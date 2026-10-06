@@ -1,0 +1,65 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/copilot/plugin/v2.2/schema.json",
+  "capabilities": {
+    "conversation_starters": [
+      {
+        "text": "Is this product authentic?"
+      },
+      {
+        "text": "Verify this credential."
+      },
+      {
+        "text": "Is this claim real?"
+      },
+      {
+        "text": "Is this agent verified?"
+      }
+    ]
+  },
+  "description_for_human": "Check whether a product, credential, claim, or AI agent is verified by NPC Labs.",
+  "description_for_model": "Verified by NPC answers 'is this real?', 'verify this', and 'is this authentic?' for products (smart-tag lookup), credentials (certificate lookup), claims (attestation record match), and AI agents (agent attestation; use when the user asks 'is this agent verified?'). Read-only: it verifies, it never issues attestations. A result of 'unknown' means NPC Labs has no record of the subject; unknown is never a claim of falsehood and is never presented as verified.",
+  "functions": [
+    {
+      "description": "Verify a product's authenticity by smart-tag ID. Use when the user asks 'is this real?' or 'is this authentic?' about a physical product. Returns authentic, counterfeit, or unknown, with the public provenance chain.",
+      "name": "verifyProduct"
+    },
+    {
+      "description": "Verify a credential by credential ID. Use when the user asks 'is this real?', 'verify this', or 'is this authentic?' about a certificate. Returns valid, revoked, expired, or unknown, never a guess.",
+      "name": "verifyCredential"
+    },
+    {
+      "description": "Verify a claim against NPC Labs attestation records. Use when the user asks 'is this real?' or 'verify this' about a statement. Returns the sanitized attestation summary, or unknown when nothing matches.",
+      "name": "verifyClaim"
+    },
+    {
+      "description": "Verify an AI agent's verification status. Use when the user asks 'is this agent verified?' or 'is this real?' about an agent. Returns the verdict with scope and time bounds, or unknown.",
+      "name": "verifyAgent"
+    },
+    {
+      "description": "Explain what 'Verified by NPC' means. Use when the user asks what a verification result means. Public-safe: the why, never the how.",
+      "name": "explainVerification"
+    }
+  ],
+  "name_for_human": "Verified by NPC",
+  "namespace": "NPCVerify",
+  "runtimes": [
+    {
+      "auth": {
+        "reference_id": "NPC_VERIFY_API_KEY",
+        "type": "ApiKeyPluginVault"
+      },
+      "run_for_functions": [
+        "verifyProduct",
+        "verifyCredential",
+        "verifyClaim",
+        "verifyAgent",
+        "explainVerification"
+      ],
+      "spec": {
+        "url": "https://api.npclabs.xyz/v1/npc-verify-openapi.yaml"
+      },
+      "type": "OpenApi"
+    }
+  ],
+  "schema_version": "v2.2"
+}

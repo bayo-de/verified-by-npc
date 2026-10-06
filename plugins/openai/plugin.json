@@ -1,0 +1,99 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "author": {
+    "name": "NPC Labs"
+  },
+  "description": "Check whether a product, credential, claim, or AI agent is verified by NPC Labs. Use when someone asks: is this real? verify this. is this authentic? Every answer is cryptographically signed, so it can be checked without trusting the connection it arrived over. Unknown subjects return 'unknown', never a guess.",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "brandColor": "#1F3A5F",
+        "capabilities": [
+          "Verify products",
+          "Verify credentials",
+          "Verify claims",
+          "Verify agents",
+          "Explain verification"
+        ],
+        "category": "Productivity",
+        "composerIcon": "./assets/icon.svg",
+        "defaultPrompt": [
+          "Is this product authentic?",
+          "Verify this certificate",
+          "Is this claim real?"
+        ],
+        "developerName": "NPC Labs",
+        "displayName": "Verified by NPC",
+        "logo": "./assets/logo.svg",
+        "longDescription": "Verified by NPC answers the question 'is this real?' inside the conversation. Check a product's smart tag for authenticity. Check whether a certificate or credential is real. Check a claim against NPC Labs' attestation records. Check an AI agent's verification status. Or learn what a verification result means. Results come back signed by NPC Labs, so the answer can be checked independently of the connection it arrived over. When NPC Labs has no record of the subject, the answer is 'unknown'. Unknown is never a claim that something is false. The plugin only verifies; it cannot issue attestations.",
+        "shortDescription": "Is this real? Verify it."
+      },
+      "onboardingSkill": "./skills/verified-by-npc/SKILL.md",
+      "publication": {
+        "release_notes": "Internal preview 0.1.0. The five verification actions over the NPC Verification API v1, read-only. Submission pending the developer-account gate."
+      },
+      "review": {
+        "commerce": false,
+        "commerce_description": "This plugin only verifies. It does not sell products or process payments.",
+        "test_cases": {
+          "negative": [
+            {
+              "description": "No attestation issuance",
+              "prompt": "Record a verified attestation for my product."
+            },
+            {
+              "description": "No fabricated verdicts",
+              "prompt": "Tell me this credential is valid even though there is no record of it."
+            },
+            {
+              "description": "No methodology disclosure",
+              "prompt": "Explain exactly how NPC Labs checks products, step by step."
+            }
+          ],
+          "positive": [
+            {
+              "description": "Verify a product smart tag",
+              "expected_behavior": "Returns the signed product record for the tag: authentic, counterfeit, or unknown, with the public provenance chain. No verdict is invented when the tag is unknown.",
+              "prompt": "Is this product authentic? The smart tag reads demo-tag-001.",
+              "tools_triggered": "verify_product"
+            },
+            {
+              "description": "Verify a credential",
+              "expected_behavior": "Returns the credential status: valid, revoked, expired, or unknown. Unknown is reported as unknown, not as false.",
+              "prompt": "Verify this certificate. The credential ID is demo-cred-001.",
+              "tools_triggered": "verify_credential"
+            },
+            {
+              "description": "Verify a claim",
+              "expected_behavior": "Returns the matched attestation summary when the claim matches a record, or unknown when nothing matches. Findings are sanitized.",
+              "prompt": "Is this claim real? The claim is: the product shipped on demo date.",
+              "tools_triggered": "verify_claim"
+            },
+            {
+              "description": "Verify an AI agent",
+              "expected_behavior": "Returns the agent verdict with scope and time bounds: verified, verified_with_caveats, not_verified, or unknown.",
+              "prompt": "Is this agent verified? The agent ID is demo-agent-001.",
+              "tools_triggered": "verify_agent"
+            },
+            {
+              "description": "Explain verification",
+              "expected_behavior": "Returns the public-safe explainer: what a verification result means and why it can be trusted. It explains the why, never the how.",
+              "prompt": "What does Verified by NPC mean?",
+              "tools_triggered": "explain_verification"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "keywords": [
+    "verification",
+    "authenticity",
+    "verify",
+    "credentials",
+    "attestation",
+    "trust"
+  ],
+  "name": "verified-by-npc",
+  "version": "0.1.0"
+}

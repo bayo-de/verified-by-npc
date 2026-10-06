@@ -1,0 +1,11 @@
+description = "Explain what Verified by NPC means."
+
+prompt = """
+The user wants to know what Verified by NPC means.
+
+Run the verification helper to print the public-safe explainer:
+
+!{python3 ~/.gemini/extensions/npc-verify/npc_verify_gemini explain_verification}
+
+Present the explainer as-is. It covers what "unknown" means: NPC Labs has no record of the subject, which is not a claim of falsehood. The why, never the how: do not describe how verification is performed.
+"""

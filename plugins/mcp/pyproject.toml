@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "npc-verify-mcp"
+version = "1.0.0"
+description = "Verified by NPC — MCP server. Thin client over the NPC Verification API v1 (local-first, internal only)."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+npc-verify-mcp = "npc_verify_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["npc_verify_mcp*"]

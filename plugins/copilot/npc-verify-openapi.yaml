@@ -1,0 +1,244 @@
+openapi: 3.0.3
+info:
+  title: Verified by NPC - Copilot plugin actions
+  version: 1.0.0
+  description: |
+    Read-only verification actions for the Verified by NPC Copilot plugin.
+    The five functions map onto the NPC Verification API v1 endpoints:
+    verifyProduct, verifyCredential, verifyClaim, verifyAgent, and
+    explainVerification. Each operation carries an x-npc-action extension
+    with the canonical action name.
+
+    explainVerification is served by the plugin from static public-safe
+    copy (the why, never the how); GET /health is the action's API anchor
+    and provides the live, signature-verified service identity.
+
+    Issuance is intentionally absent: the plugin cannot record attestations
+    (POST /attestations is not part of this spec). Every API response is
+    Ed25519-signed by NPC Labs; the plugin's reference helper verifies the
+    signature on every response and treats any unverifiable answer as
+    "unknown". A verdict is never fabricated.
+servers:
+  - url: https://api.npclabs.xyz/v1
+    description: Production (deployment gated - local-first in Phase 1)
+security:
+  - bearerAuth: []
+paths:
+  /products/{tag_id}:
+    get:
+      operationId: verifyProduct
+      x-npc-action: verify_product
+      summary: Verify a product's authenticity through its NPC smart tag
+      description: |
+        Use when the user asks 'is this real?', 'verify this', or 'is this
+        authentic?' about a physical product carrying a smart tag. Returns
+        authentic, counterfeit, or unknown, with the public provenance chain.
+      parameters:
+        - name: tag_id
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        '200':
+          description: Product record. Verify X-NPC-Signature before use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductVerdict'
+        '404':
+          description: Unknown tag (fail-closed - unknown, never a guess)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+  /credentials/{id}:
+    get:
+      operationId: verifyCredential
+      x-npc-action: verify_credential
+      summary: Verify a credential
+      description: |
+        Use when the user asks 'is this real?', 'verify this', or 'is this
+        authentic?' about a certificate, course completion, or other
+        NPC-issued credential ID. Returns valid, revoked, expired, or
+        unknown - never a guess.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        '200':
+          description: Credential record. Verify X-NPC-Signature before use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialVerdict'
+        '404':
+          description: Unknown credential (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+  /claims/verify:
+    post:
+      operationId: verifyClaim
+      x-npc-action: verify_claim
+      summary: Verify a claim against attested records
+      description: |
+        Use when the user asks 'is this real?' or 'verify this' about a
+        statement, and you want to check it against NPC Labs' verified
+        attestation records. Returns the sanitized attestation summary, or
+        unknown when no record matches. Unknown is never presented as false.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                claim_text:
+                  type: string
+                  description: The claim to verify, as plain text.
+                claim_hash:
+                  type: string
+                  description: SHA-256 hex of the normalized claim text.
+      responses:
+        '200':
+          description: Claim matched. Verify X-NPC-Signature before use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimVerdict'
+        '404':
+          description: No attestation matches (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+  /agents/{agent_id}/attestation:
+    get:
+      operationId: verifyAgent
+      x-npc-action: verify_agent
+      summary: Agent verification status
+      description: |
+        Use when the user asks 'is this agent verified?' or 'is this real?'
+        about an agent identity. Returns verified, verified_with_caveats,
+        not_verified, or unknown, with scope and time bounds.
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        '200':
+          description: Agent attestation. Verify X-NPC-Signature before use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentVerdict'
+        '404':
+          description: Unknown agent (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+  /health:
+    get:
+      operationId: explainVerification
+      x-npc-action: explain_verification
+      summary: Service identity for the verification explainer
+      description: |
+        Use when the user asks what 'Verified by NPC' means. The plugin
+        answers from static public-safe copy (the why, never the how);
+        this endpoint provides the live, signature-verified service
+        identity behind the answer. No authentication required.
+      responses:
+        '200':
+          description: Service status. Verify X-NPC-Signature before use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: NPC verifier API key (Bearer)
+  schemas:
+    UnknownVerdict:
+      type: object
+      required:
+        - verdict
+      properties:
+        verdict:
+          type: string
+          enum:
+            - unknown
+    ProductVerdict:
+      type: object
+      required:
+        - tag_id
+        - status
+        - verdict
+      properties:
+        tag_id:
+          type: string
+        status:
+          type: string
+          enum:
+            - authentic
+            - counterfeit
+            - unknown
+        verdict:
+          type: string
+    CredentialVerdict:
+      type: object
+      required:
+        - id
+        - status
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          enum:
+            - valid
+            - revoked
+            - expired
+            - unknown
+    ClaimVerdict:
+      type: object
+      required:
+        - matched
+      properties:
+        matched:
+          type: boolean
+    AgentVerdict:
+      type: object
+      required:
+        - agent_id
+        - verdict
+      properties:
+        agent_id:
+          type: string
+        verdict:
+          type: string
+          enum:
+            - verified
+            - verified_with_caveats
+            - not_verified
+            - unknown
+    Health:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string

@@ -1,0 +1,266 @@
+openapi: 3.1.0
+info:
+  title: Verified by NPC - plugin actions
+  version: 0.1.0
+  description: |
+    Read-only verification actions for the Verified by NPC plugin. This spec
+    covers the five operations a ChatGPT user can reach mid-conversation:
+    verify_product, verify_credential, verify_claim, verify_agent, and
+    explain_verification.
+
+    The four verification operations map 1:1 onto the NPC Verification API
+    v1 endpoints. explain_verification is served by the plugin itself and
+    performs no API call.
+
+    Issuance is intentionally absent: the plugin cannot record attestations
+    (POST /v1/attestations is not part of this spec). Every API response is
+    Ed25519-signed by NPC Labs; the plugin verifies the signature on every
+    response and treats any unverifiable answer as "unknown". A verdict is
+    never fabricated.
+servers:
+  - url: https://api.npclabs.xyz/v1
+    description: Production (deployment gated - local-first in Phase 1)
+  - url: http://127.0.0.1:8787/v1
+    description: Local development
+security:
+  - bearerAuth: []
+paths:
+  /v1/products/{tag_id}:
+    get:
+      operationId: verify_product
+      summary: Verify a product's authenticity through its NPC smart tag
+      description: |
+        Use when the user asks 'is this real?', 'verify this', or 'is this
+        product authentic?' about a physical product carrying a smart tag.
+        Returns authentic, counterfeit, or unknown, with the public
+        provenance chain.
+      parameters:
+        - name: tag_id
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        '200':
+          description: Product record. Verify X-NPC-Signature before use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductVerdict'
+        '404':
+          description: Unknown tag (fail-closed - unknown, never a guess)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+  /v1/credentials/{id}:
+    get:
+      operationId: verify_credential
+      summary: Verify a credential
+      description: |
+        Use when the user asks 'is this real?', 'verify this', or 'is this
+        authentic?' about a certificate, course completion, or other
+        NPC-issued credential ID. Returns valid, revoked, expired, or
+        unknown - never a guess.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        '200':
+          description: Credential record. Verify X-NPC-Signature before use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialVerdict'
+        '404':
+          description: Unknown credential (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+  /v1/claims/verify:
+    post:
+      operationId: verify_claim
+      summary: Verify a claim against attested records
+      description: |
+        Use when the user asks 'is this real?', 'verify this', or 'did this
+        really happen?' about a statement, and wants to check it against
+        NPC Labs' attestation records. Returns the sanitized verification
+        record, or unknown when there is no record.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimVerifyRequest'
+      responses:
+        '200':
+          description: Claim matched an attestation. Verify signature first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimVerdict'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: No attestation matches (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimNotMatched'
+  /v1/agents/{agent_id}/attestation:
+    get:
+      operationId: verify_agent
+      summary: Verify an AI agent's verification status
+      description: |
+        Use when the user asks 'is this agent verified?' or 'is this real?'
+        about an agent identity. Returns verified, verified_with_caveats,
+        not_verified, or unknown, with scope and time bounds.
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        '200':
+          description: Agent attestation. Verify X-NPC-Signature before use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentVerdict'
+        '404':
+          description: Unknown agent (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+  /explain/verification:
+    get:
+      operationId: explain_verification
+      summary: Explain what 'Verified by NPC' means
+      x-npc-client-side: true
+      description: |
+        Use when the user asks what a verification result means, or what
+        NPC Labs verification is. This operation is served by the plugin
+        itself: a static, public-safe explainer that teaches the why, never
+        the how. It performs no API call; the path exists for documentation
+        only and is never sent to the API.
+      responses:
+        '200':
+          description: The public-safe explainer text
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExplainResult'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: NPC API key (Bearer). The plugin uses verifier-role keys.
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    ProductVerdict:
+      type: object
+      required: [tag_id, status, verdict]
+      properties:
+        tag_id:
+          type: string
+        status:
+          type: string
+          enum: [authentic, counterfeit, unknown]
+        verdict:
+          type: string
+          enum: [verified, verified_with_caveats, not_verified, unknown]
+        name:
+          type: string
+        creator:
+          type: string
+        provenance:
+          type: array
+          items:
+            type: object
+    CredentialVerdict:
+      type: object
+      required: [id, status, title, issuer]
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          enum: [valid, revoked, expired]
+        title:
+          type: string
+        issuer:
+          type: string
+    ClaimVerifyRequest:
+      type: object
+      description: Provide exactly one of claim_text or claim_hash
+      properties:
+        claim_text:
+          type: string
+        claim_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+    ClaimVerdict:
+      type: object
+      required: [matched, claim_hash]
+      properties:
+        matched:
+          type: boolean
+        claim_hash:
+          type: string
+    ClaimNotMatched:
+      type: object
+      required: [verdict, matched]
+      properties:
+        verdict:
+          type: string
+          const: unknown
+        matched:
+          type: boolean
+          const: false
+    AgentVerdict:
+      type: object
+      required: [agent_id, verdict]
+      properties:
+        agent_id:
+          type: string
+        verdict:
+          type: string
+          enum: [verified, verified_with_caveats, not_verified, unknown]
+    ExplainResult:
+      type: object
+      required: [explanation]
+      properties:
+        explanation:
+          type: string
+          description: Public-safe explainer - the why, never the how
+    UnknownVerdict:
+      type: object
+      required: [verdict]
+      properties:
+        verdict:
+          type: string
+          const: unknown
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        detail:
+          type: string
