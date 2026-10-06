@@ -21,7 +21,7 @@ The package lives at
    and does not signify. It only appears next to signed, verifiable
    verdicts. It never implies endorsement beyond the verdict's own scope
    and time bounds. Every new public use gets your tap.
-4. **The clearance request memo to Anibal**: asks for three things —
+4. **The clearance request memo to Anibal**: asks for three things:
    trademark clearance (likelihood-of-confusion review), your right to
    use the mark publicly (plus his recommendation on filing), and
    confirmation that clearance covers the mark as a program so each

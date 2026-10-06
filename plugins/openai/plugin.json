@@ -26,11 +26,15 @@
         "displayName": "Verified by NPC",
         "logo": "./assets/logo.svg",
         "longDescription": "Verified by NPC answers the question 'is this real?' inside the conversation. Check a product's smart tag for authenticity. Check whether a certificate or credential is real. Check a claim against NPC Labs' attestation records. Check an AI agent's verification status. Or learn what a verification result means. Results come back signed by NPC Labs, so the answer can be checked independently of the connection it arrived over. When NPC Labs has no record of the subject, the answer is 'unknown'. Unknown is never a claim that something is false. The plugin only verifies; it cannot issue attestations.",
-        "shortDescription": "Is this real? Verify it."
+        "shortDescription": "Is this real? Verify it.",
+        "websiteURL": "https://npclabs.xyz",
+        "supportURL": "https://npclabs.xyz/support",
+        "privacyPolicyURL": "https://npclabs.xyz/privacy",
+        "termsOfServiceURL": "https://npclabs.xyz/terms"
       },
       "onboardingSkill": "./skills/verified-by-npc/SKILL.md",
       "publication": {
-        "release_notes": "Internal preview 0.1.0. The five verification actions over the NPC Verification API v1, read-only. Submission pending the developer-account gate."
+        "release_notes": "1.0.0: public launch. The five verification actions over the NPC Verification API v1, read-only, against the public demo API. The plugin verifies only; it cannot issue attestations. Unknown subjects return 'unknown', never a guess."
       },
       "review": {
         "commerce": false,
@@ -95,5 +99,5 @@
     "trust"
   ],
   "name": "verified-by-npc",
-  "version": "0.1.0"
+  "version": "1.0.0"
 }

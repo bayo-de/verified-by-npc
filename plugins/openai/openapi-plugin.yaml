@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Verified by NPC - plugin actions
-  version: 0.1.0
+  version: 1.0.0
   description: |
     Read-only verification actions for the Verified by NPC plugin. This spec
     covers the five operations a ChatGPT user can reach mid-conversation:

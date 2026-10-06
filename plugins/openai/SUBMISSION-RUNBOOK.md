@@ -5,6 +5,16 @@
 **Bayo's approval 2026-10-06:** "Yes proceed" - but every money step, account step, and public listing step
 needs his explicit in-the-moment tap. Nothing here is created, paid, or submitted without that.
 
+**Track 1 progress (2026-10-06, agent work, no taps taken):**
+- Demo API bundle built and locally verified: `api/serverless/npc-verify-api-netlify-drop.zip`
+  (22/22 local checks green: demo fixtures, Ed25519 signatures, fail-closed unknown, write
+  endpoints stripped). Deploy to api.npclabs.xyz (Netlify Drop + DNS) is Bayo's tap.
+- Policy pages (privacy, terms, support) staged in `~/workspace/sites/npclabs-deploy.zip`;
+  deploy is Bayo's drag-drop.
+- Package at 1.0.0 with public release notes and live legal URLs; validator exit 0, 52/52 tests.
+- Listing screenshots (5 real API-response cards) + 2-minute captioned demo video in
+  `listing-assets/`. Bayo's tap list: `OPENAI-SUBMISSION-BAYO-STEPS.md`.
+
 ---
 
 ## 1. What is already done

@@ -1,9 +1,10 @@
 # Verified by NPC: OpenAI (ChatGPT) plugin package
 
-**Status: internal preview, submission-ready but NOT submitted.**
-No developer account has been created, no submission has been made, no
-public endpoint is live. Everything here runs against the local API or
-documents the gated production path.
+**Status: 1.0.0, package validated, NOT submitted.**
+No developer account has been created, no submission has been made, the
+demo API bundle is built and locally verified but not yet deployed to
+api.npclabs.xyz. Everything here runs against the local API or documents
+the gated production path.
 
 ## What this is
 
@@ -100,12 +101,18 @@ submission ZIP.
 
 ## What remains gated (explicitly NOT done)
 
-1. OpenAI developer account + verified identity (Bayo's decision).
-2. Store listing copy approval (Bayo reviews every public word).
+1. OpenAI developer account + verified identity (Bayo's decision; NPC Labs
+   business identity approved 2026-10-06).
+2. Store listing copy approval (Bayo reviews every public word; copy
+   approved 2026-10-06, release notes rewritten for 1.0.0).
 3. Submission + publication in the plugin portal.
-4. Public endpoint `https://api.npclabs.xyz/v1` (deployment + hosting budget).
+4. Public endpoint `https://api.npclabs.xyz/v1` - demo API bundle built
+   and locally verified 2026-10-06 (`api/serverless/`); the Netlify Drop
+   deploy + DNS is Bayo's tap.
 5. Approved "Verified by NPC" mark artwork (counsel clearance; placeholders ship for now).
-6. Reviewer test account, demo video walkthrough, and country availability for the review form.
+6. Demo video walkthrough link for the review form (2-minute captioned
+   video built 2026-10-06; Bayo to host it as an unlisted video).
+   Country availability: United States (portal entry, Bayo's tap).
 7. Mainnet onchain anchoring (testnet until Bayo signs off).
 
 ## Files

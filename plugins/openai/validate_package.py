@@ -93,6 +93,8 @@ def check_copy_rules():
             allowed = url.startswith((
                 "https://agent-plugins.org/",
                 "https://api.npclabs.xyz/",
+                "https://npclabs.xyz",
+                "https://npclabs.xyz/",
                 "http://127.0.0.1:8787/",
                 "http://www.w3.org/2000/svg",
             ))
