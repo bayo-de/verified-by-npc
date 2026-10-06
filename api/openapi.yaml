@@ -1,0 +1,781 @@
+openapi: 3.1.0
+info:
+  title: NPC Verification API
+  version: 1.0.0
+  description: |
+    Verify a claim, a credential, a product, or an agent against NPC Labs'
+    attestation records. Read-first: v1 verifies; it does not issue
+    attestations to third parties.
+
+    Every response body is canonicalized (NPC-JCS-v1: UTF-8, sorted keys,
+    no insignificant whitespace) and Ed25519-signed. The signature travels
+    in the `X-NPC-Signature` header (base64) with `X-NPC-Key-ID`.
+    `GET /v1/keys` publishes the public keys, so responses verify offline.
+
+    Fail-closed: an unknown subject returns 404 with
+    `{"verdict": "unknown"}`. A verdict is never fabricated.
+  contact:
+    name: NPC Labs
+    url: https://npclabs.xyz
+servers:
+  - url: https://api.npclabs.xyz/v1
+    description: Production (deployment gated — local-first in Phase 1)
+  - url: http://127.0.0.1:8787/v1
+    description: Local development
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Liveness, active signing key, chain status
+      security: []
+      responses:
+        '200':
+          description: Service is up
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /keys:
+    get:
+      operationId: getKeys
+      summary: NPC public keys with rotation history
+      description: |
+        Current API-signing and issuer public keys plus retired keys.
+        Anyone can verify API responses offline against these keys.
+      security: []
+      responses:
+        '200':
+          description: Key registry
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyRegistry'
+
+  /credentials/{id}:
+    get:
+      operationId: getCredential
+      summary: Credential lookup
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: Credential record
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credential'
+        '404':
+          description: Unknown credential (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+
+  /claims/verify:
+    post:
+      operationId: verifyClaim
+      summary: Verify a claim against attested records
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimVerifyRequest'
+      responses:
+        '200':
+          description: Claim matched an attestation
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimVerifyResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: No attestation matches (fail-closed)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/UnknownVerdict'
+                  - type: object
+                    properties:
+                      matched: { type: boolean, const: false }
+
+  /products/{tag_id}:
+    get:
+      operationId: getProduct
+      summary: Smart-tag authenticity lookup
+      parameters:
+        - name: tag_id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: Product record
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '404':
+          description: Unknown tag (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+
+  /agents/{agent_id}/attestation:
+    get:
+      operationId: getAgentAttestation
+      summary: Agent verification status
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: Agent attestation
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentAttestation'
+        '404':
+          description: Unknown agent (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+
+  /attestations:
+    post:
+      operationId: createAttestation
+      summary: Record a new attestation (NPC-issued only)
+      description: |
+        Requires an API key with the `issuer` role. The attestation is
+        signed with NPC's issuer key; its SHA-256 anchor hash is recorded
+        locally. No chain write occurs in Phase 1 (anchor status
+        `not_anchored`); the hash is testnet-ready for later anchoring via
+        the FleetAttestationRegistry pattern.
+      responses:
+        '201':
+          description: Attestation recorded
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttestationReceipt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttestationRequest'
+
+  /memory/agents:
+    post:
+      operationId: registerMemoryAgent
+      summary: Register an agent's attestation public key
+      description: |
+        Requires an API key with the `issuer` role. Binds an agent_id to
+        its Ed25519 public key and its place in the company -> team tree.
+        The API key's scope must cover the agent's scope; agent-scoped
+        keys cannot register agents. Idempotent for the same key;
+        a different key for the same agent_id is a 409 conflict.
+      responses:
+        '201':
+          description: Agent registered
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryAgentReceipt'
+        '200':
+          description: Already registered with the same key
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryAgentReceipt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryAgentRequest'
+
+  /memory/records:
+    post:
+      operationId: appendMemoryRecord
+      summary: Append a signed memory record to a stream
+      description: |
+        Requires an API key with the `verifier` role or above. The record
+        must be built and signed by the agent locally (see the npc_memory
+        library). The API checks: shape, write-boundary secrets, API-key
+        scope, the writer's registered agent scope, the Ed25519 signature,
+        and the stream chain (contiguous seq, matching prev_hash) before
+        appending. Fail-closed: any check failure rejects the write.
+        Fleet-stream writes need an issuer key.
+      responses:
+        '201':
+          description: Record appended
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryRecordReceipt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryRecord'
+
+  /memory/records/{id}:
+    get:
+      operationId: getMemoryRecord
+      summary: Read one memory record with its verification status
+      description: |
+        Requires an API key with the `verifier` role or above. The key's
+        scope must cover the record's stream; out-of-scope reads return
+        404, the same shape as unknown, so existence is never confirmed
+        across scopes. Every record carries its verification status:
+        signature validity, chain integrity, superseded-by, retracted,
+        and overall standing.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+          description: Record id (mem_...)
+      responses:
+        '200':
+          description: Record with verification status
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryRecallItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /memory/recall:
+    post:
+      operationId: recallMemories
+      summary: Tag, recency, and keyword recall over readable streams
+      description: |
+        Requires an API key with the `verifier` role or above. Searches
+        the streams the key's scope covers (omit stream filters to search
+        them all, or narrow to one stream by kind, dims, or stream_key).
+        Every hit carries its verification status. Vector recall is out
+        of scope for v1.
+      responses:
+        '200':
+          description: Recalled memories with verification status
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryRecallResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryRecallRequest'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "NPC API key (Bearer). Roles: verifier, issuer."
+
+  headers:
+    XNPCSignature:
+      description: Base64 Ed25519 signature over the canonical response body
+      schema: { type: string }
+    XNPCKeyID:
+      description: Key ID of the signing key (see GET /v1/keys)
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Key lacks the required role
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unprocessable:
+      description: Request failed validation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: State conflict (duplicate, fork, or superseded target)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Unknown subject or out-of-scope record
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Health:
+      type: object
+      required: [status, version, key_id, chain, time]
+      properties:
+        status: { type: string, const: ok }
+        version: { type: string }
+        key_id: { type: string }
+        chain:
+          type: object
+          properties:
+            network: { type: string }
+            anchoring: { type: string }
+            mode: { type: string }
+            note: { type: string }
+        time: { type: string, format: date-time }
+
+    KeyEntry:
+      type: object
+      required: [key_id, public_key, algorithm, status, created_at, retired_at]
+      properties:
+        key_id: { type: string }
+        public_key: { type: string, description: Base64 Ed25519 public key }
+        algorithm: { type: string, const: Ed25519 }
+        status: { type: string, enum: [active, retired] }
+        created_at: { type: string, format: date-time }
+        retired_at: { type: ['string', 'null'], format: date-time }
+
+    KeyRegistry:
+      type: object
+      required: [api_signing, issuers]
+      properties:
+        api_signing:
+          type: object
+          required: [current, history]
+          properties:
+            current:
+              oneOf:
+                - $ref: '#/components/schemas/KeyEntry'
+                - type: 'null'
+            history:
+              type: array
+              items: { $ref: '#/components/schemas/KeyEntry' }
+        issuers:
+          type: array
+          items: { $ref: '#/components/schemas/KeyEntry' }
+
+    Credential:
+      type: object
+      required: [id, status, title, issuer, holder_name, issued_at,
+                 expires_at, assessed_skills, signature, key_id,
+                 verification_url]
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [valid, revoked, expired] }
+        title: { type: string }
+        issuer: { type: string }
+        holder_name:
+          type: ['string', 'null']
+          description: Present only if the holder made it public
+        issued_at: { type: string, format: date-time }
+        expires_at: { type: ['string', 'null'], format: date-time }
+        assessed_skills: { type: array, items: { type: string } }
+        signature: { type: string, description: Base64 NPC issuer signature }
+        key_id: { type: string }
+        verification_url: { type: string }
+
+    ClaimVerifyRequest:
+      type: object
+      description: Provide exactly one of claim_text or claim_hash
+      properties:
+        claim_text: { type: string }
+        claim_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 hex of the normalized claim text
+
+    OnchainAnchor:
+      type: object
+      required: [chain, tx, hash, status]
+      properties:
+        chain: { type: string }
+        tx: { type: ['string', 'null'] }
+        hash: { type: string }
+        status: { type: string, enum: [not_anchored, pending, anchored] }
+
+    AttestationSummary:
+      type: object
+      required: [id, verdict, scope, tested_at, expires_at, findings_summary,
+                 signature, key_id, onchain_anchor]
+      properties:
+        id: { type: string }
+        verdict:
+          type: string
+          enum: [verified, verified_with_caveats, not_verified, unknown]
+        scope: { type: object }
+        tested_at: { type: string, format: date-time }
+        expires_at: { type: ['string', 'null'], format: date-time }
+        findings_summary:
+          type: string
+          description: Sanitized findings; methodology is never exposed
+        signature: { type: string }
+        key_id: { type: string }
+        onchain_anchor: { $ref: '#/components/schemas/OnchainAnchor' }
+
+    ClaimVerifyResult:
+      type: object
+      required: [matched, claim_hash, attestation]
+      properties:
+        matched: { type: boolean, const: true }
+        claim_hash: { type: string }
+        attestation: { $ref: '#/components/schemas/AttestationSummary' }
+
+    Product:
+      type: object
+      required: [tag_id, status, verdict, name, creator, description,
+                 provenance, attestation_id]
+      properties:
+        tag_id: { type: string }
+        status: { type: string, enum: [authentic, counterfeit, unknown] }
+        verdict:
+          type: string
+          enum: [verified, verified_with_caveats, not_verified, unknown]
+        name: { type: string }
+        creator: { type: string }
+        description: { type: string }
+        provenance:
+          type: array
+          items:
+            type: object
+            properties:
+              event: { type: string }
+              at: { type: string, format: date-time }
+              detail: { type: string }
+        attestation_id: { type: ['string', 'null'] }
+
+    AgentAttestation:
+      type: object
+      required: [agent_id, verdict, scope, valid_from, valid_until,
+                 attestation_id, onchain_anchor, notes]
+      properties:
+        agent_id: { type: string }
+        verdict:
+          type: string
+          enum: [verified, verified_with_caveats, not_verified, unknown]
+        scope: { type: object }
+        valid_from: { type: string, format: date-time }
+        valid_until: { type: ['string', 'null'], format: date-time }
+        attestation_id: { type: string }
+        onchain_anchor: { $ref: '#/components/schemas/OnchainAnchor' }
+        notes: { type: string }
+
+    AttestationRequest:
+      type: object
+      required: [subject_type, subject_id, verdict, scope, tested_at,
+                 findings_summary]
+      properties:
+        subject_type:
+          type: string
+          enum: [claim, credential, product, agent]
+        subject_id: { type: string, maxLength: 256 }
+        verdict:
+          type: string
+          enum: [verified, verified_with_caveats, not_verified, unknown]
+        scope: { type: object }
+        tested_at: { type: string, format: date-time }
+        expires_at: { type: ['string', 'null'], format: date-time }
+        findings_summary:
+          type: string
+          maxLength: 4000
+          description: Sanitized findings; methodology is never exposed
+        claim_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+
+    AttestationReceipt:
+      type: object
+      required: [id, signature, key_id, onchain_anchor, created_at]
+      properties:
+        id: { type: string }
+        signature: { type: string }
+        key_id: { type: string }
+        onchain_anchor: { $ref: '#/components/schemas/OnchainAnchor' }
+        created_at: { type: string, format: date-time }
+
+    UnknownVerdict:
+      type: object
+      required: [verdict]
+      properties:
+        verdict: { type: string, const: unknown }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        detail: { type: string }
+        retry_after_seconds: { type: integer }
+
+    MemoryAgentRequest:
+      type: object
+      required: [agent_id, public_key_b64]
+      properties:
+        agent_id:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$'
+        company_id:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$'
+          nullable: true
+        team_id:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$'
+          nullable: true
+        public_key_b64:
+          type: string
+          description: Base64 Ed25519 public key (32 bytes)
+
+    MemoryAgentReceipt:
+      type: object
+      required: [agent_id, key_id, status]
+      properties:
+        agent_id: { type: string }
+        company_id: { type: string, nullable: true }
+        team_id: { type: string, nullable: true }
+        key_id:
+          type: string
+          description: Key fingerprint ak_<16 hex>
+        status: { type: string, enum: [registered, already_registered] }
+
+    MemoryRecord:
+      type: object
+      required: [id, seq, ts, stream_kind, stream_key, agent_id, type,
+                 content, provenance, prev_hash, record_hash,
+                 signature_b64, key_id]
+      properties:
+        id: { type: string, pattern: '^mem_[A-Za-z0-9_-]{8,64}$' }
+        seq: { type: integer, minimum: 0 }
+        ts: { type: string, format: date-time }
+        stream_kind:
+          type: string
+          enum: [agent, team, company, fleet]
+        stream_key: { type: string }
+        company_id: { type: string, nullable: true }
+        team_id: { type: string, nullable: true }
+        stream_agent_id: { type: string, nullable: true }
+        agent_id:
+          type: string
+          description: Writer agent id
+        writer_scope:
+          type: object
+          properties:
+            company_id: { type: string, nullable: true }
+            team_id: { type: string, nullable: true }
+        type:
+          type: string
+          enum: [memory.assert, memory.supersede, memory.retract]
+        content:
+          type: object
+          required: [text]
+          properties:
+            text: { type: string, maxLength: 4000 }
+            tags:
+              type: array
+              maxItems: 16
+              items: { type: string }
+            confidence: { type: number, minimum: 0, maximum: 1 }
+            target_id: { type: string }
+            reason: { type: string, maxLength: 500 }
+        provenance:
+          type: object
+          properties:
+            derived_from:
+              type: array
+              items: { type: string }
+            source: { type: string, enum: [session, memory, external] }
+            url: { type: string }
+            captured_at: { type: string, format: date-time }
+            hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+            trust: { type: string, enum: [trusted, untrusted] }
+        prev_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        record_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        signature_b64: { type: string }
+        key_id: { type: string, pattern: '^ak_[0-9a-f]{16}$' }
+
+    MemoryRecordReceipt:
+      type: object
+      required: [id, seq, stream_key, standing]
+      properties:
+        id: { type: string }
+        seq: { type: integer }
+        stream_key: { type: string }
+        standing: { type: string, const: live }
+
+    MemoryVerification:
+      type: object
+      required: [signature, chain_intact, superseded_by, retracted,
+                 standing]
+      properties:
+        signature:
+          type: string
+          enum: [valid, invalid, unverifiable]
+        chain_intact: { type: boolean }
+        superseded_by: { type: string, nullable: true }
+        retracted: { type: boolean }
+        standing:
+          type: string
+          enum: [live, superseded, retracted]
+
+    MemoryRecallItem:
+      type: object
+      required: [record, verification]
+      properties:
+        record: { $ref: '#/components/schemas/MemoryRecord' }
+        verification: { $ref: '#/components/schemas/MemoryVerification' }
+
+    MemoryRecallRequest:
+      type: object
+      properties:
+        stream_key:
+          type: string
+          description: Exact stream, e.g. team:acme:core
+        stream_kind:
+          type: string
+          enum: [agent, team, company, fleet]
+        company_id: { type: string }
+        team_id: { type: string }
+        agent_id:
+          type: string
+          description: Stream agent for agent streams
+        tags:
+          type: array
+          items: { type: string }
+          description: Matches records tagged with any of these
+        q:
+          type: string
+          description: Case-insensitive substring on memory text
+        since: { type: string, format: date-time }
+        until: { type: string, format: date-time }
+        limit: { type: integer, default: 50 }
+        live_only: { type: boolean, default: false }
+
+    MemoryRecallResponse:
+      type: object
+      required: [records, count]
+      properties:
+        records:
+          type: array
+          items: { $ref: '#/components/schemas/MemoryRecallItem' }
+        count: { type: integer }

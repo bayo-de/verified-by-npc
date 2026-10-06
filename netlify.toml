@@ -1,0 +1,43 @@
+# Verified by NPC dashboard - Netlify site config.
+#
+# Assumes the connected repo's root IS verified-by-npc/ (recommended: push
+# this directory as its own repo so the dashboard deploys independently of
+# the API and plugins). If verified-by-npc/ is a subdirectory of a larger
+# repo instead, set `base = "path/to/verified-by-npc"` under [build] and
+# keep everything else the same.
+#
+# Build: pure Python stdlib. Boots the seeded API v1 + the dashboard on
+# ephemeral loopback ports, renders every page through the full stack
+# (every API answer is signature-verified before it renders), and writes
+# plain HTML to dashboard/dist. No runtime, no server, no secrets.
+#
+# The API stays local-first: nothing here exposes it publicly. The public
+# front is a static snapshot of the test fixtures with fail-closed
+# unknown/unavailable semantics for anything outside the fixture set.
+
+[build]
+  command = "python3 dashboard/export_static.py"
+  publish = "dashboard/dist"
+
+# Keep the lookup URLs' local shape. Fixture IDs rewrite to their baked
+# detail pages; anything else falls through to the dashboard 404.
+[[redirects]]
+  from = "/credentials"
+  query = {id = ":id"}
+  to = "/credentials/:id/"
+  status = 200
+
+[[redirects]]
+  from = "/products"
+  query = {tag = ":tag"}
+  to = "/products/:tag/"
+  status = 200
+
+# Static site: no JS, inline CSS only, forms POST to self (no backend).
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "DENY"
+    Referrer-Policy = "no-referrer"
+    Content-Security-Policy = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"

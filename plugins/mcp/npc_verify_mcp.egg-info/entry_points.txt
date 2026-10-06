@@ -1,0 +1,2 @@
+[console_scripts]
+npc-verify-mcp = npc_verify_mcp.__main__:main

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INTERNAL PLACEHOLDER ONLY. This is NOT the "Verified by NPC" mark.
+     Public use of the mark awaits counsel clearance. Replace this file with
+     approved brand artwork before any public submission. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="#1F3A5F"/>
+  <text x="256" y="288" font-family="Helvetica, Arial, sans-serif" font-size="150" font-weight="bold" fill="#FFFFFF" text-anchor="middle">NPC</text>
+  <text x="256" y="360" font-family="Helvetica, Arial, sans-serif" font-size="34" fill="#9FB6D1" text-anchor="middle">verified</text>
+</svg>

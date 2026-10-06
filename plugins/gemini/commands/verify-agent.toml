@@ -1,0 +1,17 @@
+description = "Verify an AI agent: is this agent verified? is this real?"
+
+prompt = """
+The user wants to verify an AI agent with Verified by NPC.
+
+Agent ID: {{args}}
+
+Run the verification helper (it calls the NPC Verification API v1 and checks the Ed25519 signature on every response; it fails closed):
+
+!{python3 ~/.gemini/extensions/npc-verify/npc_verify_gemini verify_agent --agent-id "{{args}}"}
+
+When you report the result:
+- "unknown" means NPC Labs has no record of this agent. Say so plainly. Unknown is never presented as false, and never presented as verified.
+- Report the verdict with its scope and time bounds when present.
+- If the helper reports an error, say verification could not be completed and do not guess.
+- Explain the why, never the how. Do not describe how verification is performed.
+"""

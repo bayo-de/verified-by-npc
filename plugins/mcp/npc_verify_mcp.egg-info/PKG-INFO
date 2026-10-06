@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: npc-verify-mcp
+Version: 1.0.0
+Summary: Verified by NPC — MCP server. Thin client over the NPC Verification API v1 (local-first, internal only).
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown

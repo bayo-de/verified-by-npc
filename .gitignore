@@ -1,0 +1,11 @@
+# build artifact: rendered at deploy time, never committed
+dashboard/dist/
+# python bytecode/caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+# OS/editor noise
+.DS_Store
+# local runtime state: sqlite db + raw ed25519 seed files (PRIVATE, never commit)
+.local/
