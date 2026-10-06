@@ -91,14 +91,20 @@ class TestManifestSchema(unittest.TestCase):
                             f"{field} asset missing: {path}")
         self.assertNotIn("logoDark", iface)  # optional, omitted by design
 
-    def test_no_legal_urls_invented(self):
-        # Skills-only packages do not need the four listing URLs; they are
-        # omitted rather than invented. Legal/copyright stays internal.
+    def test_legal_urls_present(self):
+        # The four listing URLs are live on npclabs.xyz (privacy, terms,
+        # and support pages ship with the site bundle). They must point at
+        # the publisher's own domain, never anywhere invented.
         iface = self.iface
-        for field in ("websiteURL", "supportURL", "privacyPolicyURL",
-                      "termsOfServiceURL"):
-            self.assertNotIn(field, iface,
-                             f"{field} must not be invented pre-launch")
+        expected = {
+            "websiteURL": "https://npclabs.xyz",
+            "supportURL": "https://npclabs.xyz/support",
+            "privacyPolicyURL": "https://npclabs.xyz/privacy",
+            "termsOfServiceURL": "https://npclabs.xyz/terms",
+        }
+        for field, url in expected.items():
+            self.assertEqual(iface.get(field), url,
+                             f"{field} must be the live publisher URL")
 
     def test_onboarding_skill_reference(self):
         ext = self.m["extensions"]["com.openai"]

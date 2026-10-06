@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NPC Verification API (demo) - NPC Labs</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:640px;margin:48px auto;padding:0 20px;color:#1a1a1a;line-height:1.6}
+code{background:#f2f2f2;padding:2px 6px;border-radius:4px}
+a{color:#1F3A5F}
+.note{background:#f7f7f7;border-left:3px solid #1F3A5F;padding:12px 16px;margin:24px 0}
+</style>
+</head>
+<body>
+<h1>NPC Verification API <small>(demo)</small></h1>
+<p>The demo verification surface behind the <strong>Verified by NPC</strong> plugin. Read-only: it answers whether a product, credential, claim, or AI agent is verified against NPC Labs demo records. Every response is cryptographically signed by NPC Labs.</p>
+<div class="note">Demo data only. Fixtures are fictional and labeled <code>demo-</code>. Unknown subjects return <code>"unknown"</code>, never a guess.</div>
+<ul>
+<li><a href="/v1/health"><code>GET /v1/health</code></a> - liveness</li>
+<li><a href="/v1/keys"><code>GET /v1/keys</code></a> - public signing keys (verify any response offline)</li>
+</ul>
+<p>Verification lookups need the demo API key (used by the plugin):<br>
+<code>GET /v1/products/demo-tag-001</code><br>
+<code>GET /v1/credentials/demo-cred-001</code><br>
+<code>GET /v1/agents/demo-agent-001/attestation</code><br>
+<code>POST /v1/claims/verify</code></p>
+<p><a href="https://npclabs.xyz">NPC Labs</a></p>
+</body>
+</html>

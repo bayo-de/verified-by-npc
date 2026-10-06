@@ -1,0 +1,23 @@
+# NPC Verification API (demo) - Netlify site config.
+#
+# Demo-only public surface for the Verified by NPC plugin review:
+# read-only verification endpoints over the demo fixtures, every response
+# Ed25519-signed. No write endpoints ship in this bundle (see demoapp.py).
+# Stdlib-only Python function; no build step, no dependencies.
+
+[build]
+  publish = "public"
+
+[functions]
+  directory = "netlify/functions"
+
+# Keep the API's URL shape: /v1/* is served by the function.
+[[redirects]]
+  from = "/v1/*"
+  to = "/.netlify/functions/api"
+  status = 200
+
+[[headers]]
+  for = "/v1/*"
+  [headers.values]
+    Cache-Control = "no-store"
