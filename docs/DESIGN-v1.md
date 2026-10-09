@@ -33,7 +33,7 @@ Design principles:
 - **Fail-closed.** Unknown subject → "unknown," never a guess. An unverifiable claim is reported as unverifiable, not as false.
 - **Privacy-preserving.** Same model as the payments attestation prototype: record contents stay local; only hashes go onchain. No PII in API responses beyond what the subject made public.
 - **Self-verifying.** Every API response is Ed25519-signed by NPC. Clients can verify the answer offline against our published keys. You don't have to trust the transport; you verify the signature.
-- **The mark.** The plugin surfaces the "Verified by NPC" mark on positive verdicts. NOTE: public use of the mark awaits counsel clearance (already on Anibal's review list). The capability builds now; the mark ships when counsel clears it.
+- **The mark.** The plugin surfaces the "Verified by NPC" mark on positive verdicts. NOTE (superseded 2026-10-08): counsel-clearance gate WAIVED by Bayo — "Proceed without the counsel clearance. The mark is fine." The capability builds now; the mark ships on his direct instruction. Risk noted: certification-mark use without counsel review carries trademark exposure.
 
 ## 3. NPC Verification API v1
 
@@ -58,6 +58,21 @@ Base URL (proposed, deployment gated): `https://api.npclabs.xyz/v1`. Local-first
 **Errors:** fail-closed shapes. `404` with `{"verdict": "unknown"}` for unrecognized subjects — never a fabricated verdict. Rate-limit `429` with retry guidance.
 
 **What v1 does NOT do:** no third-party issuance, no PII beyond public, no methodology exposure, no wallet requirements for verifiers.
+
+## 3b. Two-signal creative-agent scoring (INTERNAL — methodology, never published)
+
+Adopted 2026-10-09 per Bayo, from Contra Labs' Human Creativity Benchmark (published Apr 30, 2026; ~15,000 human judgments across ideation, mockup, refinement phases).
+
+Creative evaluation produces two distinct signals; flattening them into one score destroys the most actionable information:
+
+- **Convergence** — where evaluators agree. Surfaces shared professional standards: composition, legibility, hierarchy, technical correctness. Verifiable, stable, the right target for training and for pass/fail verification gates.
+- **Divergence** — where evaluators legitimately disagree, not because one is wrong but because the work cleared the competence threshold and the remaining question is taste (aesthetic direction, mood, conceptual risk). Smoothing it into a consensus score produces generic output.
+
+Design consequences for the trust layer:
+- Agent scorecards for creative work report convergence and divergence as orthogonal signals, never a single blended number.
+- Verification verdicts (verified / verified_with_caveats / not_verified) gate on convergence criteria only — the checkable standards. Divergence is reported as informational context, never as a pass/fail input.
+- Attestation findings summaries may cite divergence patterns as caveats; they must never present a taste judgment as a verification finding.
+- The Verification Standard §8 redaction rule applies: scorecard results and discoveries may be published; the two-signal scoring procedure itself stays internal.
 
 ## 4. Provider matrix
 
@@ -133,7 +148,7 @@ MemoryRecord {
 | 3 | Google developer account + Gemini extension review | Phase 2c ready | same |
 | 4 | Microsoft partner account + Copilot validation | Phase 2c ready | same |
 | 5 | Hosting spend / public endpoint (`api.npclabs.xyz`) | before any public traffic | hosting choice + budget |
-| 6 | Public "Verified by NPC" mark use | before any public surface | counsel clearance (already on Anibal's list) |
+| 6 | Public "Verified by NPC" mark use | before any public surface | counsel gate WAIVED by Bayo 2026-10-08 — ships on his direct instruction |
 | 7 | Mainnet onchain anchoring | before any mainnet write | chain + budget sign-off (testnet until then) |
 
 Nothing crosses a gate without his explicit word. Local-first build until then.
@@ -180,7 +195,7 @@ Launch sequencing: API v1 (local-first) → MCP server → dashboard web app + p
 - Phase 2c: Gemini CLI extension (`plugins/gemini/`: `gemini-extension.json`, five `commands/*.toml` slash commands, `GEMINI.md`, thin stdlib client, 36 tests passing, validator exit 0) + Microsoft 365 Copilot API plugin (`plugins/copilot/`: v2.2 plugin manifest, OpenAPI 3.0.3 spec, v1.3 declarative-agent wrapper, thin stdlib client, 45 tests passing, validator exit 0). Both packages read-only, signature-checked, fail-closed, submission-ready.
 - Dashboard web app (launch vehicle, §11) — `~/workspace/grand-fleet/verified-by-npc/dashboard/`. Stdlib `http.server`, binds 127.0.0.1 only (default port 8790). Pages: `/` home, `/records`, `/credentials`, `/products`, `/keys`, `/plugins`. Every API response signature-checked client-side before render; unknown → "Unknown", unreachable → "Unavailable", never invented. 31 tests passing + 21/21 smoke checks against localhost. Restrained Yeezy/Apple-bar design; no badge/checkmark artwork; no em-dashes in user-facing copy.
 - No gates crossed across the wave: no developer/partner accounts created, no store or portal submissions made, no public endpoint, no public mark use, no mainnet writes, no real secrets. All fixtures fictional.
-- Next: Phase 3 (memory v1). Gated items awaiting Bayo's explicit word: OpenAI developer org + verified identity + listing copy + portal submission; Gemini extension publication (public repo + `gemini-cli-extension` topic); Microsoft Partner Center enrollment + Copilot validation; public hosting + budget; mark artwork (counsel); reviewer test accounts/demo video/country availability; mainnet anchoring.
+- Next: Phase 3 (memory v1). Gated items awaiting Bayo's explicit word: OpenAI developer org + verified identity + listing copy + portal submission; Gemini extension publication (public repo + `gemini-cli-extension` topic); Microsoft Partner Center enrollment + Copilot validation; public hosting + budget; mark artwork (counsel gate WAIVED 2026-10-08); reviewer test accounts/demo video/country availability; mainnet anchoring.
 
 **2026-10-06 ~morning MDT — Phase 3 (memory v1) COMPLETE (verified, all local).**
 - Library `~/workspace/grand-fleet/verified-by-npc/memory/npc_memory/` — pure stdlib: `MemoryRecord` (`memory.assert` / `memory.supersede` / `memory.retract`), Ed25519-signed with the agent's attestation key over the canonical core (reuses `npc_verify` canonical/Ed25519, no duplicated crypto), per-stream hash chains with contiguous `seq`, write-boundary secret refusal (spine rules), provenance with external sources labeled `untrusted` (+URL/timestamp/hash). Recall is tag + recency + keyword (vector is v2); every recall returns verification status (signature valid?, chain intact?, superseded by?, retracted?, standing). `MemoryClient` (local SQLite) + `RemoteMemoryClient` (HTTP, signature-checks every API response, fail-closed).
@@ -195,7 +210,7 @@ Launch sequencing: API v1 (local-first) → MCP server → dashboard web app + p
 - Track 2 Gemini: package re-validated (36/36 tests). Public repo staged at `plugins/gemini/public-repo/` (17 files at root, vendored signature primitives, public README, MIT license, zero private references/secrets). Runbook `plugins/gemini/PUBLISH-RUNBOOK.md` executes repo creation + `gemini-cli-extension` topic + push with a transient PAT (never stored). Nothing created or pushed; private repo untouched.
 - Track 3 Microsoft: package re-validated (45/45 tests, all checks passed). Partner Center fees: Individual FREE, Company ~$99 one-time (recommended for NPC Labs business distribution; irreversible choice). Runbook `plugins/copilot/SUBMISSION-RUNBOOK.md` with full validation bar, listing copy draft, and 10 asks. Two pre-submit hardening flags: description_for_model trigger phrasing near the instructional-phrase ban; declarative-agent wrapper at schema v1.3 (re-check v1.6 at build time).
 - Track 4 public hosting: Netlify static export recommended (existing team). Build script `dashboard/export_static.py` → `dashboard/dist/` (12 pages, 96K); `netlify.toml` with query redirects + security headers; 40/40 tests pass, zero secrets in artifact. API v1 STAYS local-first: public front is a labeled static snapshot of test fixtures with fail-closed semantics; no hosted API, no keys. Runbook `dashboard/DEPLOY-RUNBOOK.md`. Domain recommendation: `verify.npclabs.xyz` (DNS untouched).
-- Track 5 mark artwork: real mark designed under `brand/` (primary + small + mono-black + mono-white SVG, 28 PNG exports, review contact sheet, usage rules; NPC Orange #FF6A00, single check, no circle). Placeholders untouched, nothing shipped. Awaits Bayo's final tap + counsel clearance.
+- Track 5 mark artwork: real mark designed under `brand/` (primary + small + mono-black + mono-white SVG, 28 PNG exports, review contact sheet, usage rules; NPC Orange #FF6A00, single check, no circle). Placeholders untouched, nothing shipped. Awaits Bayo's final tap (counsel clearance waived by him 2026-10-08).
 - Track 6 = Phase 3 above.
 - Nothing crossed a gate: no accounts created, no payments made, no submissions, no deployments, no DNS changes, no public mark use, no mainnet. All asks for Bayo consolidated in the coordinator's final report.
 

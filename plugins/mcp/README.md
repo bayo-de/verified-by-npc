@@ -1,20 +1,21 @@
 # npc-verify-mcp — "Verified by NPC" MCP server
 
-**Phase 2a of the Verified by NPC program** (DESIGN v1 §4). **Internal
-only. Not published. Not listed in any directory.**
+<!-- mcp-name: io.github.bayo-de/npc-verify -->
 
-A tools-only MCP server that puts NPC Labs verification inside any
-MCP-capable assistant (Claude Desktop, Claude Code, and friends). Every
-tool is a **thin call to the NPC Verification API v1** — no verification
-logic lives here — and every API response is **Ed25519 signature-verified
-client-side** before it reaches the caller. Fail-closed everywhere:
-unknown subjects return `"unknown"`, never a guess.
+Ask "is this real?" inside any MCP-capable assistant. This MCP server
+puts NPC Labs verification inside Claude Desktop, Claude Code, and
+friends: check a product, credential, claim, or AI agent against NPC Labs
+verification records. Every tool is a **thin call to the NPC Verification
+API v1** — no verification logic lives here — and every API response is
+**Ed25519 signature-verified client-side** before it reaches the caller.
+Fail-closed everywhere: unknown subjects return `"unknown"`, never a
+guess.
 
 - **Zero dependencies.** Pure Python standard library. The MCP JSON-RPC
   transport is implemented directly over stdio; the signing primitives are
   reused from the API reference implementation.
-- **Local-first.** Talks to the API at `http://127.0.0.1:8787` by default.
-  No public endpoint, no store listing, no mark usage, no real secrets.
+- **Local-first.** Talks to the API at `http://127.0.0.1:8787` by default
+  (override with `NPC_VERIFY_API_URL`).
 
 ## Layout
 
