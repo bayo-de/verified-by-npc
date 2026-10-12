@@ -143,3 +143,38 @@ check-and-insert under the lock: `seq` must continue the stream and
 - Erasure: there is no delete. Withdrawal is `memory.retract`, and the
   history stays.
 - Any public exposure: local-first, fictional fixtures, no real secrets.
+
+## 8. v1.1 spec delta — Leviathan patterns (adopted 2026-10-10)
+
+Source: elstongun/leviathan pattern study (Apache-2.0),
+`memory/docs/leviathan-pattern-study-2026-10-10.md`. Spec-level only;
+implement when memory v1 is next touched.
+
+**8.1 Keyed-write slots.** Writes that describe changeable state carry a
+`key` in `content` (e.g. `content.key = "project.status"`). A new assert
+with the same stream + key issues an implicit `memory.supersede` against
+the live record holding that key — the writer never has to find the old
+record id. Two live asserts may not hold the same key; the write is
+rejected, fail-closed. This is the stale-memory killer: keyed values
+replace, never contradict. Unkeyed asserts keep v1 append semantics.
+
+**8.2 Token-budgeted recall.** `recall()` gains a `budget_tokens`
+parameter (default 450). Hits are returned as cited result cards, largest
+relevance first, until the budget is spent — never a raw dump. Every
+recall response reports `shown_N_of_M` so the caller can tell "no match"
+from "no data." Every card carries its verification status (§2).
+
+**8.3 Session briefing.** Session start injects a briefing of at most
+1,000 tokens: the live keyed slots (8.1) plus the top recall cards for
+the session's declared focus. Briefings are derived, never stored.
+
+**8.4 Ambiguity-refusing resolution.** Any entity resolution in the
+memory layer lists candidates and refuses on ambiguity — it never
+guesses. Matches the honesty creed; resolution calls return the
+candidate list with an explicit `ambiguous: true` rather than a
+best-guess record.
+
+**8.5 Secrets refused at write time.** `assert_memory` rejects content
+matching credential-shaped patterns (keys, tokens, secrets) before
+signing — fail-closed, with a `rejected_secret` error. The memory layer
+never persists credentials. (Attestation-relevant.)
