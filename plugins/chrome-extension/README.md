@@ -1,83 +1,92 @@
-# NPC Verify: Chrome extension (scaffold, v0.1.0)
+# NPC Verify: Chrome extension
 
-**Status:** first working scaffold. Internal only. Not submitted anywhere.
+**Status:** v1.0.0, Web Store submission candidate (not yet submitted).
+**Category (BETA):** Trust infrastructure / provenance.
 
-A Manifest V3 extension that checks whether an image on the web is
-registered with NPC Labs. It implements the layered verdict from the
-[Phase 2 product brief](../../docs/CHROME-EXTENSION-BRIEF.md):
+NPC Verify checks whether an image on the web is registered with NPC
+Labs, and says plainly what it found and what it did not check.
 
-1. **Provenance** : hash the image URL, ask the verification API
-   (`POST /v1/claims/verify`). A match shows the registered creator and
-   date. No match means "no record found," never "fake."
-2. **Forensics** : real client-side checks: file format, size,
-   dimensions, embedded EXIF/PNG software tags, known generator markers,
-   plus Google Lens / TinEye link-outs. Every finding is labeled for
-   what it is; absence of a marker proves nothing.
-3. **AI judgment** : stubbed in this scaffold. The panel says so
-   plainly: the hosted Fleet backend adds a probabilistic read later,
-   with its confidence stated. This version does not guess.
+## The layered check
 
-When no provenance is found, the panel shows the nudge: "This creator
-isn't verified yet. Know them? Nudge them to get the NPC stamp." with a
-copyable invite link (`https://verify.npclabs.xyz/get-verified`).
+1. **Provenance (registry).** The image URL is hashed with SHA-256 in
+   the service worker and the hash is sent to the NPC verification API
+   (`POST /v1/claims/verify`). The API's answer is only trusted after
+   its Ed25519 response signature (`X-NPC-Signature`, over the
+   NPC-JCS-v1 canonical body) verifies against NPC's published keys
+   (`GET /v1/keys`). A failed or unverifiable signature fails closed:
+   no verdict is shown from an answer we cannot trust. Registered
+   images report a verdict of **Verified** or **Verified with
+   caveats**, exactly as recorded; any other standing is reported as
+   not verified. No match reports **No record found**, which is not
+   the same as fake.
+2. **Forensics (on device).** The image bytes are read in the page's
+   own context where possible (the page already loaded the file),
+   falling back to a direct fetch, and parsed locally: JPEG EXIF and
+   PNG text chunks, matched against known generator markers. Findings
+   are reported; conclusions are not drawn. Bytes never leave the
+   device for this layer.
+3. **AI judgment.** Not in this version. The panel says so rather
+   than guessing.
 
-Honesty creed, enforced in copy and logic: we never claim more than we
-checked. Verdicts are only ever `verified`, `no_record`, `not_checked`,
-or `api_unreachable`.
+The free tier counts checks locally (10 free checks) and, on a
+no-record result, offers an invite link the user can send the creator.
 
-## What's real vs stubbed
+## Design
 
-| Piece | State |
-|---|---|
-| Image collection from the page | Real (content script, DOM only) |
-| File forensics (EXIF, PNG text, markers) | Real, runs on-device |
-| Reverse-image link-outs | Real links, searches run on those sites |
-| Provenance via API | Real code path, needs a verifier API key (see below) |
-| AI judgment layer | Stubbed with honest copy, no fake output |
-| Free-check counter (10) | Real local counter, no enforcement backend |
-| Nudge + copy link | Real |
+One language with the rest of NPC: the space grey and Inter of
+npclabs.xyz, the paper and ink of the public record dashboard, one
+accent (NPC orange, #ec662b) reserved for the check and the record
+link. Light and dark follow the system color scheme. The verdict word
+is the largest thing in the panel.
 
-## Load it unpacked
+## Permissions
 
-1. Open `chrome://extensions`.
-2. Enable "Developer mode" (top right).
-3. "Load unpacked" and select this folder
-   (`verified-by-npc/plugins/chrome-extension/`).
-4. Open any page with images, click the NPC Verify button in the toolbar.
+- `activeTab` + `scripting`: when the user opens the popup, collect
+  the active tab's images and, during a check, read the selected
+  image's bytes in the page context. No standing content script; the
+  collector is injected on demand only.
+- `storage`: the local free-check counter and optional developer
+  overrides for the API base and key.
+- Host permission for `https://api.npclabs.xyz/*` only: the
+  verification API.
 
-## Point it at an API
+No analytics, no tracking, no remote code. The only network call is
+to the NPC API, carrying a hash of the image URL, never the URL or
+the image itself.
 
-Provenance checks need a verifier-role API key. Two ways:
+## Configuration
 
-- Edit `config.js`: set `apiBase` (e.g. `https://api.npclabs.xyz/v1`)
-  and `apiKey` (a `npc_...` verifier key).
-- Or, at runtime in the extension's service-worker console:
-  `chrome.storage.local.set({npc_api_base: "...", npc_api_key: "..."})`.
+Production defaults live in `config.js`. For development against the
+local demo API (`api/README.md` in this repo), set two storage keys
+from the service worker console:
 
-Without a key, the extension says so in Layer 1 and every other layer
-still runs. The local demo API from `verified-by-npc/api` works as the
-target: `python3 -m npc_verify` in that folder, then use the printed
-verifier key. Note the demo only knows its seeded test fixtures, so
-expect "no record found" for real-world images until the hosted
-registry exists.
+```js
+chrome.storage.local.set({
+  npc_api_base: "http://127.0.0.1:8787/v1",
+  npc_api_key: "<verifier test key from the API's first-run output>"
+});
+```
+
+The local API sends CORS headers, so no manifest change is needed.
 
 ## Files
 
-- `manifest.json` : MV3, minimal permissions (`activeTab`, `scripting`,
-  `storage`), host access only for the API origins. No remote code, no
-  analytics, no tracking.
-- `content.js` : collects candidate images from the page (160px minimum,
-  top 8 by area). Reads the DOM, sends nothing anywhere.
-- `background.js` : service worker: runs the three-layer pipeline,
-  keeps the free-check counter.
-- `forensics.js` : dependency-free JPEG EXIF + PNG tEXt parser and
-  generator-marker matching.
-- `popup.html` / `popup.css` / `popup.js` : the verdict panel.
-- `config.js` : endpoint, key, URLs, free-check total. Edit here.
-- `icons/` : extension icons derived from the brand mark.
+- `manifest.json` — MV3 manifest, least-privilege permissions.
+- `config.js` — API base, key, links, free-tier size.
+- `background.js` — service worker: provenance with signature
+  verification, verdict assembly, free-check counter.
+- `forensics.js` — client-side JPEG EXIF / PNG text parsing and
+  marker matching; pure byte analysis (`npcAnalyzeImageBytes`).
+- `content.js` — image collector, injected on demand from the popup.
+- `popup.html` / `popup.js` / `popup.css` — the panel.
+- `icons/` — the NPC check at 16/32/48/128.
 
-## Design notes
+## Tests
 
-Yeezy-first bar: one verdict in huge type, the reasoning one tap away
-in the three layer rows. The orange check appears only next to a real
-`verified` verdict, per the brand usage rule. No em-dashes in copy.
+Exercised end to end against the local demo API on 2026-10-13:
+parser and signature unit tests (21/21) and a full Chromium run of
+the production popup flow (20/20), including Verified, Verified with
+caveats, No record with the creator nudge, EXIF and PNG marker
+forensics, the counter, and both color schemes. Harnesses and the
+full results live with the submission package:
+`~/workspace/goals/npc-labs/files/extension-store-submission/`.

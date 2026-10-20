@@ -20,6 +20,7 @@ async function activeTab() {
 
 let IMAGES = [];
 let SELECTED = 0;
+let TAB_ID = null;
 
 async function init() {
   show("view-loading");
@@ -29,6 +30,7 @@ async function init() {
     show("view-empty");
     return;
   }
+  TAB_ID = tab.id;
   let resp;
   try {
     resp = await chrome.tabs.sendMessage(tab.id, { type: "NPC_COLLECT_IMAGES" });
@@ -95,7 +97,7 @@ async function runCheck() {
   show("view-checking");
   let result;
   try {
-    result = await chrome.runtime.sendMessage({ type: "NPC_CHECK", image: IMAGES[SELECTED] });
+    result = await chrome.runtime.sendMessage({ type: "NPC_CHECK", image: IMAGES[SELECTED], tabId: TAB_ID });
   } catch (e) {
     result = { error: "pipeline_failed" };
   }
@@ -136,9 +138,10 @@ function renderVerdict(r) {
   const mark = $("verdict-mark");
   mark.classList.add("hidden");
 
-  if (r.verdict === "verified") {
+  if (r.verdictWord) {
+    word.textContent = r.verdictWord;
+  } else if (r.verdict === "verified") {
     word.textContent = "Verified";
-    mark.classList.remove("hidden");
   } else if (r.verdict === "no_record") {
     word.textContent = "No record found";
   } else if (r.verdict === "not_checked") {
@@ -146,26 +149,44 @@ function renderVerdict(r) {
   } else {
     word.textContent = "API unreachable";
   }
+  // The mark appears only when the worker verified a signed, positive
+  // verdict. It is never decoration.
+  if (r.showMark) mark.classList.remove("hidden");
   sub.textContent = r.verdictSub;
 
   // Layer 1: provenance
   const p = r.provenance || {};
-  if (p.status === "matched") {
-    setLayer("prov", "registered", "hit");
+  if (p.status === "matched" && r.showMark) {
+    setLayer("prov", p.attVerdict === "verified_with_caveats" ? "registered, with caveats" : "registered", "hit");
     $("body-prov").innerHTML =
       "<p><span class='k'>Registered.</span> " + esc(p.creator || "A creator") + " put this on record"
       + (p.recordedAt ? " on " + esc(p.recordedAt.slice(0, 10)) : "") + "."
       + (p.scope ? " Scope: " + esc(p.scope) + "." : "") + "</p>"
+      + (p.findings ? "<p><span class='k'>On record:</span> " + esc(p.findings) + "</p>" : "")
+      + "<p>Answer signed by NPC. Signature verified against the published keys.</p>"
       + "<p><a href='" + esc(r.fullReportUrl) + "' target='_blank' rel='noopener'>See the full record</a></p>";
+  } else if (p.status === "matched") {
+    setLayer("prov", "record found", "miss");
+    $("body-prov").innerHTML =
+      "<p>A record matched this image, with standing \"" + esc(p.attVerdict || "unknown")
+      + "\". That standing is not a verified one, so no verdict is shown from it.</p>"
+      + "<p>Answer signed by NPC. Signature verified against the published keys.</p>";
+  } else if (p.status === "signature_failed") {
+    setLayer("prov", "signature failed", "miss");
+    $("body-prov").innerHTML = "<p>The API answered, but the answer's NPC signature did not verify against the published keys. An answer we cannot verify is not shown as a result.</p>";
   } else if (p.status === "unknown") {
     setLayer("prov", "no record", "miss");
-    $("body-prov").innerHTML = "<p>No NPC record matches this image. That means nobody has registered it here, nothing more.</p>";
+    $("body-prov").innerHTML = "<p>No NPC record matches this image. That means nobody has registered it here, nothing more.</p>"
+      + "<p>Answer signed by NPC. Signature verified against the published keys.</p>";
   } else if (p.status === "not_configured") {
     setLayer("prov", "not connected", "miss");
     $("body-prov").innerHTML = "<p>The registry was not checked. This copy of the extension has no API key set. See the README to connect one.</p>";
   } else if (p.status === "unauthorized") {
     setLayer("prov", "key rejected", "miss");
     $("body-prov").innerHTML = "<p>The API rejected the configured key. Check that it is a verifier-role key.</p>";
+  } else if (p.status === "error") {
+    setLayer("prov", "api error", "miss");
+    $("body-prov").innerHTML = "<p>The verification API answered with an error, so the registry could not be read.</p>";
   } else {
     setLayer("prov", "unreachable", "miss");
     $("body-prov").innerHTML = "<p>We could not reach the verification API, so the registry was not checked.</p>";
