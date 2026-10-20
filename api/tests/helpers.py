@@ -11,6 +11,12 @@ import unittest
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
 
+# Test-harness path for the intake-fetch SSRF guard (audit D3): the
+# registration fixtures serve content over loopback, so the harness
+# opts in to loopback fetches. Production never sets this; the guard
+# still refuses private/link-local ranges and all redirect hops.
+os.environ.setdefault("NPC_ALLOW_LOOPBACK_FETCH", "1")
+
 from npc_verify.server import create_app, Handler  # noqa: E402
 from npc_verify.seed import seed_all  # noqa: E402
 from npc_verify.canonical import canonicalize  # noqa: E402

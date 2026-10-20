@@ -31,12 +31,14 @@ api/
     canonical.py        # NPC-JCS-v1 canonical JSON
     ed25519.py          # vendored RFC 8032 (from sim-gate)
     errors.py           # fail-closed error shapes
+    detector.py         # Sightengine genai client, server-side credentials
   tests/
     test_ed25519.py     # RFC 8032 vectors + tamper checks
     test_canonical.py   # canonicalization determinism
     test_keys.py        # generation, rotation, publish shape
     test_store.py       # schema, lifecycle, append-only revocation
     test_api.py         # end-to-end over loopback HTTP, all 7 endpoints
+    test_detector.py    # /v1/images/ai-check + Sightengine client (mocked)
     test_contracts.py   # Proofline-style contract suite
 ```
 

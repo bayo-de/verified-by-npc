@@ -21,6 +21,7 @@ _KEEP = [
     ("POST", "/v1/claims/verify"),
     ("GET", "/v1/products/demo-tag-001"),
     ("GET", "/v1/agents/demo-agent-001/attestation"),
+    ("POST", "/v1/images/ai-check"),
 ]
 
 

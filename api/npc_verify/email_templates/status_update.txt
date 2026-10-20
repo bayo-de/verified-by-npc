@@ -1,0 +1,17 @@
+Hello,
+
+The status of your NPC record has changed.
+
+$subject_name
+Record ID: $record_id
+New status: $status_label
+
+$detail
+
+You can see the full record, including every check and its result, here:
+
+$record_link
+
+NPC Labs
+
+You are receiving this email because this address was given when the record above was registered. We use it only for messages about this record, never for marketing.

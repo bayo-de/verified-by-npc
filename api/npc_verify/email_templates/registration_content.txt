@@ -1,0 +1,22 @@
+Hello $recipient_name,
+
+Thank you for registering your work with NPC Labs.
+
+"$title" is now on record. Your NPC record ID is:
+
+$record_id
+
+Keep this ID. Anyone can check your record at any time, with no account and no permission from us:
+
+$record_link
+
+Your status today is: registered, checks pending. NPC has signed and stored your registration. The record itself lists the checks that ran when you registered and the checks that have not run yet.
+
+Registration is not verification. Verification is a second step, and it is not automatic. When you are ready, you can ask NPC to verify this record from the record page above, using the email address you registered with. We will email this address again when your record's status changes.
+
+One question is worth asking of any work, including your own: Who signed for that? Your record now has an answer.
+
+NPC Labs
+A for profit company for public good and AI blockchain research lab.
+
+You are receiving this email because this address was given when the record above was registered. We use it only for messages about this record, never for marketing.

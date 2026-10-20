@@ -5,7 +5,10 @@ info:
   description: |
     Verify a claim, a credential, a product, or an agent against NPC Labs'
     attestation records. Read-first: v1 verifies; it does not issue
-    attestations to third parties.
+    attestations to third parties. The public registration endpoints
+    (POST /v1/register/*) are the one write open to everyone: they mint
+    signed registration records that start verification. Registration
+    is not verification and issues no verdict and no mark.
 
     Every response body is canonicalized (NPC-JCS-v1: UTF-8, sorted keys,
     no insignificant whitespace) and Ed25519-signed. The signature travels
@@ -127,6 +130,41 @@ paths:
                     properties:
                       matched: { type: boolean, const: false }
 
+  /images/ai-check:
+    post:
+      operationId: aiCheckImage
+      summary: AI-generation check for one image (Sightengine-backed)
+      description: |
+        The client sends the image itself (base64) or its URL. The API
+        holds the Sightengine credentials server-side and returns the
+        genai ai_generated probability as an integer percent inside
+        the signed response. When detection is not configured or the
+        service fails, the answer is an honest 503; no score is faked.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AiCheckRequest'
+      responses:
+        '200':
+          description: Detector result, signed like every response
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AiCheckResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/DetectorUnavailable'
+
   /products/{tag_id}:
     get:
       operationId: getProduct
@@ -217,6 +255,206 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/AttestationRequest'
+
+  /pact/grants:
+    post:
+      operationId: createPactGrant
+      summary: Record a PACT grant issuance (mints the signed consent record)
+      description: |
+        Requires an API key with the `issuer` role. NPC extension
+        surface (PACT 1.0 defines no consent-record format): the
+        response body is the signed `npc.pact.consent_record`,
+        preserving `scopes_requested` vs `scopes_granted` exactly as
+        approved. `scopes_granted` must be a subset of
+        `scopes_requested`. A second issuance for the same `grant_id`
+        conflicts. Record format: internal profile draft
+        (trust-tab/pact-record-layer-PROFILE-DRAFT.md).
+      responses:
+        '201':
+          description: Consent record minted
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pa_iss, pa_sub, brand_id, user_id_at_brand,
+                         scopes_requested, scopes_granted]
+              properties:
+                grant_id: {type: string}
+                pa_iss: {type: string}
+                pa_sub: {type: string}
+                brand_id: {type: string}
+                user_id_at_brand: {type: string}
+                scopes_requested:
+                  type: array
+                  items: {type: string}
+                scopes_granted:
+                  type: array
+                  items: {type: string}
+                shown_at: {type: string}
+                granted_at: {type: string}
+                expires_at: {type: string}
+
+  /pact/grants/{grant_id}/receipts:
+    parameters:
+      - name: grant_id
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: appendPactReceipt
+      summary: Append a Provider receipt to the grant's hash-chained audit log
+      description: |
+        Requires an API key with the `issuer` role. The body carries
+        the PACT section 5.6 receipt claims verbatim as `receipt`
+        (plus optional `ts`). The response is the signed audit entry
+        (`seq`, `receipt_claims_hash`, `prev_entry_hash`,
+        `entry_hash`). Unknown grants fail closed with 404
+        `{"verdict": "unknown"}`.
+      responses:
+        '201':
+          description: Audit entry appended
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [receipt]
+              properties:
+                receipt: {type: object}
+                ts: {type: string}
+
+  /pact/grants/{grant_id}/audit:
+    parameters:
+      - name: grant_id
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: getPactGrantAudit
+      summary: Read a grant's audit trail with live chain verification
+      description: |
+        Requires an API key with the `verifier` role or above.
+        Returns the signed entries in chain order plus a `chain`
+        block (`valid`, `detail`, `entries`) computed at read time;
+        a rewritten or missing receipt reports `valid: false` naming
+        the exact broken `seq`.
+      responses:
+        '200':
+          description: Audit trail and chain verification result
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /pact/grants/{grant_id}:revoke:
+    parameters:
+      - name: grant_id
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: revokePactGrant
+      summary: Revoke a PACT grant (signed, append-only)
+      description: |
+        Requires an API key with the `issuer` role. Revocation is a
+        new signed `npc.pact.revocation` record; the consent record
+        and audit log are never edited. A second revocation
+        conflicts. Unknown grants fail closed with 404
+        `{"verdict": "unknown"}`.
+      responses:
+        '201':
+          description: Revocation record written
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [revoked_by, reason]
+              properties:
+                revoked_by: {type: string}
+                reason: {type: string}
+
+  /pact/grants/{grant_id}/status:
+    parameters:
+      - name: grant_id
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: getPactGrantStatus
+      summary: Signed status read for a PACT grant
+      description: |
+        Requires an API key with the `verifier` role or above. The
+        body is the signed `npc.pact.grant_status` record itself
+        (`status`: active / revoked / expired, plus the consent
+        `record_id`), verifiable offline against /v1/keys. This is
+        the read path PACT section 5.5 step 2's revocation check
+        needs; consumers must fail closed on anything but a verified
+        `active`.
+      responses:
+        '200':
+          description: Signed grant status record
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   /memory/agents:
     post:
@@ -376,6 +614,257 @@ paths:
             schema:
               $ref: '#/components/schemas/MemoryRecallRequest'
 
+  /register/content:
+    post:
+      operationId: registerContent
+      summary: Register a piece of content and start its verification
+      description: |
+        PUBLIC: no API key. Registration is free and is NOT
+        verification. The API mints a signed registration record
+        (npc.registry.content_registration) with status
+        "registered_checks_pending" and returns it; the same record
+        answers at GET /v1/records/{record_id}. The record lists the
+        checks that ran at intake and those that have not run yet.
+        For content at a fetchable URL, the content is fetched once
+        (SHA-256 recorded). Images: the C2PA structural parse runs on
+        the bytes, and when a manifest is present, cryptographic
+        validation runs too (the manifest's COSE signature, the
+        claim's assertion hashes, and the asset hash are verified;
+        the signer is reported exactly as presented in its
+        certificate, unrated: no trust list is configured). The AI
+        generation check runs when a detector is configured,
+        recorded as a signal percent with its uncertainty stated.
+        Audio and video: a media probe reads the container facts
+        from the file itself (format, duration, codecs, dimensions,
+        channels, sample rate), and video files also get the C2PA
+        read and validation on the file itself; frame-level checks
+        stay pending (no video decoder ships in the runtime) and
+        AI audio detection is not run (not cleared for the
+        registry). Abuse minimums: the creator email is required
+        and per-email and per-IP submission caps apply (429 past
+        the cap). The email is kept server-side only and never
+        appears in the signed public record.
+
+        The request may carry an optional `source` object when the
+        work arrives through a platform account the customer
+        connected (the integrations batch lane). The source is
+        provenance: which platform listed the work, its ID and
+        address on that platform, the platform's own timestamps and
+        checksum when it gave one, and whether the work's bytes can
+        be fetched at all. When a source is present, the generic
+        URL fetch does not run (a platform permalink is a human
+        page, not the work's bytes); the record instead shows the
+        platform metadata as observed and lists the byte fetch as
+        not run. Connecting an account shows control of that
+        account at connect time; it is not verification of the
+        work, and a source changes no status and issues no mark.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterContentRequest'
+      responses:
+        '201':
+          description: Signed registration record, minted at issuance
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContentRegistration'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /register/agent:
+    post:
+      operationId: registerAgent
+      summary: Register an agent (signed registration claim)
+      description: |
+        PUBLIC: no API key. Per the Agent Registry spec, registration
+        is free, a named accountable owner is required (no anonymous
+        or team-alias owners), and the issued signed claim
+        (npc.registry.agent_registration) states registration, not
+        verification: status "registered_checks_pending", no verdict,
+        no verification mark. The same record answers at
+        GET /v1/records/{record_id}. Abuse minimums: the owner email
+        is required and per-email and per-IP submission caps apply
+        (429 past the cap). The email is kept server-side only and
+        never appears in the signed public record.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterAgentRequest'
+      responses:
+        '201':
+          description: Signed agent registration claim, minted at issuance
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRegistration'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /records/{id}:
+    get:
+      operationId: getRecord
+      summary: The signed record for any API-issued ID
+      description: |
+        PUBLIC: no API key. One resolution path for every NPC ID.
+        Registration IDs return the signed registration record minted
+        at issuance; credential, product, agent, attestation, and PACT
+        consent IDs return exactly the body their own endpoint
+        returns. Unknown IDs fail closed.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: The record for this ID
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Unknown ID (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+
+  /records/{id}:request-verification:
+    post:
+      operationId: requestVerification
+      summary: Ask NPC to verify a registration (step two)
+      description: |
+        PUBLIC: no API key. The registrant asks for the verification
+        step on their own record. The body carries the email the
+        record was registered with; the server matches it against
+        the record's stored email hash. Registration records are
+        immutable, so a match mints a separate signed request
+        record (npc.registry.verification_request) that lands in
+        NPC's step-two queue, and the request state answers at
+        GET /v1/records/{id}/verification-request. A repeat request
+        returns the existing request record (200) instead of
+        minting a duplicate. A mismatched email and an unknown ID
+        return the identical signed 404, so the endpoint reveals
+        nothing about which IDs exist beyond what the public record
+        endpoint already shows. Asking issues no verdict and no
+        verification mark. Attempts (matched and not) are capped
+        per email and per IP on the same ceilings as registration
+        (429 past the cap).
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerificationRequestInput'
+      responses:
+        '201':
+          description: Signed verification-request record, minted now
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationRequest'
+        '200':
+          description: The existing request record (repeat request)
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationRequest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Unknown ID or email mismatch (identical answer)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /records/{id}/verification-request:
+    get:
+      operationId: getVerificationRequest
+      summary: A registration's verification-request state
+      description: |
+        PUBLIC: no API key. Whether the registrant has asked for
+        verification of this record, when, and the signed request
+        record itself when one exists, so public record views can
+        show "Verification requested". IDs that are not
+        registrations (and unknown IDs) fail closed with the same
+        signed 404 as the record endpoint.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: The registration's request state
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationRequestState'
+        '404':
+          description: Unknown or non-registration ID (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -424,6 +913,18 @@ components:
             $ref: '#/components/schemas/Error'
     NotFound:
       description: Unknown subject or out-of-scope record
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    DetectorUnavailable:
+      description: AI detection is not configured or the service failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: Submission or request cap reached; slow down and retry later
       content:
         application/json:
           schema:
@@ -505,6 +1006,37 @@ components:
           type: string
           pattern: '^[0-9a-f]{64}$'
           description: SHA-256 hex of the normalized claim text
+
+    AiCheckRequest:
+      type: object
+      description: Provide exactly one of image_url or image_base64
+      properties:
+        image_url:
+          type: string
+          maxLength: 2048
+          description: http(s) URL of the image; Sightengine fetches it
+        image_base64:
+          type: string
+          description: Base64 image bytes, at most 750 KB decoded
+
+    AiCheckResult:
+      type: object
+      required: [check, provider, model, ai_generated_percent,
+                 image_sha256, source, checked_at]
+      properties:
+        check: { type: string, const: ai_generation }
+        provider: { type: string, const: sightengine }
+        model: { type: string, const: genai }
+        ai_generated_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Sightengine ai_generated probability as a percent
+        image_sha256:
+          type: ['string', 'null']
+          description: SHA-256 hex of the image bytes (bytes mode only)
+        source: { type: string, enum: [bytes, url] }
+        checked_at: { type: string, format: date-time }
 
     OnchainAnchor:
       type: object
@@ -779,3 +1311,229 @@ components:
           type: array
           items: { $ref: '#/components/schemas/MemoryRecallItem' }
         count: { type: integer }
+
+    RegisterContentRequest:
+      type: object
+      required: [title, kind, locator, creator_name, creator_email]
+      properties:
+        title: { type: string, maxLength: 200 }
+        kind:
+          type: string
+          enum: [image, text, audio, video, other]
+        locator:
+          type: string
+          maxLength: 2048
+          description: An http(s) URL where the content can be fetched, or a content hash (hex, optionally prefixed with sha256:)
+        creator_name: { type: string, maxLength: 128 }
+        creator_email:
+          type: string
+          maxLength: 254
+          description: Required. Kept server-side only (submission caps and contact); never published in the signed record.
+        source:
+          $ref: '#/components/schemas/RegistrationSource'
+
+    RegistrationSource:
+      type: object
+      description: |
+        Optional provenance for a registration that arrives through
+        a platform account the customer connected. Only the fields
+        below are kept, in this shape, in the signed record.
+        `platform_checksum` is the platform's own checksum for the
+        work as the platform stores it, labeled with its algorithm;
+        it is never an NPC-computed hash. `metadata_hash` is a
+        SHA-256 over the normalized source metadata, computed by
+        the integration before submission. `byte_class` states what
+        the lane can do with the work's bytes: `bytes_fetchable`
+        (the platform lets NPC fetch the bytes), `metadata_only`
+        (the platform gives details but not bytes), or
+        `permalink_only` (only the work's address). `rendition`
+        names the form the bytes take when they are an export or
+        conversion rather than the native file. `previous_record_id`
+        links a changed version of a work to the registration of
+        its earlier version.
+      required: [platform, external_id, permalink, byte_class]
+      properties:
+        platform:
+          type: string
+          enum: [youtube, instagram, tiktok, x, spotify,
+                 google_drive, microsoft_onedrive, box]
+        external_id:
+          type: string
+          maxLength: 256
+          description: The work's stable ID on the platform.
+        permalink:
+          type: string
+          maxLength: 2048
+          description: The work's address on the platform (http(s) URL).
+        byte_class:
+          type: string
+          enum: [bytes_fetchable, metadata_only, permalink_only]
+        account_display_name:
+          type: string
+          maxLength: 128
+          description: The connected account's display name, as the platform shows it.
+        native_type:
+          type: string
+          maxLength: 128
+          description: The platform's own type for the work (its media type or MIME type), preserved alongside the NPC kind.
+        published_at: { type: string, format: date-time }
+        modified_at: { type: string, format: date-time }
+        version_marker:
+          type: object
+          required: [kind, value]
+          properties:
+            kind: { type: string, maxLength: 64, description: 'Which marker this is, e.g. box_file_version, microsoft_ctag, google_version.' }
+            value: { type: string, maxLength: 512, description: The opaque marker value, exactly as the platform gave it. }
+        platform_checksum:
+          type: object
+          required: [algorithm, value]
+          properties:
+            algorithm: { type: string, enum: [md5, sha1, sha256, crc32, quickxor] }
+            value: { type: string, maxLength: 256 }
+        metadata_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 hex over the normalized source metadata.
+        rendition:
+          type: string
+          maxLength: 200
+          description: Label for the bytes when they are an export or conversion rather than the native file.
+        previous_record_id:
+          type: string
+          pattern: '^reg_[A-Za-z0-9]{8,64}$'
+          description: The NPC record ID of the earlier version of this work, when this registration is a changed version.
+
+    RegisterAgentRequest:
+      type: object
+      required: [agent_name, owner_name, owner_email]
+      description: A homepage or a description is required (at least one).
+      properties:
+        agent_name: { type: string, maxLength: 128 }
+        owner_name:
+          type: string
+          maxLength: 128
+          description: The named accountable owner. Anonymous and team-alias owners are not accepted.
+        owner_email:
+          type: string
+          maxLength: 254
+          description: Required. Kept server-side only (submission caps and contact); never published in the signed record.
+        homepage: { type: string, maxLength: 2048 }
+        description: { type: string, maxLength: 2000 }
+
+    RegistrationCheck:
+      type: object
+      description: |
+        One intake check entry. Entries in checks_run carry a status
+        and their result; entries in checks_not_run carry the reason
+        the check has not run. Check-specific result fields (sha256,
+        generator, ai_generated_percent, and the rest) ride alongside.
+      required: [check]
+      properties:
+        check: { type: string }
+        status: { type: string }
+        reason: { type: string }
+        detail: { type: string }
+
+    ContentRegistration:
+      type: object
+      description: |
+        The signed content registration record. Its signature (issuer
+        key, see GET /v1/keys) covers the canonical record without the
+        signature field, so the record verifies as a portable artifact.
+      required: [record_type, record_id, kind, status, status_label,
+                 title, content_kind, locator, locator_kind,
+                 creator_name, registered_at, checks_run,
+                 checks_not_run, key_id, signature]
+      properties:
+        record_type: { type: string, const: npc.registry.content_registration }
+        record_id: { type: string, description: 'The NPC ID of this record (reg_...)' }
+        kind: { type: string, const: content }
+        status: { type: string, const: registered_checks_pending }
+        status_label: { type: string, const: 'registered, checks pending' }
+        title: { type: string }
+        content_kind: { type: string, enum: [image, text, audio, video, other] }
+        locator: { type: string }
+        locator_kind: { type: string, enum: [url, content_hash] }
+        creator_name: { type: string }
+        registered_at: { type: string, format: date-time }
+        checks_run:
+          type: array
+          items: { $ref: '#/components/schemas/RegistrationCheck' }
+        checks_not_run:
+          type: array
+          items: { $ref: '#/components/schemas/RegistrationCheck' }
+        source:
+          $ref: '#/components/schemas/RegistrationSource'
+          description: Present only when the registration arrived through a connected platform account; omitted otherwise.
+        key_id: { type: string }
+        signature: { type: string, description: Base64 NPC issuer signature over the record }
+
+    VerificationRequestInput:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email, description: 'The email the record was registered with. Matched against the stored hash; never published.' }
+
+    VerificationRequest:
+      type: object
+      description: |
+        The signed verification-request record. Its signature (issuer
+        key, see GET /v1/keys) covers the canonical record without
+        the signature field, so the record verifies as a portable
+        artifact. The subject registration record is never modified.
+      required: [record_type, record_id, subject_record_id,
+                 subject_kind, status, status_label, requested_at,
+                 detail, key_id, signature]
+      properties:
+        record_type: { type: string, const: npc.registry.verification_request }
+        record_id: { type: string, description: 'The NPC ID of this request record (vreq_...)' }
+        subject_record_id: { type: string, description: 'The registration record asked about (reg_...)' }
+        subject_kind: { type: string, enum: [content, agent] }
+        status: { type: string, const: verification_requested }
+        status_label: { type: string, const: 'Verification requested' }
+        requested_at: { type: string, format: date-time }
+        detail: { type: string }
+        key_id: { type: string }
+        signature: { type: string, description: Base64 NPC issuer signature over the record }
+
+    VerificationRequestState:
+      type: object
+      required: [record_id, verification_requested, requested_at, request]
+      properties:
+        record_id: { type: string }
+        verification_requested: { type: boolean }
+        requested_at: { type: ['string', 'null'], format: date-time }
+        request:
+          oneOf:
+            - $ref: '#/components/schemas/VerificationRequest'
+            - { type: 'null' }
+
+    AgentRegistration:
+      type: object
+      description: |
+        The signed agent registration claim, per the Agent Registry
+        spec: registration is free, the owner is named and accountable,
+        and the claim states registration, not verification.
+      required: [record_type, record_id, kind, status, status_label,
+                 agent_name, owner_name, homepage, description,
+                 registered_at, checks_run, checks_not_run, key_id,
+                 signature]
+      properties:
+        record_type: { type: string, const: npc.registry.agent_registration }
+        record_id: { type: string, description: 'The NPC ID of this record (reg_...)' }
+        kind: { type: string, const: agent }
+        status: { type: string, const: registered_checks_pending }
+        status_label: { type: string, const: 'registered, checks pending' }
+        agent_name: { type: string }
+        owner_name: { type: string }
+        homepage: { type: ['string', 'null'] }
+        description: { type: ['string', 'null'] }
+        registered_at: { type: string, format: date-time }
+        checks_run:
+          type: array
+          items: { $ref: '#/components/schemas/RegistrationCheck' }
+        checks_not_run:
+          type: array
+          items: { $ref: '#/components/schemas/RegistrationCheck' }
+        key_id: { type: string }
+        signature: { type: string, description: Base64 NPC issuer signature over the record }
