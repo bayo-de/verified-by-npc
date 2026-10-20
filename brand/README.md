@@ -14,7 +14,7 @@ artwork replaces them. Nothing here ships anywhere on its own.
 
 One gesture: a single orange check. No circle, no badge, no blue checkmark.
 The stroke tapers from a confident entry to a light exit, and the long arm
-finishes with a forward slice. The color is NPC Orange, `#FF6A00`.
+finishes with a forward slice. The color is NPC Orange, `#ec662b`.
 
 The mark is always the check alone. The words "Verified by NPC" sit next to
 it in type, never baked into the artwork, so the mark never depends on a font.
