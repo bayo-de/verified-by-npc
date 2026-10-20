@@ -76,7 +76,7 @@ def main():
 
     y = 190
     y = row(canvas, y, LIGHT, [
-        ("primary", 256, "Primary. NPC Orange #FF6A00.\n24 px and up."),
+        ("primary", 256, "Primary. NPC Orange #ec662b.\n24 px and up."),
         ("small", 256, "Small variant. Heavier cut.\n16 to 32 px."),
         ("mono-black", 256, "Mono black.\nOne-color, light grounds."),
     ], "The three variants", "One gesture. No circle, no badge, no blue check.")

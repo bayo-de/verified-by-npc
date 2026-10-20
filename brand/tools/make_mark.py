@@ -21,7 +21,7 @@ BRAND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SVG_DIR = os.path.join(BRAND_DIR, "svg")
 PNG_DIR = os.path.join(BRAND_DIR, "png")
 
-NPC_ORANGE = "#FF6A00"
+NPC_ORANGE = "#ec662b"
 MONO_BLACK = "#181818"
 MONO_WHITE = "#FFFFFF"
 
