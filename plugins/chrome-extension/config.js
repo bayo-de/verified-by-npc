@@ -1,17 +1,17 @@
 /* NPC Verify: configuration.
  *
- * Point API_BASE at the hosted verification API when it is live.
- * API_KEY must be a verifier-role key. Both can also be overridden at
- * runtime via chrome.storage.local keys "npc_api_base" and "npc_api_key".
+ * The shipped default is the production verification API. Both values
+ * can be overridden at runtime via chrome.storage.local keys
+ * "npc_api_base" and "npc_api_key" (developer use: point the base at
+ * the local demo API from the verified-by-npc repo, api/README.md).
  *
- * Defaults target the local demo API from the verified-by-npc repo
- * (api/README.md). With no key set, provenance checks are skipped
- * honestly and every other layer still runs.
+ * API_KEY must be a verifier-role key. With no key set, provenance
+ * checks are skipped honestly and every other layer still runs.
  */
 
 const NPC_CONFIG_DEFAULTS = {
-  apiBase: "http://127.0.0.1:8787/v1",
-  apiKey: "",
+  apiBase: "https://api.npclabs.xyz/v1",
+  apiKey: "npc_demo_HNL8-qoMjLTVvDCYog1scIZm4JgrganOI2RRFoTFI-E",
   getVerifiedUrl: "https://verify.npclabs.xyz/get-verified",
   fullReportUrl: "https://verify.npclabs.xyz",
   freeChecksTotal: 10

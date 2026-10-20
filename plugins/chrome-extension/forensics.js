@@ -1,8 +1,9 @@
 /* NPC Verify: client-side image forensics.
  *
  * Vanilla JS, no dependencies. Parses only what the file itself declares:
- * JPEG EXIF (Software / Make / Model / DateTime) and PNG tEXt/iTXt chunks.
- * Matches embedded strings against known generator markers.
+ * JPEG EXIF (Software / Make / Model / DateTime), PNG tEXt chunks, and
+ * uncompressed PNG iTXt chunks. Matches embedded strings against known
+ * generator markers.
  *
  * What it never does: claim an image is AI-generated or human-made from
  * these signals alone. Markers can be stripped or faked, and absence of a
@@ -109,6 +110,27 @@ function npcParsePng(bytes) {
       const raw = npcReadBytes(view, off + 8, len);
       const z = raw.indexOf("\0");
       if (z > 0) text[raw.slice(0, z).trim()] = raw.slice(z + 1).slice(0, 300).trim();
+    } else if (type === "iTXt") {
+      // iTXt: keyword \0 compression-flag compression-method language
+      // \0 translated \0 text. Only the uncompressed form (flag 0) is
+      // read; compressed iTXt and zTXt are not parsed, and the report
+      // does not claim otherwise.
+      const start = off + 8;
+      const end = start + len;
+      const kwEnd = bytes.indexOf(0, start);
+      if (kwEnd > 0 && kwEnd + 3 < end && view.getUint8(kwEnd + 1) === 0) {
+        let p = kwEnd + 3; // skip flag + method bytes
+        const langEnd = bytes.indexOf(0, p);
+        if (langEnd > 0 && langEnd < end) {
+          const trEnd = bytes.indexOf(0, langEnd + 1);
+          if (trEnd > 0 && trEnd < end) {
+            const keyword = npcReadBytes(view, start, kwEnd - start).trim();
+            const value = new TextDecoder("utf-8")
+              .decode(bytes.subarray(trEnd + 1, end)).slice(0, 300).trim();
+            if (keyword) text[keyword] = value;
+          }
+        }
+      }
     }
     if (type === "IEND") break;
     off += 12 + len;
@@ -130,31 +152,19 @@ async function npcSha256Hex(str) {
   return Array.from(new Uint8Array(dig)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-/* Main entry: analyze one image URL. Never throws; failures are data. */
-async function npcAnalyzeImage(src, naturalW, naturalH) {
+/* Analyze image bytes already in hand. Pure: no fetching, never throws. */
+function npcAnalyzeImageBytes(bytes, src, naturalW, naturalH) {
   const report = {
     src,
     format: (src.split("?")[0].match(/\.([a-z0-9]{2,5})$/i) || [])[1] || "unknown",
     dimensions: naturalW && naturalH ? naturalW + " x " + naturalH : "unknown",
-    bytesRead: false,
-    byteSize: null,
+    bytesRead: true,
+    byteSize: bytes.length,
     exif: null,
     pngText: null,
     markers: [],
     notes: []
   };
-  let bytes = null;
-  try {
-    const res = await fetch(src, { mode: "cors", credentials: "omit" });
-    if (!res.ok) throw new Error("http " + res.status);
-    const buf = await res.arrayBuffer();
-    bytes = new Uint8Array(buf);
-    report.bytesRead = true;
-    report.byteSize = buf.byteLength;
-  } catch (e) {
-    report.notes.push("bytes_unreadable");
-    return report;
-  }
   const isJpeg = bytes[0] === 0xFF && bytes[1] === 0xD8;
   const isPng = bytes[0] === 0x89 && bytes[1] === 0x50;
   if (isJpeg) {
@@ -175,4 +185,41 @@ async function npcAnalyzeImage(src, naturalW, naturalH) {
   if (report.pngText) hay.push(...Object.entries(report.pngText).map(([k, v]) => k + " " + v));
   report.markers = npcFindMarkers(hay);
   return report;
+}
+
+/* Fetch an image's bytes from the extension context. Returns a
+ * Uint8Array or null. Works only where the host serves the file with
+ * CORS approval (or a matching host permission); the caller in
+ * background.js first tries a page-context fetch, which covers the
+ * far more common case of a page loading its own images. */
+async function npcFetchImageBytes(src) {
+  try {
+    const res = await fetch(src, { mode: "cors", credentials: "omit" });
+    if (!res.ok) return null;
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > 26214400) return null; // 25 MB sanity cap
+    return new Uint8Array(buf);
+  } catch (e) {
+    return null;
+  }
+}
+
+/* Main entry for callers that only have a URL. Never throws;
+ * failures are data (bytesRead: false, note "bytes_unreadable"). */
+async function npcAnalyzeImage(src, naturalW, naturalH) {
+  const bytes = await npcFetchImageBytes(src);
+  if (!bytes) {
+    return {
+      src,
+      format: (src.split("?")[0].match(/\.([a-z0-9]{2,5})$/i) || [])[1] || "unknown",
+      dimensions: naturalW && naturalH ? naturalW + " x " + naturalH : "unknown",
+      bytesRead: false,
+      byteSize: null,
+      exif: null,
+      pngText: null,
+      markers: [],
+      notes: ["bytes_unreadable"]
+    };
+  }
+  return npcAnalyzeImageBytes(bytes, src, naturalW, naturalH);
 }
