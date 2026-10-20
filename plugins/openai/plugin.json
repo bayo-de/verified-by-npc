@@ -39,6 +39,7 @@
       "review": {
         "commerce": false,
         "commerce_description": "This plugin only verifies. It does not sell products or process payments.",
+        "demo_recording_url": "https://npclabs.xyz/plugin-assets/verified-by-npc-demo-2min.mp4",
         "test_cases": {
           "negative": [
             {

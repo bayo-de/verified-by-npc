@@ -122,20 +122,54 @@ class TestManifestSchema(unittest.TestCase):
     def test_review_cases(self):
         review = self.m["extensions"]["com.openai"]["review"]
         self.assertFalse(review["commerce"])
-        pos = review["test_cases"]["positive"]
-        neg = review["test_cases"]["negative"]
-        self.assertEqual(len(pos), 5)
-        self.assertEqual(len(neg), 3)
+        # OpenAI submission field reference: plugin-level
+        # review.test_cases is the placement for a plugin with exactly
+        # one MCP server; per-server declarations are for multiple
+        # servers and can't be combined with the plugin-level placement.
+        # The package declares exactly one server (the hosted production
+        # endpoint), so the cases live at plugin level. (The 2026-10-14
+        # finding fired when plugin-level cases coexisted with multiple
+        # declared servers; the 2026-10-15 per-server detour ended when
+        # the package went back to one server.)
+        with open(os.path.join(BASE, "mcp.json"), encoding="utf-8") as f:
+            mcp = json.load(f)
+        servers = mcp["mcpServers"]
+        self.assertEqual(sorted(servers), ["production"])
+        for name, entry in servers.items():
+            self.assertNotIn("review", entry,
+                             f"{name}: cases belong at plugin level "
+                             f"for a one-server package")
+        cases = review["test_cases"]
+        pos = cases["positive"]
+        neg = cases["negative"]
+        self.assertEqual(len(pos), 5, "positive count")
+        self.assertEqual(len(neg), 3, "negative count")
         for case in pos:
             for field in ("description", "prompt", "tools_triggered",
                           "expected_behavior"):
-                self.assertTrue(case.get(field), f"positive case missing {field}")
+                self.assertTrue(case.get(field),
+                                f"positive case missing {field}")
         for case in neg:
             for field in ("description", "prompt"):
-                self.assertTrue(case.get(field), f"negative case missing {field}")
+                self.assertTrue(case.get(field),
+                                f"negative case missing {field}")
         # fail-closed language in every expected behavior
         joined = " ".join(c["expected_behavior"] for c in pos).lower()
         self.assertIn("unknown", joined)
+
+    def test_demo_recording_url(self):
+        # Submission field reference: the demo recording URL is
+        # optional in the ZIP only for skills-only plugins; an MCP
+        # plugin's review requires a reviewer-accessible walkthrough
+        # URL. Without it the portal keeps an "Incomplete review
+        # information" finding even with every form section filled
+        # (observed 2026-10-15).
+        review = self.m["extensions"]["com.openai"]["review"]
+        url = review.get("demo_recording_url")
+        self.assertTrue(url, "review.demo_recording_url is required "
+                             "for MCP review")
+        self.assertTrue(url.startswith("https://npclabs.xyz/"), url)
+        self.assertTrue(url.endswith(".mp4"), url)
 
     def test_publication(self):
         pub = self.m["extensions"]["com.openai"]["publication"]
@@ -147,11 +181,11 @@ class TestManifestSchema(unittest.TestCase):
                  self.iface["displayName"],
                  self.iface["shortDescription"],
                  self.iface["longDescription"]]
-        review = self.m["extensions"]["com.openai"]["review"]
+        cases = self.m["extensions"]["com.openai"]["review"]["test_cases"]
         texts += [c["description"] for c in
-                  review["test_cases"]["positive"] + review["test_cases"]["negative"]]
+                  cases["positive"] + cases["negative"]]
         texts += [c.get("expected_behavior", "") for c in
-                  review["test_cases"]["positive"]]
+                  cases["positive"]]
         texts.append(self.m["extensions"]["com.openai"]["publication"]["release_notes"])
         for t in texts:
             self.assertNotIn(EM_DASH, t, f"em-dash found in: {t[:60]!r}")
@@ -167,3 +201,87 @@ class TestManifestSchema(unittest.TestCase):
         # submission scan; the package must not ship it.
         self.assertFalse(
             os.path.exists(os.path.join(BASE, "ai-plugin.json")))
+
+
+def load_validator():
+    import importlib.util
+    path = os.path.join(BASE, "validate_package.py")
+    spec = importlib.util.spec_from_file_location("validate_package", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def load_mcp():
+    with open(os.path.join(BASE, "mcp.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+class TestMcpDeclaration(unittest.TestCase):
+    """The MCP declaration the portal parses (2026-10-15 diagnosis).
+
+    The v2 package declared the production server with type "http",
+    the Codex .mcp.json spelling, inside the portable mcp.json. That
+    value matches no server definition in the Agent Plugins MCP
+    schema (remote constants are "streamable-http" and "sse"), and
+    the draft's MCPs tab reported that the plugin "does not reference
+    any MCP server" even though the endpoint was live. These tests
+    pin the documented portable shape so the defect cannot return.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mcp = load_mcp()
+        cls.entry = cls.mcp["mcpServers"]["production"]
+        cls.validator = load_validator()
+
+    def test_mcp_schema_marker(self):
+        self.assertEqual(
+            self.mcp["$schema"],
+            "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json")
+
+    def test_single_production_server(self):
+        self.assertEqual(sorted(self.mcp["mcpServers"]), ["production"])
+
+    def test_remote_entry_shape(self):
+        self.assertEqual(self.entry["type"], "streamable-http")
+        self.assertEqual(self.entry["url"], "https://api.npclabs.xyz/v1/mcp")
+        self.assertLessEqual(set(self.entry),
+                             {"type", "url", "headers", "extensions",
+                              "review"})
+
+    def test_auth_declaration_for_no_auth_server(self):
+        # The portal reads authentication settings from mcp.json; a
+        # public no-auth server declares auth.type "none" (Package
+        # your plugin, "Configure MCP authentication").
+        auth = self.entry["extensions"]["com.openai"]["auth"]
+        self.assertEqual(auth["type"], "none")
+
+    def test_validator_accepts_shipped_entry(self):
+        self.assertEqual(
+            self.validator.mcp_entry_problems("production", self.entry),
+            [])
+
+    def test_validator_rejects_codex_http_spelling(self):
+        # Negative control: the exact 2026-10-15 v2 defect.
+        bad = dict(self.entry, type="http")
+        problems = self.validator.mcp_entry_problems("production", bad)
+        self.assertTrue(any("streamable-http" in p for p in problems),
+                        problems)
+
+    def test_validator_rejects_missing_auth_declaration(self):
+        bad = {k: v for k, v in self.entry.items() if k != "extensions"}
+        problems = self.validator.mcp_entry_problems("production", bad)
+        self.assertTrue(any("authentication" in p for p in problems),
+                        problems)
+
+    def test_validator_rejects_undocumented_key(self):
+        bad = dict(self.entry, transport="streamable-http")
+        problems = self.validator.mcp_entry_problems("production", bad)
+        self.assertTrue(any("outside the documented" in p
+                            for p in problems), problems)
+
+    def test_validator_rejects_plain_http_url(self):
+        bad = dict(self.entry, url="http://api.npclabs.xyz/v1/mcp")
+        problems = self.validator.mcp_entry_problems("production", bad)
+        self.assertTrue(any("HTTPS" in p for p in problems), problems)

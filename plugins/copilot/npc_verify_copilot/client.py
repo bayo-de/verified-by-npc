@@ -64,15 +64,29 @@ class UnknownSubject(Exception):
         self.payload = payload
 
 
+#: Public production API. Local development overrides via
+#: NPC_VERIFY_API_URL (e.g. http://127.0.0.1:8787).
+DEFAULT_API_URL = "https://api.npclabs.xyz"
+
+#: Public read-only verifier key bundled with the client: the same demo
+#: verifier key the Chrome extension ships
+#: (plugins/chrome-extension/config.js). Verifier role only: it can read
+#: records and verify claims; it cannot issue or administer. Developers
+#: override with NPC_VERIFY_API_KEY.
+DEFAULT_API_KEY = "npc_demo_HNL8-qoMjLTVvDCYog1scIZm4JgrganOI2RRFoTFI-E"
+
+
 def _config():
-    url = os.environ.get("NPC_VERIFY_API_URL", "http://127.0.0.1:8787").rstrip("/")
-    key = os.environ.get("NPC_VERIFY_API_KEY", "")
+    url = os.environ.get("NPC_VERIFY_API_URL", DEFAULT_API_URL).rstrip("/")
+    key = os.environ.get("NPC_VERIFY_API_KEY", "") or DEFAULT_API_KEY
     return url, key
 
 
 def _split(url):
     parts = urllib.parse.urlsplit(url)
-    return parts.hostname or "127.0.0.1", parts.port or 80, parts.path or ""
+    scheme = parts.scheme or "https"
+    port = parts.port or (443 if scheme == "https" else 80)
+    return scheme, parts.hostname or "api.npclabs.xyz", port, parts.path or ""
 
 
 class VerifiedClient:
@@ -87,8 +101,10 @@ class VerifiedClient:
 
     # -- seam for tests -------------------------------------------------
     def _http(self, method, path, body_bytes=None, extra_headers=None):
-        host, port, prefix = _split(self.base_url)
-        conn = http.client.HTTPConnection(host, port, timeout=self.timeout)
+        scheme, host, port, prefix = _split(self.base_url)
+        conn_cls = (http.client.HTTPSConnection if scheme == "https"
+                    else http.client.HTTPConnection)
+        conn = conn_cls(host, port, timeout=self.timeout)
         headers = dict(extra_headers or {})
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -126,8 +142,9 @@ class VerifiedClient:
 
     def _verify_response(self, status, headers, body_bytes):
         """Verify X-NPC-Signature. Returns parsed JSON. Raises on failure."""
-        sig_b64 = headers.get("X-NPC-Signature")
-        key_id = headers.get("X-NPC-Key-ID")
+        lowered = {k.lower(): v for k, v in headers.items()}
+        sig_b64 = lowered.get("x-npc-signature")
+        key_id = lowered.get("x-npc-key-id")
         if not sig_b64 or not key_id:
             raise ApiError("response missing X-NPC-Signature/X-NPC-Key-ID - "
                            "refusing to trust it")
@@ -171,9 +188,8 @@ class VerifiedClient:
                 method, path, body_bytes=payload, extra_headers=headers)
         except OSError as exc:
             raise ApiError(
-                f"NPC Verification API unreachable at {self.base_url}: {exc}. "
-                f"Start it first: python3 -m npc_verify "
-                f"(in ../api/).") from exc
+                f"NPC Verification API unreachable at "
+                f"{self.base_url}: {exc}") from exc
         if status == 404:
             # 404s are signed too - verify before trusting the unknown shape.
             parsed = self._verify_response(status, resp_headers, data)
@@ -334,9 +350,9 @@ def run_action(client, name, args):
 def make_client(base_url=None, api_key=None, timeout=10):
     """Build a VerifiedClient for API v1.
 
-    Env defaults: NPC_VERIFY_API_URL (default http://127.0.0.1:8787),
-    NPC_VERIFY_API_KEY. All response-signature verification happens inside
-    the client.
+    Env defaults: NPC_VERIFY_API_URL (default https://api.npclabs.xyz),
+    NPC_VERIFY_API_KEY (a public read-only verifier key is bundled when
+    unset). All response-signature verification happens inside the client.
     """
     return VerifiedClient(base_url=base_url, api_key=api_key,
                           timeout=timeout)

@@ -16,14 +16,15 @@ from npc_verify_mcp.tools import TOOLS  # noqa: E402
 
 
 class TestToolContracts(McpTestCase):
-    def test_five_tools_listed(self):
+    def test_seven_tools_listed(self):
         reply = self.mcp.handle({"jsonrpc": "2.0", "id": 1,
                                  "method": "tools/list", "params": {}})
         tools = reply["result"]["tools"]
         self.assertEqual(
             sorted(t["name"] for t in tools),
-            ["explain_verification", "verify_agent", "verify_claim",
-             "verify_credential", "verify_product"])
+            ["explain_verification", "register_agent", "register_content",
+             "verify_agent", "verify_claim", "verify_credential",
+             "verify_product"])
 
     def test_descriptions_carry_trigger_phrasing(self):
         triggers = ["is this real?", "verify this", "is this authentic?"]
@@ -47,6 +48,15 @@ class TestToolContracts(McpTestCase):
                          ["tag_id"])
         self.assertEqual(by_name["verify_agent"]["inputSchema"]["required"],
                          ["agent_id"])
+        self.assertEqual(by_name["register_agent"]["inputSchema"]["required"],
+                         ["agent_name", "owner_name", "owner_email"])
+        self.assertEqual(by_name["register_content"]["inputSchema"]["required"],
+                         ["title", "kind", "locator", "creator_name",
+                          "creator_email"])
+        self.assertEqual(
+            by_name["register_content"]["inputSchema"]
+            ["properties"]["kind"]["enum"],
+            ["image", "text", "audio", "video", "other"])
 
     def test_unknown_tool_rejected(self):
         reply = self.mcp.handle({"jsonrpc": "2.0", "id": 2,

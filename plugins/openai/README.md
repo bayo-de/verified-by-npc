@@ -64,19 +64,24 @@ manifest, which is what `plugin.json` is:
   for the mid-conversation suggestion trigger, starter prompts, icons).
 - `skills/` auto-discovered by the platform; the manifest's
   `onboardingSkill` points at the bundled skill.
-- This package is skills-only on purpose: no `mcp.json` is declared. The
-  MCP lane needs a hosted server plus domain verification, which is
-  gated (see below). The platform does not allow adding an MCP server to
-  a skills-only plugin later, so that lane is a separate submission
-  once the hosting gate clears.
+- Root `mcp.json` declares the hosted production MCP server in the
+  documented portable shape: type `streamable-http`, the endpoint URL
+  `https://api.npclabs.xyz/v1/mcp`, and a no-authentication declaration
+  (`extensions.com.openai.auth` type `none`) that the portal reads.
+  Connecting the server in the portal also involves a domain
+  verification challenge. The platform does not support adding an MCP
+  server to a plugin that was created skills-only, so a package with
+  an MCP server must carry `mcp.json` in its initial upload.
 - Logo and composer-icon fields point at internal placeholder SVGs in
   `assets/`. They are NOT the "Verified by NPC" mark; public mark use
   awaits counsel clearance. Replace them with approved artwork before
   any public submission.
 - Review metadata ships in the manifest: five positive and three
-  negative test cases plus commerce declarations. Reviewer credentials
-  and the demo video walkthrough are entered in the portal, never in
-  the package.
+  negative test cases, commerce declarations, and the demo video
+  walkthrough URL (`review.demo_recording_url`, required for MCP
+  review per the submission field reference). Reviewer credentials
+  are entered only in the portal's secure form; the package format
+  rejects credential fields outright.
 
 Submission flow (portal, not done): create an OpenAI developer
 organization with Apps Management write access, complete verified

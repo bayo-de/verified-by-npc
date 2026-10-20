@@ -44,6 +44,10 @@ token. Unknown subjects return `{"verdict": "unknown"}` - never a guess.
 
 ## Try the helper locally
 
+The helper defaults to the public API (https://api.npclabs.xyz) with a
+bundled read-only verifier key. For local development against your own
+API instance:
+
 ```bash
 # 1. Start the API (from the api/ directory)
 python3 -m npc_verify
