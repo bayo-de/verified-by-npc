@@ -42,6 +42,10 @@ Auth: verifier API key as a Bearer token. Unknown subjects return
 
 ## Use it locally
 
+The helper works out of the box against the public API
+(https://api.npclabs.xyz, bundled read-only verifier key). For local
+development against your own API instance:
+
 ```bash
 # 1. Start the API (from the api/ directory)
 python3 -m npc_verify

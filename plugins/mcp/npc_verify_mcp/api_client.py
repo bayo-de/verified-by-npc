@@ -5,9 +5,12 @@ keys (``GET /v1/keys``) before it is returned. Any verification failure is
 fail-closed: the caller gets an error, never the unverified data.
 
 The signing primitives are REUSED from the API reference implementation
-(``npc_verify.canonical`` / ``npc_verify.ed25519``) — no duplicated logic.
-The API package is located via ``NPC_VERIFY_API_PATH`` or by resolving
-``../api`` relative to this package's install location.
+(``npc_verify.canonical`` / ``npc_verify.ed25519``). When the API tree
+is not present (a standalone PyPI install), byte-identical vendored
+copies under ``npc_verify_mcp._vendor`` are used instead; the test
+suite asserts the copies never drift. The API package is located via
+``NPC_VERIFY_API_PATH`` or by resolving ``../api`` relative to this
+package's install location.
 """
 import base64
 import http.client
@@ -45,9 +48,24 @@ def _ensure_api_package():
         "directory containing the api/ tree (the one holding npc_verify/).")
 
 
-_API_BASE = _ensure_api_package()
-from npc_verify.canonical import canonicalize  # noqa: E402
-from npc_verify import ed25519  # noqa: E402
+def _load_primitives():
+    """Return (canonicalize, ed25519 module).
+
+    Prefers the API reference implementation itself; falls back to the
+    vendored copies so a standalone install (no repo checkout) works.
+    """
+    try:
+        _ensure_api_package()
+        from npc_verify.canonical import canonicalize
+        from npc_verify import ed25519
+        return canonicalize, ed25519
+    except Exception:
+        from ._vendor import canonical as _vc
+        from ._vendor import ed25519 as _ve
+        return _vc.canonicalize, _ve
+
+
+canonicalize, ed25519 = _load_primitives()
 
 
 class ApiError(Exception):
@@ -62,15 +80,29 @@ class UnknownSubject(Exception):
         self.payload = payload
 
 
+#: Public production API. Local development overrides via
+#: NPC_VERIFY_API_URL (e.g. http://127.0.0.1:8787).
+DEFAULT_API_URL = "https://api.npclabs.xyz"
+
+#: Public read-only verifier key bundled with the client: the same demo
+#: verifier key the Chrome extension ships
+#: (plugins/chrome-extension/config.js). Verifier role only: it can read
+#: records and verify claims; it cannot issue or administer. Developers
+#: override with NPC_VERIFY_API_KEY.
+DEFAULT_API_KEY = "npc_demo_HNL8-qoMjLTVvDCYog1scIZm4JgrganOI2RRFoTFI-E"
+
+
 def _config():
-    url = os.environ.get("NPC_VERIFY_API_URL", "http://127.0.0.1:8787").rstrip("/")
-    key = os.environ.get("NPC_VERIFY_API_KEY", "")
+    url = os.environ.get("NPC_VERIFY_API_URL", DEFAULT_API_URL).rstrip("/")
+    key = os.environ.get("NPC_VERIFY_API_KEY", "") or DEFAULT_API_KEY
     return url, key
 
 
 def _split(url):
     parts = urllib.parse.urlsplit(url)
-    return parts.hostname or "127.0.0.1", parts.port or 80, parts.path or ""
+    scheme = parts.scheme or "https"
+    port = parts.port or (443 if scheme == "https" else 80)
+    return scheme, parts.hostname or "api.npclabs.xyz", port, parts.path or ""
 
 
 class VerifiedClient:
@@ -85,8 +117,10 @@ class VerifiedClient:
 
     # -- seam for tests -------------------------------------------------
     def _http(self, method, path, body_bytes=None, extra_headers=None):
-        host, port, prefix = _split(self.base_url)
-        conn = http.client.HTTPConnection(host, port, timeout=self.timeout)
+        scheme, host, port, prefix = _split(self.base_url)
+        conn_cls = (http.client.HTTPSConnection if scheme == "https"
+                    else http.client.HTTPConnection)
+        conn = conn_cls(host, port, timeout=self.timeout)
         headers = dict(extra_headers or {})
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -124,8 +158,9 @@ class VerifiedClient:
 
     def _verify_response(self, status, headers, body_bytes):
         """Verify X-NPC-Signature. Returns parsed JSON. Raises on failure."""
-        sig_b64 = headers.get("X-NPC-Signature")
-        key_id = headers.get("X-NPC-Key-ID")
+        lowered = {k.lower(): v for k, v in headers.items()}
+        sig_b64 = lowered.get("x-npc-signature")
+        key_id = lowered.get("x-npc-key-id")
         if not sig_b64 or not key_id:
             raise ApiError("response missing X-NPC-Signature/X-NPC-Key-ID — "
                            "refusing to trust it")
@@ -169,9 +204,8 @@ class VerifiedClient:
                 method, path, body_bytes=payload, extra_headers=headers)
         except OSError as exc:
             raise ApiError(
-                f"NPC Verification API unreachable at {self.base_url}: {exc}. "
-                f"Start it first: python3 -m npc_verify "
-                f"(in ../api/).") from exc
+                f"NPC Verification API unreachable at "
+                f"{self.base_url}: {exc}") from exc
         if status == 404:
             # 404s are signed too — verify before trusting the unknown shape.
             parsed = self._verify_response(status, resp_headers, data)
@@ -181,8 +215,24 @@ class VerifiedClient:
         if status == 403:
             raise ApiError("API key lacks the required role (403)")
         if status == 429:
+            # The 429 body is signed like every other response; its
+            # retry guidance is only trusted after verification.
+            parsed = self._verify_response(status, resp_headers, data)
+            retry = parsed.get("retry_after_seconds")
+            if isinstance(retry, int) and not isinstance(retry, bool):
+                raise ApiError(
+                    "API rate limit hit (429) — slow down and retry "
+                    f"after {retry} seconds")
             raise ApiError("API rate limit hit (429) — slow down and retry")
         if status >= 400:
+            # Surface the API's own rejection detail (the validation
+            # problems on a 422, a conflict on a 409) so the caller can
+            # fix its request — but only from the signature-verified
+            # body, never from an untrusted one.
+            parsed = self._verify_response(status, resp_headers, data)
+            detail = parsed.get("detail")
+            if isinstance(detail, str) and detail:
+                raise ApiError(f"API returned {status}: {detail}")
             raise ApiError(f"API returned {status}")
         return self._verify_response(status, resp_headers, data)
 
@@ -203,6 +253,35 @@ class VerifiedClient:
 
     def verify_agent(self, agent_id):
         return self.request("GET", f"/v1/agents/{agent_id}/attestation")
+
+    # -- registration (public endpoints; no API key required) ------------
+    # Registration is how verification starts: these endpoints are
+    # deliberately unauthenticated on the API (registration is free
+    # and open; the abuse minimums are the required email and the
+    # per-email / per-IP submission caps the API counts itself). They
+    # are called with auth=False so they work with no key configured;
+    # when a key IS configured it is still sent, and the API ignores
+    # it on these routes. Registration is NOT verification: the record
+    # returned states "registered, checks pending" and carries no
+    # verdict and no verification mark.
+    def register_agent(self, agent_name, owner_name, owner_email,
+                       homepage=None, description=None):
+        body = {"agent_name": agent_name, "owner_name": owner_name,
+                "owner_email": owner_email}
+        if homepage:
+            body["homepage"] = homepage
+        if description:
+            body["description"] = description
+        return self.request("POST", "/v1/register/agent", body=body,
+                            auth=False)
+
+    def register_content(self, title, kind, locator, creator_name,
+                         creator_email):
+        body = {"title": title, "kind": kind, "locator": locator,
+                "creator_name": creator_name,
+                "creator_email": creator_email}
+        return self.request("POST", "/v1/register/content", body=body,
+                            auth=False)
 
     def health(self):
         return self.request("GET", "/v1/health", auth=False)

@@ -60,7 +60,7 @@ class TestTransport(McpTestCase):
                                        "credential_id": "cred_test_001"}}}),
         ])
         self.assertEqual(len(replies), 4)
-        self.assertEqual(len(replies[1]["result"]["tools"]), 5)
+        self.assertEqual(len(replies[1]["result"]["tools"]), 7)
         self.assertIn("Verified by NPC",
                       replies[2]["result"]["content"][0]["text"])
         cred = json.loads(replies[3]["result"]["content"][0]["text"])

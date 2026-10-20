@@ -131,6 +131,93 @@ class TestVerifyAgent(McpTestCase):
         self.assertTrue(is_err)
 
 
+class TestToolAnnotations(McpTestCase):
+    """Every tool declares the three MCP annotation hints as explicit
+    booleans. OpenAI's plugin tool scan flags any tool missing them
+    ("does not provide explicit boolean values for readOnlyHint,
+    destructiveHint, and openWorldHint") and leaves it "Not live"
+    (observed 2026-10-15 against the hosted endpoint). The values are
+    truthful per tool: the five lookups are pure registry reads; the
+    two registration tools create a record (never read-only, never
+    destructive), and register_content is open-world because a URL
+    locator makes the API fetch that address at intake."""
+
+    EXPECTED = {"readOnlyHint": True,
+                "destructiveHint": False,
+                "openWorldHint": False}
+    REGISTER_EXPECTED = {
+        "register_agent": {"readOnlyHint": False,
+                           "destructiveHint": False,
+                           "openWorldHint": False},
+        "register_content": {"readOnlyHint": False,
+                             "destructiveHint": False,
+                             "openWorldHint": True},
+    }
+
+    def _expected_for(self, name):
+        return self.REGISTER_EXPECTED.get(name, self.EXPECTED)
+
+    def test_registry_entries_carry_explicit_boolean_annotations(self):
+        from npc_verify_mcp.tools import TOOLS
+        self.assertEqual(len(TOOLS), 7)
+        for t in TOOLS:
+            ann = t.get("annotations")
+            self.assertIsInstance(ann, dict, t["name"])
+            self.assertEqual(set(ann), set(self.EXPECTED), t["name"])
+            for key, value in self._expected_for(t["name"]).items():
+                self.assertIs(ann[key], value,
+                              f"{t['name']}.{key} must be {value!r}")
+                self.assertIs(type(ann[key]), bool,
+                              f"{t['name']}.{key} must be a boolean")
+
+    def test_tools_list_output_carries_annotations(self):
+        reply = self.mcp.handle({"jsonrpc": "2.0", "id": 1,
+                                 "method": "tools/list"})
+        tools = reply["result"]["tools"]
+        self.assertEqual(len(tools), 7)
+        for t in tools:
+            ann = t.get("annotations")
+            self.assertIsInstance(ann, dict, t["name"])
+            self.assertEqual(ann, self._expected_for(t["name"]), t["name"])
+            for key in self.EXPECTED:
+                self.assertIs(type(ann[key]), bool,
+                              f"{t['name']}.{key} must be a boolean")
+
+
+class TestToolTitles(McpTestCase):
+    """Every tool carries a plain human-readable `title` (the
+    protocol's Tool.title), projected into tools/list. Anthropic's
+    Connectors Directory review requires a title on every tool
+    alongside the annotation hints (submission checklist + review
+    criteria, read 2026-10-15)."""
+
+    EXPECTED_TITLES = {
+        "verify_claim": "Verify a claim",
+        "verify_credential": "Verify a credential",
+        "verify_product": "Verify a product",
+        "verify_agent": "Verify an agent",
+        "register_agent": "Register an agent",
+        "register_content": "Register content",
+        "explain_verification": "Explain a verification result",
+    }
+
+    def test_registry_entries_carry_titles(self):
+        from npc_verify_mcp.tools import TOOLS
+        self.assertEqual(len(TOOLS), 7)
+        for t in TOOLS:
+            self.assertEqual(t.get("title"),
+                             self.EXPECTED_TITLES[t["name"]], t["name"])
+
+    def test_tools_list_output_carries_titles(self):
+        reply = self.mcp.handle({"jsonrpc": "2.0", "id": 1,
+                                 "method": "tools/list"})
+        tools = reply["result"]["tools"]
+        self.assertEqual(len(tools), 7)
+        for t in tools:
+            self.assertEqual(t.get("title"),
+                             self.EXPECTED_TITLES[t["name"]], t["name"])
+
+
 class TestExplainVerification(McpTestCase):
     def test_explains_the_why(self):
         is_err, text = self.call_tool("explain_verification", {})

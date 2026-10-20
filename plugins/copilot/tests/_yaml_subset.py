@@ -114,6 +114,23 @@ def _scalar(text):
     return text
 
 
+def _split_key(text):
+    """Split a mapping line into (key, rest).
+
+    The separator is ': ' (colon + space) or a trailing ':' at end of
+    line. A ':' inside the key that is not followed by a space is part
+    of the key: API paths use action suffixes such as
+    '/pact/grants/{id}:revoke', which real YAML reads as one key.
+    Returns (None, None) when the line is not a mapping entry.
+    """
+    idx = text.find(": ")
+    if idx != -1:
+        return text[:idx], text[idx + 2:]
+    if text.endswith(":"):
+        return text[:-1], ""
+    return None, None
+
+
 class _Parser:
     def __init__(self, text):
         self.lines = []
@@ -175,8 +192,8 @@ class _Parser:
                 break
             if text == "-" or text.startswith("- "):
                 raise YAMLError("list item inside mapping")
-            key, sep, rest = text.partition(":")
-            if not sep:
+            key, rest = _split_key(text)
+            if key is None:
                 raise YAMLError(f"expected 'key: value', got {text!r}")
             key = _scalar(key)
             rest = rest.strip()
@@ -201,7 +218,7 @@ class _Parser:
                 result.append(self._value(indent, item))
             elif re.match(r"^[^\s:]+:(\s|$)", item) or ": " in item:
                 # list item that is a mapping: "- key: value"
-                key, _, rest = item.partition(":")
+                key, rest = _split_key(item)
                 sub = { _scalar(key): None }
                 rest = rest.strip()
                 if rest in ("|", ">"):
@@ -215,8 +232,8 @@ class _Parser:
                     ind2, text2 = self.lines[self.pos]
                     if ind2 <= indent or (text2 == "-" or text2.startswith("- ")):
                         break
-                    k2, sep2, r2 = text2.partition(":")
-                    if not sep2:
+                    k2, r2 = _split_key(text2)
+                    if k2 is None:
                         raise YAMLError(f"expected 'key: value', got {text2!r}")
                     r2 = r2.strip()
                     self.pos += 1
