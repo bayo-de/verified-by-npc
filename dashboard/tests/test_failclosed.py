@@ -52,28 +52,27 @@ class FailClosedTest(DashTestCase):
         return status, data
 
     # -- unknown subjects: "unknown", never a guess ---------------------
-    def test_unknown_credential(self):
-        status, body = self.get("/credentials?id=cred_nope_999")
+    def test_unknown_credential_id(self):
+        status, body = self.get("/search?id=cred_nope_999")
         self.assertEqual(status, 200)
         self.assertIn("Unknown", body)
         self.assertIn("never guess", body)
         self.assertNotIn("Test Artisan Certificate", body)
 
-    def test_unknown_product(self):
-        status, body = self.get("/products?tag=tag_nope_999")
+    def test_unknown_product_id(self):
+        status, body = self.get("/search?id=tag_nope_999")
         self.assertEqual(status, 200)
         self.assertIn("Unknown", body)
-        self.assertIn("We have no record of this tag", body)
+        self.assertIn("We have no record of this ID", body)
         # no invented product data, and no verdict pill rendered
         self.assertNotIn("Test Widget", body)
         self.assertNotIn('<span class="pill verified">', body)
         self.assertNotIn('<span class="pill bad">', body)
 
-    def test_unknown_claim(self):
-        status, body = self.post_form(
+    def test_records_claim_form_is_gone(self):
+        status, _body = self.post_form(
             "/records", {"claim_text": "definitely not an attested claim"})
-        self.assertEqual(status, 200)
-        self.assertIn("Unknown", body)
+        self.assertEqual(status, 404)
 
     # -- dead API: "unavailable", pages still render ---------------------
     def test_dead_api_home_still_renders(self):
@@ -87,20 +86,20 @@ class FailClosedTest(DashTestCase):
         self.assertIn("could not be confirmed", body)
         self.assertNotIn("Mechanical drop test", body)
 
-    def test_dead_api_keys_unavailable(self):
-        status, body = self.dead_get("/keys")
+    def test_dead_api_search_keys_unavailable(self):
+        status, body = self.dead_get("/search/keys")
         self.assertEqual(status, 200)
         self.assertIn("Unavailable", body)
         self.assertNotIn("npc-api_signing", body)
 
-    def test_dead_api_credential_unavailable(self):
-        status, body = self.dead_get("/credentials?id=cred_test_001")
+    def test_dead_api_search_credential_unavailable(self):
+        status, body = self.dead_get("/search?id=cred_test_001")
         self.assertEqual(status, 200)
         self.assertIn("Unavailable", body)
         self.assertNotIn("Test Artisan Certificate", body)
 
-    def test_dead_api_product_unavailable(self):
-        status, body = self.dead_get("/products?tag=tag_test_authentic")
+    def test_dead_api_search_product_unavailable(self):
+        status, body = self.dead_get("/search?id=tag_test_authentic")
         self.assertEqual(status, 200)
         self.assertIn("Unavailable", body)
         self.assertNotIn("Test Widget", body)

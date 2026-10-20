@@ -7,14 +7,26 @@ it is rendered, and anything unverifiable renders "unknown" or
 "unavailable". No data is ever invented.
 
 Routes:
-  GET  /                  home: the why, links to plugin pages
+  GET  /                  home: the why and the four main surfaces
   GET  /records           verification records (attestations)
-  POST /records           check a claim against attested records
-  GET  /credentials[?id=] credential lookup + detail
-  GET  /products[?tag=]   product authenticity lookup + detail
-  GET  /keys              published public keys
-  GET  /plugins           the plugin surfaces and their gates
+  GET  /search[?id=]      one lookup for credential, product, archive,
+                          and public key IDs; API-issued registration
+                          IDs resolve through GET /v1/records/{id}
+  GET  /search/keys       the full public key list, inside Search
+  GET  /search/unknown    the honest unknown answer for an unmatched ID
+  GET  /verify            Verify yours: the content and agent
+                          registration forms (they POST from the
+                          visitor's browser to the verification API;
+                          this server never proxies a submission)
+  GET  /archive           archive of NPC Labs' real historical on-chain
+                          mints (company history; reached from Records)
+  GET  /plugins           the plugin surfaces and their honest status
+  GET  /api               the developer API: endpoints, live examples,
+                          and the published signing keys (static text)
+  GET  /privacy           the NPC Verify privacy policy (static text)
+  GET  /help              how it works + FAQ (static text)
 """
+import datetime
 import re
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -87,6 +99,41 @@ def _records_rows(client):
     return rows
 
 
+def _archive_rows(client):
+    """Build archive rows from live, signature-verified API responses.
+
+    The archive set is fixtures.ARCHIVE_PRODUCTS (real historical mints,
+    not test fixtures). Display facts (chain, standard, collection, token)
+    come from fixtures.ARCHIVE_META; the item name, status, and mint date
+    come from the verified API product record itself. A record the API
+    cannot confirm degrades to an unknown row, never invented data.
+    """
+    rows = []
+    for tag in fixtures.ARCHIVE_PRODUCTS:
+        meta = fixtures.ARCHIVE_META[tag]
+        row = {"tag_id": tag, "chain": meta["chain"],
+               "standard": meta["standard"],
+               "collection": meta["collection"],
+               "token_id": meta["token_id"],
+               "name": "could not confirm", "status": "unknown",
+               "minted_at": "could not confirm"}
+        try:
+            product = client.get_product(tag)
+            minted = None
+            for ev in product.get("provenance") or []:
+                if ev.get("event") == "minted":
+                    minted = (ev.get("at") or "")[:10]
+            row.update({
+                "name": product.get("name") or row["name"],
+                "status": product.get("status") or "unknown",
+                "minted_at": minted or row["minted_at"],
+            })
+        except (UnknownSubject, ApiError):
+            pass
+        rows.append(row)
+    return rows
+
+
 class _Req:
     def __init__(self, method, path, query, form):
         self.method = method
@@ -112,6 +159,90 @@ class _App:
     def _register(self):
         app = self
 
+        def key_entries():
+            try:
+                doc = app.client.keys()
+            except ApiError:
+                return None, []
+            return doc, views.key_entries(doc)
+
+        def search_page(query="", result_html="", live_lookup_id=None):
+            doc, _entries = key_entries()
+            return views.search_view(
+                query=query, result_html=result_html,
+                credential_examples=fixtures.PREVIEW_CREDENTIALS,
+                product_examples=fixtures.PREVIEW_PRODUCTS,
+                keys_doc=doc, live_lookup_id=live_lookup_id,
+                api_base=app.api_url)
+
+        def search_result(query):
+            try:
+                cred = app.client.get_credential(query)
+                return search_page(query, views.credential_result(cred))
+            except UnknownSubject:
+                pass
+            except ApiError:
+                return search_page(query, views.unavailable_notice())
+            try:
+                product = app.client.get_product(query)
+                return search_page(query, views.product_result(product))
+            except UnknownSubject:
+                pass
+            except ApiError:
+                return search_page(query, views.unavailable_notice())
+            doc, entries = key_entries()
+            if doc is None:
+                return search_page(query, views.unavailable_notice())
+            for entry, label in entries:
+                if entry.get("key_id") == query:
+                    result = (
+                        '<div class="notice"><h3>Public key found</h3>'
+                        '<p>This key ID is published in Search. The full '
+                        'public key is below and in the '
+                        '<a href="/search/keys#%s">public key list</a>.'
+                        '</p></div>%s' % (
+                            views.esc(query),
+                            views.key_card(entry, label)))
+                    return views.search_view(
+                        query=query, result_html=result,
+                        credential_examples=fixtures.PREVIEW_CREDENTIALS,
+                        product_examples=fixtures.PREVIEW_PRODUCTS,
+                        keys_doc=doc, api_base=app.api_url)
+            # API-issued IDs (registrations above all) resolve through
+            # the one records endpoint, signature-verified like every
+            # API answer this dashboard renders.
+            try:
+                rec = app.client.get_record(query)
+                state = None
+                if str(rec.get("record_type") or "").startswith(
+                        "npc.registry."):
+                    try:
+                        state = app.client.get_verification_request(
+                            query)
+                    except (UnknownSubject, ApiError):
+                        state = None
+                rendered = views.record_result(
+                    rec, verification_request=state,
+                    api_base=app.api_url)
+                if rendered and "npc-request-verification" in rendered:
+                    rendered += ("<script>%s</script>"
+                                 % views.REQUEST_VERIFY_JS)
+                if rendered:
+                    return views.search_view(
+                        query=query, result_html=rendered,
+                        credential_examples=fixtures.PREVIEW_CREDENTIALS,
+                        product_examples=fixtures.PREVIEW_PRODUCTS,
+                        keys_doc=doc, api_base=app.api_url)
+            except UnknownSubject:
+                pass
+            except ApiError:
+                return search_page(query, views.unavailable_notice())
+            return search_page(
+                query,
+                views.unknown_notice("this ID",
+                                     notice_id="npc-unknown-notice"),
+                live_lookup_id=query)
+
         @app.route("GET", r"^/$")
         def home(req):
             return views.home_view()
@@ -120,74 +251,52 @@ class _App:
         def plugins(req):
             return views.plugins_view()
 
+        @app.route("GET", r"^/api$")
+        def api(req):
+            return views.api_view()
+
         @app.route("GET", r"^/records$")
         def records(req):
             rows = _records_rows(app.client)
             return views.records_view(rows)
 
-        @app.route("POST", r"^/records$")
-        def records_check(req):
-            rows = _records_rows(app.client)
-            text = (req.form.get("claim_text") or "").strip()
-            if not text:
-                return views.records_view(rows, claim_error="unknown")
-            try:
-                res = app.client.verify_claim(claim_text=text)
-                res = dict(res)
-                res["claim_text"] = text
-                return views.records_view(rows, claim_result=res)
-            except UnknownSubject:
-                return views.records_view(rows, claim_error="unknown")
-            except ApiError:
-                return views.records_view(rows, claim_error="unavailable")
+        @app.route("GET", r"^/search$")
+        def search(req):
+            if (req.query.get("view") or "").strip() == "keys":
+                return search_keys(req)
+            query = (req.query.get("id") or req.query.get("tag")
+                     or req.query.get("key") or "").strip()
+            if not query:
+                return search_page()
+            return search_result(query)
 
-        @app.route("GET", r"^/credentials$")
-        def credentials(req):
-            cred_id = (req.query.get("id") or "").strip()
-            if not cred_id:
-                return views.credentials_view(
-                    examples=fixtures.PREVIEW_CREDENTIALS)
-            try:
-                cred = app.client.get_credential(cred_id)
-                return views.credentials_view(
-                    cred, state="ok",
-                    examples=fixtures.PREVIEW_CREDENTIALS)
-            except UnknownSubject:
-                return views.credentials_view(
-                    {"id": cred_id}, state="unknown",
-                    examples=fixtures.PREVIEW_CREDENTIALS)
-            except ApiError:
-                return views.credentials_view(
-                    {"id": cred_id}, state="unavailable",
-                    examples=fixtures.PREVIEW_CREDENTIALS)
+        @app.route("GET", r"^/search/keys$")
+        def search_keys(req):
+            query = (req.query.get("id") or "").strip()
+            doc, _entries = key_entries()
+            return views.search_keys_view(doc, query=query)
 
-        @app.route("GET", r"^/products$")
-        def products(req):
-            tag = (req.query.get("tag") or "").strip()
-            if not tag:
-                return views.products_view(
-                    examples=fixtures.PREVIEW_PRODUCTS)
-            try:
-                product = app.client.get_product(tag)
-                return views.products_view(
-                    product, state="ok",
-                    examples=fixtures.PREVIEW_PRODUCTS)
-            except UnknownSubject:
-                return views.products_view(
-                    {"tag_id": tag}, state="unknown",
-                    examples=fixtures.PREVIEW_PRODUCTS)
-            except ApiError:
-                return views.products_view(
-                    {"tag_id": tag}, state="unavailable",
-                    examples=fixtures.PREVIEW_PRODUCTS)
+        @app.route("GET", r"^/search/unknown$")
+        def search_unknown(req):
+            query = (req.query.get("id") or "").strip()
+            return views.search_unknown_view(query, api_base=app.api_url)
 
-        @app.route("GET", r"^/keys$")
-        def keys(req):
-            try:
-                doc = app.client.keys()
-            except ApiError:
-                return views.unavailable_notice()
-            return views.keys_view(doc)
+        @app.route("GET", r"^/verify$")
+        def verify(req):
+            return views.verify_view(api_base=app.api_url)
+
+        @app.route("GET", r"^/archive$")
+        def archive(req):
+            return views.archive_view(_archive_rows(app.client))
+
+        @app.route("GET", r"^/privacy$")
+        def privacy(req):
+            return views.privacy_view(
+                datetime.date.today().isoformat())
+
+        @app.route("GET", r"^/help$")
+        def help_page(req):
+            return views.help_view(api_base=app.api_url)
 
     # -- dispatch -------------------------------------------------------
     def dispatch(self, req):
@@ -207,15 +316,18 @@ class _App:
 
 
 def _title_for(path):
+    if path.startswith("/search"):
+        return "Search"
     return {
         "/": "Home",
         "/records": "Records",
-        "/credentials": "Credentials",
-        "/products": "Products",
-        "/keys": "Keys",
+        "/archive": "Archive",
         "/plugins": "Plugins",
+        "/api": "API",
+        "/privacy": "Privacy",
+        "/help": "How it works",
+        "/verify": "Verify yours",
     }.get(path, "Not found")
-
 
 def make_handler(api_url, api_key):
     """Build a request-handler class bound to one API target."""

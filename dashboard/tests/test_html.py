@@ -12,14 +12,20 @@ HREF = re.compile(r'href="(/[^"]*)"')
 PAGES = [
     "/",
     "/records",
-    "/credentials",
-    "/credentials?id=cred_test_001",
-    "/credentials?id=cred_test_002",
-    "/products",
-    "/products?tag=tag_test_authentic",
-    "/products?tag=tag_test_counterfeit",
-    "/keys",
+    "/search",
+    "/search?id=cred_test_001",
+    "/search?id=cred_test_002",
+    "/search?id=tag_test_authentic",
+    "/search?id=tag_test_counterfeit",
+    "/search?id=tag_archive_seeker_hat_1",
+    "/search/keys",
+    "/search/unknown",
+    "/archive",
     "/plugins",
+    "/api",
+    "/privacy",
+    "/help",
+    "/verify",
 ]
 
 
@@ -37,9 +43,10 @@ class HtmlSanityTest(DashTestCase):
             for href in HREF.findall(body):
                 if href not in seen and href not in queue:
                     queue.append(href)
-        # every nav page was reachable through the crawl
-        for page in ("/", "/records", "/credentials", "/products", "/keys",
-                     "/plugins"):
+        # every main page was reachable through the crawl
+        for page in ("/", "/records", "/search", "/search/keys",
+                     "/search/unknown", "/archive", "/plugins", "/api",
+                     "/help", "/verify"):
             self.assertIn(page, seen)
 
     def test_no_placeholder_text(self):
@@ -49,7 +56,17 @@ class HtmlSanityTest(DashTestCase):
             # check visible text only: strip tags so HTML attributes like
             # placeholder="..." do not count as placeholder copy
             text = re.sub(r"<[^>]+>", " ", body).lower()
-            for marker in ("lorem ipsum", "todo", "fixme", "coming soon"):
+            markers = ["lorem ipsum", "todo", "fixme"]
+            # "coming soon" is a placeholder marker everywhere except
+            # /help, where it is the directed status line for the NPC
+            # Verify extension (Bayo, 2026-10-14), surrounded by real
+            # content asserted in test_routes.test_help_page, and
+            # /plugins, where it is the directed status line for the
+            # Chrome extension (Bayo, 2026-10-15: "Coming soon", never
+            # a hard date).
+            if path not in ("/help", "/plugins"):
+                markers.append("coming soon")
+            for marker in markers:
                 self.assertNotIn(marker, text,
                                  "%r found on %s" % (marker, path))
 
@@ -66,9 +83,17 @@ class HtmlSanityTest(DashTestCase):
         for path in PAGES:
             status, body = self.get(path)
             self.assertEqual(status, 200)
-            for link in ("/records", "/credentials", "/products", "/keys",
-                         "/plugins"):
+            for link in ("/records", "/search", "/plugins", "/api",
+                         "/verify", "/help"):
                 self.assertIn('href="%s"' % link, body, path)
+            nav = body.split("<nav>", 1)[1].split("</nav>", 1)[0]
+            self.assertIn(
+                '<a href="/records">Records</a><a href="/search">Search</a>'
+                '<a href="/plugins">Plugins</a><a href="/api">API</a>'
+                '<a href="/verify">Verify yours</a>'
+                '<a href="/help">How it works</a>', nav, path)
+            for old in ("/archive", "/credentials", "/products", "/keys"):
+                self.assertNotIn('href="%s">' % old, nav, path)
             self.assertIn("Internal preview. Local only.", body, path)
 
     def test_no_badge_artwork(self):
