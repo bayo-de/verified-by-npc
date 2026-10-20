@@ -214,3 +214,27 @@ class VerifiedClient:
         return self.request("GET", "/v1/agents/" +
                             urllib.parse.quote(agent_id, safe="") +
                             "/attestation")
+
+    def get_record(self, record_id):
+        """GET /v1/records/{id}: any API-issued ID (public endpoint).
+
+        Resolves registrations minted by POST /v1/register/* as well
+        as the existing record types. Signature-verified like every
+        response; 404 raises UnknownSubject (fail-closed).
+        """
+        return self.request("GET", "/v1/records/" +
+                            urllib.parse.quote(record_id, safe=""),
+                            auth=False)
+
+    def get_verification_request(self, record_id):
+        """GET /v1/records/{id}/verification-request (public).
+
+        Whether the registrant has asked for step two on this
+        registration, and the signed request record when one exists.
+        Signature-verified like every response; non-registration and
+        unknown IDs raise UnknownSubject (fail-closed).
+        """
+        return self.request(
+            "GET", "/v1/records/" +
+            urllib.parse.quote(record_id, safe="") +
+            "/verification-request", auth=False)
