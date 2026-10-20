@@ -12,32 +12,34 @@
 # plain HTML to dashboard/dist. No runtime, no server, no secrets.
 #
 # The API stays local-first: nothing here exposes it publicly. The public
-# front is a static snapshot of the test fixtures with fail-closed
-# unknown/unavailable semantics for anything outside the fixture set.
+# front is a static snapshot of the test fixtures. Search rewrites are
+# generated into dashboard/dist/_redirects by the exporter: exact IDs in
+# the build land on their baked Search pages, and every other ID lands
+# on /search/unknown/ with status 200. The generated rules are forced
+# (200!) and cover both the /search and /search/ path forms, because
+# Netlify shadows unforced rules when a static file exists at the
+# from-path and normalizes the unslashed path to the slashed one.
 
 [build]
   command = "python3 dashboard/export_static.py"
   publish = "dashboard/dist"
 
-# Keep the lookup URLs' local shape. Fixture IDs rewrite to their baked
-# detail pages; anything else falls through to the dashboard 404.
-[[redirects]]
-  from = "/credentials"
-  query = {id = ":id"}
-  to = "/credentials/:id/"
-  status = 200
+# Search query routing lives in the generated dashboard/dist/_redirects
+# file, because the exact public key IDs are known only at build time.
+# Do not restate the rules here as [[redirects]] blocks: they would
+# drift from the generated file, and unforced duplicates would still be
+# shadowed by the static /search page.
 
-[[redirects]]
-  from = "/products"
-  query = {tag = ":tag"}
-  to = "/products/:tag/"
-  status = 200
-
-# Static site: no JS, inline CSS only, forms POST to self (no backend).
+# Static site: inline CSS, plus inline JS on the Verify yours page and
+# the Search live lookup only (verification-start, 2026-10-14). Those
+# scripts talk from the visitor's browser to the verification API, so
+# script-src allows the inline scripts and connect-src names the API
+# base (the same base baked into the pages as data-api-base). The
+# waitlist form uses Netlify Forms.
 [[headers]]
   for = "/*"
   [headers.values]
     X-Content-Type-Options = "nosniff"
     X-Frame-Options = "DENY"
     Referrer-Policy = "no-referrer"
-    Content-Security-Policy = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    Content-Security-Policy = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self'; connect-src https://api.npclabs.xyz; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
