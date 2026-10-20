@@ -39,21 +39,38 @@ dashboard/
 
 | Route | What it shows |
 |-------|---------------|
-| `/` | What Verified by NPC is (the why, never the method), links to the plugin pages |
-| `/records` | Attestation records: verdict, scope, tested dates, sanitized findings; plus a claim-check form |
-| `/credentials[?id=]` | Credential lookup and detail (`valid` / `revoked` / `expired`) |
-| `/products[?tag=]` | Smart-tag authenticity lookup (`authentic` / `counterfeit` / `unknown`) with provenance |
-| `/keys` | Published NPC public keys, so anyone can check signatures offline |
-| `/plugins` | The five plugin actions and the provider surfaces with their gates |
+| `/` | What Verified by NPC is (the why, never the method), with the four main surfaces |
+| `/records` | Attestation records: verdict, scope, tested dates, and sanitized findings |
+| `/search[?id=]` | One lookup for credential, product, archive, and public key IDs, digital and physical; API-issued registration IDs resolve through `GET /v1/records/{id}` |
+| `/search/keys` | The full published NPC public key list, as a sub-view inside Search |
+| `/search/unknown` | The honest Unknown answer for an ID with no record; the page also asks the live API for the ID from the visitor's browser, so a registration ID resolves live and anything else stays Unknown |
+| `/verify` | Verify yours: the content and agent registration forms. They POST from the visitor's browser to the verification API base in the page's `data-api-base` (the public API in the export); if the service is not answering, the page says so plainly and offers the waitlist. Nothing is ever faked |
+| `/archive` | NPC Labs' real historical on-chain mints, reached from Records |
+| `/plugins` | The plugin questions and each provider surface's honest status |
+| `/api` | For developers: what the public API does, a quickstart with examples taken from live calls, the MCP endpoint, and how to check NPC signatures against the published keys |
+| `/help` | How it works: Records, Search, the Archive, Plugins, and registering your own digital resources and agents on Verify yours |
 
 ## Public static export (Netlify)
 
-`export_static.py` builds a static snapshot of all six pages plus baked
-fixture detail pages into `dashboard/dist/` (pure stdlib; boots the seeded
+`export_static.py` builds a static snapshot of the main pages plus baked
+Search detail pages into `dashboard/dist/` (pure stdlib; boots the seeded
 API and this dashboard on ephemeral loopback ports, so `server.py`'s
-loopback-only bind is never touched). `../../netlify.toml` wires the
-Netlify build, query redirects for the lookup URLs, and security headers.
-The API stays local-first: no hosted API, no keys in the artifact.
+loopback-only bind is never touched). The exporter also generates
+`dist/_redirects`: exact IDs in the build rewrite to their baked Search
+pages, and every other ID rewrites to `/search/unknown/` with status 200.
+Every rule is forced (`200!`) and emitted for both the `/search` and
+`/search/` path forms: Netlify shadows an unforced rule when a static
+file exists at the from-path, and its slash normalization moves
+`/search` to `/search/`, so an unforced rule never fires on the live
+host. Search resolution for API-issued IDs does not depend on these
+rules: the live lookup described above is the primary path, and the
+rules cover the baked fixture IDs.
+`../../netlify.toml` wires the Netlify build and security headers. The
+CSP allows the inline scripts and names the API base in `connect-src`:
+the Verify yours forms and the Search live lookup run in the visitor's
+browser against the live API, and if that base changes, the CSP and the
+pages' `data-api-base` must change together. The API
+stays local-first: no hosted API, no private keys in the artifact.
 `tests/test_static_export.py` proves content parity with the local app and
 zero secrets in the artifact. Deploy steps: `DEPLOY-RUNBOOK.md`.
 
@@ -102,7 +119,9 @@ Per DESIGN v1 §8, nothing below ships without his word:
    only. Counsel clearance is already on Anibal's review list.
 3. **Plugin submissions and store listings** (OpenAI developer account,
    Gemini extension review, Copilot partner validation). The `/plugins`
-   page states each surface's gate honestly.
+   page states each surface's status honestly: three are unsubmitted, and
+   the built MCP server was tested against the local API while the public
+   API is not live.
 4. **Mainnet onchain anchoring.** Phase 1 records anchor hashes locally
    with status `not_anchored`; no chain writes until the mainnet gate clears.
 5. **Real data.** Fictional seed fixtures only; production keys, real

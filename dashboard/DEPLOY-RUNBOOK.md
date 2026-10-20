@@ -6,12 +6,15 @@ path from here to live.
 
 ## 1. What ships
 
-A static export of the six dashboard pages, built by
+A static export of the dashboard pages, built by
 `dashboard/export_static.py`:
 
-- `/`, `/records`, `/credentials`, `/products`, `/keys`, `/plugins`
-- baked detail pages for every preview fixture
-  (`/credentials?id=cred_test_001`, `/products?tag=tag_test_authentic`, ...)
+- `/`, `/records`, `/search`, `/search/keys`, `/search/unknown`,
+  `/archive`, `/plugins`, `/privacy`, `/help`
+- baked Search detail pages for every credential, product, archive, and
+  public key ID in the build (`/search?id=cred_test_001`,
+  `/search?id=tag_test_authentic`, ...)
+- a generated `_redirects` file for Search query routing
 - the dashboard's own 404 page as `404.html`
 
 Every page is rendered through the full local stack at build time: the
@@ -32,8 +35,10 @@ deploy time, do not commit it).
   safest shape for a read-first trust surface: no server to patch, no
   environment variables to leak, no cold starts.
 - Netlify handles the one dynamic-looking piece the static export needs:
-  query-string redirects (`/credentials?id=X` rewrites to the baked
-  detail page; GitHub Pages cannot do this server-side).
+  query-string redirects from the generated `_redirects` file
+  (`/search?id=X` rewrites to the baked Search page for a known ID, and
+  to `/search/unknown/` for every other ID; GitHub Pages cannot do this
+  server-side).
 - Build runs the export itself (`python3 dashboard/export_static.py`),
   so every deploy re-renders from the current fixtures. Free tier is
   plenty for this traffic shape.
@@ -52,19 +57,19 @@ section 8; rejected).
 - No hosted API, no API keys in the deploy, no bearer tokens anywhere in
   the artifact (proven by `test_zero_secrets_in_artifact`).
 - The public front renders the local test fixtures with honest
-  labeling: every page footer reads "Internal preview. Test fixtures
-  only." plus the snapshot build date. Fixture IDs are all
+  labeling in customer words: every page footer reads "Every record
+  shown is a sample." plus "Sample records. Updated <build date>".
+  Fixture IDs are all
   `test_`/`tag_test_`/`cred_test_`/`agent_test_` prefixed by design and
   can never be mistaken for real records.
-- Fail-closed semantics are preserved in static form: records, the
-  claim-check form note, credentials, and products pages say plainly
-  that live verification runs against the verification API and the
-  static preview shows fixture records. Unknown lookups fall through to
-  the dashboard 404 ("Nothing here"), never an invented answer.
+- Fail-closed semantics are preserved in static form: the static
+  preview is labeled as fixture records where that is true, and an
+  unmatched Search ID lands on the honest Unknown answer, never an
+  invented record and never a raw 404.
 - Signed responses are still verified, at build time, client-side,
-  before anything renders. The `/keys` page publishes the build's
-  public signing keys (public halves only; private material never leaves
-  the build machine and is excluded from the artifact by test).
+  before anything renders. The public key list inside Search publishes
+  the build's public signing keys (public halves only; private material
+  never leaves the build machine and is excluded from the artifact by test).
 
 When the public API (`api.npclabs.xyz`) is later approved and hosted
 (DESIGN-v1 section 8, gate 5: hosting spend + public endpoint), the
@@ -102,14 +107,14 @@ publishes `dist/`, and applies the redirects and security headers from
 
 **Step 4: post-deploy verification** (do not announce until these pass):
 
-1. Open `/`, `/records`, `/credentials`, `/products`, `/keys`,
-   `/plugins`. All render; footer reads "Internal preview. Test
-   fixtures only." with a build date.
-2. Open `/credentials?id=cred_test_001` and
-   `/products?tag=tag_test_authentic`. Both resolve to their baked
-   detail pages through the query redirects.
-3. Open `/credentials?id=does_not_exist`. You get the dashboard 404
-   ("Nothing here"), not an invented record.
+1. Open `/`, `/records`, `/search`, `/search/keys`, `/plugins`, and
+   `/help`. All render; the fixture pages' footer reads "Internal
+   preview. Test fixtures only." with a build date.
+2. Open `/search?id=cred_test_001` and
+   `/search?id=tag_test_authentic`. Both resolve to their baked Search
+   detail pages through the generated query redirects.
+3. Open `/search?id=does_not_exist`. You get the Search Unknown answer
+   with status 200, not an invented record and not a raw 404.
 4. Check response headers include `Content-Security-Policy`,
    `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`.
 5. View source on any page: no `127.0.0.1`, no `localhost`, no
@@ -133,7 +138,7 @@ When the domain is chosen: Netlify dashboard > the site > Domain
 settings > Add custom domain > `verify.npclabs.xyz`, then add the DNS
 record at the registrar (Netlify shows the exact target). Future work:
 add `/c/{id}` redirects so the seeded `verify.npclabs.xyz/c/{id}` URLs
-resolve (currently the dashboard serves `/credentials?id={id}`).
+resolve (currently the dashboard serves `/search?id={id}`).
 
 ## 6. What remains gated (unchanged)
 
@@ -156,8 +161,8 @@ Per DESIGN-v1 section 8, still needs Bayo's explicit word:
    `base` in `netlify.toml`).
 3. **Choose the domain:** `verify.npclabs.xyz` (recommended) or a
    different host. DNS is not touched until he picks.
-4. **Confirm the labeling:** ship now as an "Internal preview" of test
-   fixtures (recommended; it demonstrates the product honestly), or
-   hold the public launch until real records exist.
+4. **Confirm the labeling:** ship now with every record labeled a
+   sample in customer words (recommended; it demonstrates the product
+   honestly), or hold the public launch until real records exist.
 5. **Note, no action:** the public API stays local-first and gated.
    This deploy does not cross that gate.
