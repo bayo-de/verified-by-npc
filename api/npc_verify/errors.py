@@ -40,6 +40,12 @@ def rate_limited(retry_after):
     }
 
 
+def detector_unavailable(detail):
+    """The AI detection service is off or unreachable. No score is faked."""
+    return HTTPStatus.SERVICE_UNAVAILABLE, {
+        "error": "detector_unavailable", "detail": detail}
+
+
 def conflict(detail):
     return HTTPStatus.CONFLICT, {"error": "conflict", "detail": detail}
 

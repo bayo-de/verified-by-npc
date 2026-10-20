@@ -138,6 +138,28 @@ and the onchain anchor reference.
 
 Unknown agent → `404 {"verdict": "unknown"}`.
 
+### POST /v1/images/ai-check
+
+**Verifier role required.**
+
+AI-generation check for one image, backed by the Sightengine genai
+model. The request carries the image itself as base64
+(`image_base64`, at most 750 KB decoded) or its address
+(`image_url`); exactly one of the two. Sightengine credentials live
+only in the server environment (`SIGHTENGINE_API_USER`,
+`SIGHTENGINE_API_SECRET`); no client ever sees them, and the
+extension only calls this API.
+
+The answer carries the detector probability as an integer percent
+(`ai_generated_percent`, 0 to 100): the signed envelope is defined
+over strings, booleans, integers and nulls, and a float would not
+canonicalize identically on every client. Bytes mode also returns
+`image_sha256` so a result can be tied to the exact file checked.
+
+When detection is not configured on the server, or Sightengine
+cannot complete the check, the answer is `503
+{"error": "detector_unavailable", ...}`. A score is never fabricated.
+
 ### POST /v1/attestations
 
 **Issuer role required. NPC-issued only in v1.**
