@@ -1,0 +1,46 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "id": "1eb60cd8-b5c0-451d-aded-50b2d15683cc",
+  "version": "1.0.0",
+  "packageName": "xyz.npclabs.verifiedbynpc",
+  "developer": {
+    "name": "NPC Labs",
+    "websiteUrl": "https://npclabs.xyz",
+    "privacyUrl": "https://npclabs.xyz/privacy",
+    "termsOfUseUrl": "https://npclabs.xyz/terms"
+  },
+  "name": {
+    "short": "Verified by NPC",
+    "full": "Verified by NPC"
+  },
+  "description": {
+    "short": "Check whether a product, credential, claim, or AI agent is genuinely verified, right inside Microsoft 365 Copilot.",
+    "full": "Before you buy it, share it, or trust it, check it.\n\nVerified by NPC lets you verify things right inside Microsoft 365 Copilot. Ask whether a product is authentic, whether a credential is real, whether a claim checks out, or whether an AI agent is verified, and get a clear answer from NPC Labs' attestation records: verified, flagged, or unknown.\n\nWhy it matters: fakes and false claims cost real money and real trust. A quick check before you act means you can move with confidence. When NPC Labs has no record of something, the answer is simply \"unknown,\" so you never mistake a guess for a verdict. Every answer is digitally signed, so it stands on its own evidence rather than on a promise.\n\nWho it is for: anyone shopping for authentic goods, teams checking credentials and claims, and anyone who wants to know whether the AI agent in front of them carries verification.\n\nWhat you need: a Microsoft 365 Copilot license, plus an NPC Labs verifier API key that you enter once in the plugin settings. The plugin verifies. It never issues attestations, and it never collects more than the identifier you ask about."
+  },
+  "icons": {
+    "color": "color-icon.png",
+    "outline": "outline-icon.png"
+  },
+  "accentColor": "#EC662B",
+  "copilotAgents": {
+    "declarativeAgents": [
+      {
+        "id": "npcVerifyAgent",
+        "file": "declarative-agent.json"
+      }
+    ]
+  },
+  "validDomains": [
+    "api.npclabs.xyz"
+  ],
+  "permissions": [
+    "identity"
+  ],
+  "devicePermissions": [],
+  "authorization": {
+    "permissions": {
+      "resourceSpecific": []
+    }
+  }
+}
