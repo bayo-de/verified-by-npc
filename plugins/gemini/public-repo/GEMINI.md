@@ -29,10 +29,12 @@ lives in `operations.json`.
 
 ## Setup
 
-Set the API location and key (or accept the prompts on first install):
+No setup is required: the helper defaults to the public API at
+https://api.npclabs.xyz with a bundled public read-only verifier key.
+To use your own key, or a local API during development, set:
 
 ```bash
-export NPC_VERIFY_API_URL="http://127.0.0.1:8787"   # local API during development
+export NPC_VERIFY_API_URL="http://127.0.0.1:8787"   # local API override
 export NPC_VERIFY_API_KEY="<verifier key>"
 ```
 

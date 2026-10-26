@@ -6,8 +6,9 @@ import sys
 def main():
     from .server import McpServer, _log
     if not os.environ.get("NPC_VERIFY_API_KEY"):
-        _log("WARNING: NPC_VERIFY_API_KEY is not set — authenticated tools "
-             "will report a configuration error until it is.")
+        _log("NPC_VERIFY_API_KEY is not set - using the bundled public "
+             "read-only verifier key. Set NPC_VERIFY_API_KEY to use "
+             "your own key.")
     McpServer().serve()
 
 

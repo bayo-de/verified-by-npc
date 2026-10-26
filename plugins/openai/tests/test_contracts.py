@@ -18,9 +18,10 @@ from npc_verify_openai.client import (  # noqa: E402
 
 
 class TestOperationContracts(OpenAITestCase):
-    def test_five_operations_exposed(self):
+    def test_seven_operations_exposed(self):
         self.assertEqual(sorted(OPERATIONS),
-                         ["explain_verification", "verify_agent",
+                         ["explain_verification", "register_agent",
+                          "register_content", "verify_agent",
                           "verify_claim", "verify_credential",
                           "verify_product"])
 

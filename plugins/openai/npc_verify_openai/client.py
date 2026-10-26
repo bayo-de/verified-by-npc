@@ -73,9 +73,10 @@ EXPLAINER = _mcp_tools.EXPLAINER.replace(
 def make_client(base_url=None, api_key=None, timeout=10):
     """Build a VerifiedClient for API v1.
 
-    Env defaults: NPC_VERIFY_API_URL (default http://127.0.0.1:8787),
-    NPC_VERIFY_API_KEY. All response-signature verification happens inside
-    the reused client.
+    Env defaults: NPC_VERIFY_API_URL (default https://api.npclabs.xyz),
+    NPC_VERIFY_API_KEY (a public read-only verifier key is bundled when
+    unset). All response-signature verification happens inside the
+    reused client.
     """
     return VerifiedClient(base_url=base_url, api_key=api_key,
                           timeout=timeout)

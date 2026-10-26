@@ -9,10 +9,29 @@ import traceback
 
 from . import __version__
 from .api_client import VerifiedClient, ApiError
-from .tools import TOOLS, TOOL_MAP
+from .tools import TOOLS, TOOL_MAP, validate_tool_arguments
 
 SERVER_NAME = "npc-verify"
-PROTOCOL_VERSION = "2024-11-05"
+
+#: MCP protocol versions this server can speak, newest first. Tool
+#: shapes do not change across these versions for a tools-only server.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+
+#: The version answered when the client requests none (or one this
+#: server does not know): the newest supported version.
+PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]
+
+#: The original protocol version, kept for callers that pinned it.
+LEGACY_PROTOCOL_VERSION = "2024-11-05"
+
+
+def negotiate_protocol_version(requested):
+    """MCP version negotiation for initialize: honor the client's
+    requested version when it is one we support; otherwise answer
+    with the newest supported version."""
+    if requested in SUPPORTED_PROTOCOL_VERSIONS:
+        return requested
+    return PROTOCOL_VERSION
 
 
 def _log(msg):
@@ -46,7 +65,8 @@ class McpServer:
 
         if method == "initialize":
             return self._result(msg_id, {
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": negotiate_protocol_version(
+                    params.get("protocolVersion")),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": SERVER_NAME,
                                "version": __version__},
@@ -55,8 +75,10 @@ class McpServer:
             return None  # notifications get no reply
         if method == "tools/list":
             return self._result(msg_id, {"tools": [
-                {"name": t["name"], "description": t["description"],
-                 "inputSchema": t["inputSchema"]} for t in TOOLS]})
+                {"name": t["name"], "title": t["title"],
+                 "description": t["description"],
+                 "inputSchema": t["inputSchema"],
+                 "annotations": t["annotations"]} for t in TOOLS]})
         if method == "tools/call":
             return self._tools_call(msg_id, params)
         if method == "ping":
@@ -72,6 +94,11 @@ class McpServer:
         if not isinstance(arguments, dict):
             return self._error(msg_id, -32602,
                                "arguments must be an object")
+        problem = validate_tool_arguments(tool, arguments)
+        if problem is not None:
+            return self._result(msg_id, {
+                "content": [{"type": "text", "text": problem}],
+                "isError": True})
         try:
             is_error, text = tool["handler"](self.client, arguments)
         except ApiError as exc:  # belt and suspenders: never leak a traceback

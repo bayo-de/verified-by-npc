@@ -39,9 +39,11 @@ gemini extensions link /path/to/npc-verify
 
 ## Configure
 
-You need an NPC Verification API v1 endpoint and a verifier API key. During development, point the extension at a local instance.
-
-Accept the settings prompts on install, or set them yourself:
+No configuration is required: the extension defaults to the public NPC
+Verification API at https://api.npclabs.xyz with a bundled public
+read-only verifier key. To use your own key, or a local API during
+development, accept the settings prompts on install or set them
+yourself:
 
 ```bash
 export NPC_VERIFY_API_URL="http://127.0.0.1:8787"
