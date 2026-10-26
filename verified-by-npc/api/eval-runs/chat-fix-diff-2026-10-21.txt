@@ -1,0 +1,167 @@
+--- api_pkgs/npc_verify/chat.py	2026-10-16 00:38:56.000000000 +0000
++++ /home/hatch/workspace/grand-fleet/verified-by-npc/api/npc_verify/chat.py	2026-10-21 06:09:50.091122781 +0000
+@@ -29,8 +29,10 @@
+ """
+ import datetime
+ import json
++import logging
+ import math
+ import os
++import random
+ import re
+ import secrets
+ import time
+@@ -40,6 +42,8 @@
+ from . import errors
+ from .models import utcnow_iso
+ 
++log = logging.getLogger("npc_verify.chat")
++
+ # -- fixed strings (spec sections 2 and 3; shown to visitors as-is) --
+ NO_ANSWER = (
+     "I do not have that in what I can speak to here. The Help page "
+@@ -252,7 +256,15 @@
+ 
+ # -------------------------------------------------------------- provider
+ class ProviderError(Exception):
+-    """The model provider failed or is not configured."""
++    """The model provider failed or is not configured. Carries the
++    upstream HTTP status and the underlying exception's type name
++    when known, so the failure can be logged (never the message
++    body, never any credential material)."""
++
++    def __init__(self, message, status=None, cause_type=None):
++        super().__init__(message)
++        self.status = status
++        self.cause_type = cause_type
+ 
+ 
+ class GeminiChatProvider:
+@@ -267,33 +279,68 @@
+         self.base_url = base_url.rstrip("/")
+         self.timeout = timeout
+ 
++    # Retry posture: a visitor should see the resting state only
++    # when the provider is actually down, not on a burst of
++    # throttles. Up to 4 attempts inside one overall deadline, so
++    # the worst case stays well under the Lambda timeout (30s);
++    # each attempt's timeout is whatever budget remains, and a
++    # provider Retry-After is honored (capped) inside the budget.
++    _MAX_ATTEMPTS = 4
++    _OVERALL_BUDGET_S = 22.0
++    _BACKOFF_BASE_S = (1.0, 2.0, 4.0)
++    _RETRY_AFTER_CAP_S = 10.0
++
++    def _retry_delay(self, exc, attempt):
++        """Seconds to wait before the next attempt: the provider's
++        Retry-After when it sends a numeric one (capped), else
++        exponential backoff with jitter."""
++        headers = getattr(exc, "headers", None)
++        raw = headers.get("Retry-After") if headers is not None \
++            else None
++        if raw:
++            try:
++                return min(float(raw), self._RETRY_AFTER_CAP_S)
++            except (TypeError, ValueError):
++                pass  # an HTTP-date or junk value: use backoff
++        base = self._BACKOFF_BASE_S[
++            min(attempt, len(self._BACKOFF_BASE_S) - 1)]
++        return base * random.uniform(0.5, 1.5)
++
+     def _call(self, payload):
+         """One generateContent round trip. Separated so tests and
+         the grounding eval can ride a different credential path
+         (the stored-key surrogate) without duplicating the payload
+-        or the parsing. One retry on a transient status: a visitor
+-        should see the resting state only when the provider is
+-        actually down, not on a single throttle."""
++        or the parsing. Retries transient statuses (429/5xx) and
++        network errors; anything else raises at once."""
+         url = "%s/v1beta/models/%s:generateContent" % (self.base_url,
+                                                        self.model)
+         req = urllib.request.Request(
+             url, data=json.dumps(payload).encode("utf-8"),
+             headers={"Content-Type": "application/json",
+                      "x-goog-api-key": self._api_key}, method="POST")
++        deadline = time.monotonic() + self._OVERALL_BUDGET_S
+         last_exc = None
+-        for attempt in range(2):
++        for attempt in range(self._MAX_ATTEMPTS):
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                break
+             try:
+                 with urllib.request.urlopen(
+-                        req, timeout=self.timeout) as resp:
++                        req, timeout=min(self.timeout,
++                                         remaining)) as resp:
+                     return json.loads(resp.read().decode("utf-8"))
+             except Exception as exc:
+                 last_exc = exc
+                 code = getattr(exc, "code", None)
+-                if attempt == 0 and (code in (429, 500, 502, 503, 504)
+-                                     or code is None):
+-                    time.sleep(2.0)
+-                    continue
+-                raise
++                transient = code in (429, 500, 502, 503, 504) \
++                    or code is None
++                if not transient \
++                        or attempt == self._MAX_ATTEMPTS - 1:
++                    raise
++                delay = self._retry_delay(exc, attempt)
++                if time.monotonic() + delay >= deadline:
++                    break
++                time.sleep(delay)
+         raise last_exc
+ 
+     def complete(self, system_instruction, history, message):
+@@ -309,16 +356,26 @@
+         payload = {
+             "systemInstruction": {"parts": [{"text": system_instruction}]},
+             "contents": contents,
++            # maxOutputTokens 1200 with thinking budgeted to zero:
++            # on Gemini 2.5 Flash-class models thinking tokens draw
++            # from the same output budget, and at 700 a long think
++            # cut a fixed-string reply off mid-sentence (the Oct 18
++            # eval's noans-1 truncation). This is a fixed-format
++            # answerer over retrieved chunks; it does not need the
++            # thinking budget, and 1200 leaves the reply ample room.
+             "generationConfig": {"temperature": 0.2,
+-                                 "maxOutputTokens": 700},
++                                 "maxOutputTokens": 1200,
++                                 "thinkingConfig": {"thinkingBudget": 0}},
+         }
+         try:
+             data = self._call(payload)
+         except ProviderError:
+             raise
+         except Exception as exc:
+-            raise ProviderError("gemini call failed: %s"
+-                                % type(exc).__name__)
++            raise ProviderError(
++                "gemini call failed: %s" % type(exc).__name__,
++                status=getattr(exc, "code", None),
++                cause_type=type(exc).__name__)
+         text = ""
+         for cand in data.get("candidates") or []:
+             for part in (cand.get("content") or {}).get("parts") or []:
+@@ -480,7 +537,17 @@
+         try:
+             reply, tok_in, tok_out = self.provider.complete(
+                 instruction, history, message)
+-        except ProviderError:
++        except ProviderError as exc:
++            # Instrumented (Oct 21 fix): until now this branch
++            # swallowed the failure with no trace anywhere, which
++            # is why the Oct 18 eval's off-flicker could only be
++            # diagnosed by inference. Type and HTTP status only:
++            # never the provider's message body, never key material.
++            log.warning(
++                "chat provider failure: error_type=%s http_status=%s",
++                getattr(exc, "cause_type", None)
++                or type(exc).__name__,
++                getattr(exc, "status", None))
+             self._record_pair(thread_id, message, page, OFF_MESSAGE,
+                               [], False, now)
+             if is_new:
