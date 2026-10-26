@@ -40,6 +40,13 @@ def rate_limited(retry_after):
     }
 
 
+def unavailable(error, detail):
+    """A configured-off or not-yet-configured service. Fail closed,
+    say so plainly, never fake the success shape."""
+    return HTTPStatus.SERVICE_UNAVAILABLE, {
+        "error": error, "detail": detail}
+
+
 def detector_unavailable(detail):
     """The AI detection service is off or unreachable. No score is faked."""
     return HTTPStatus.SERVICE_UNAVAILABLE, {

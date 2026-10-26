@@ -37,6 +37,7 @@ import base64
 import secrets
 from datetime import datetime, timezone
 
+from . import kya
 from .canonical import canonicalize, canonical_sha256_hex
 from .models import is_iso8601, utcnow_iso
 
@@ -117,6 +118,27 @@ def validate_consent_input(fields: dict) -> list:
     return problems
 
 
+def _kya_block_for_consent(consent, reputation_basis=None):
+    """The KYA block for a PACT grant, from the consent record's
+    own fields (npc_verify.kya). Withheld scopes keep the order
+    they were requested in."""
+    granted = list(consent.get("scopes_granted") or [])
+    withheld = [s for s in (consent.get("scopes_requested") or [])
+                if s not in granted]
+    constraints = {}
+    if withheld:
+        constraints["scopes_withheld"] = withheld
+    return kya.build_kya_block(
+        principal={
+            "user_id_at_brand": consent.get("user_id_at_brand"),
+            "pa_sub": consent.get("pa_sub"),
+        },
+        extra_permissions={"scopes_granted": granted},
+        extra_constraints=constraints,
+        expires_at=consent.get("expires_at"),
+        reputation_basis=reputation_basis)
+
+
 def mint_consent_record(store, keys, fields: dict):
     """Mint and store the signed Consent Record for a new grant.
 
@@ -138,6 +160,14 @@ def mint_consent_record(store, keys, fields: dict):
         "granted_at": fields.get("granted_at") or now,
         "expires_at": fields.get("expires_at"),
     }
+    if kya.kya_enabled():
+        # KYA block (npc_verify.kya), signed into the record.
+        # Principal: the user the personal agent acts for, named
+        # by the two ids this record already carries. Permissions:
+        # scopes_granted. Constraints: what was requested but
+        # withheld, and the grant expiry. Reputation: no standing
+        # fact exists at issuance, so it is honestly null.
+        core["kya"] = _kya_block_for_consent(core)
     rec = sign_record(keys, core)
     if not store.add_pact_consent(rec):
         return None
@@ -275,6 +305,20 @@ def grant_status_record(store, keys, grant_id: str, at: str = None):
     elif consent.get("expires_at") and \
             _parse_iso(checked_at) > _parse_iso(consent["expires_at"]):
         core["status"] = "expired"
+    if kya.kya_enabled():
+        # KYA block (npc_verify.kya), signed into this status
+        # record. Reputation carries no score: its basis is exactly
+        # the standing facts this read can see, the grant status,
+        # whether a revocation record exists, and how many signed
+        # audit entries the grant's log holds at this moment.
+        entries = store.pact_audit_entries(grant_id)
+        core["kya"] = _kya_block_for_consent(
+            consent,
+            reputation_basis={
+                "grant_status": core["status"],
+                "revocation_recorded": revocation is not None,
+                "audit_entries": len(entries),
+            })
     return sign_record(keys, core)
 
 

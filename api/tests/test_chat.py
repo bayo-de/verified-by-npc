@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
@@ -150,6 +151,33 @@ class TestChatService(unittest.TestCase):
         self.assertEqual(body["state"], "off")
         self.assertEqual(body["reply"], chat_mod.OFF_MESSAGE)
 
+    def test_provider_failure_is_logged_with_status(self):
+        # The Oct 21 instrumentation: a swallowed ProviderError now
+        # leaves a trace carrying the type and HTTP status (and
+        # nothing else: no message body, no key material).
+        class StatusProvider:
+            def complete(self, system_instruction, history, message):
+                raise chat_mod.ProviderError(
+                    "gemini call failed: HTTPError", status=429,
+                    cause_type="HTTPError")
+
+        svc, _store = _service(StatusProvider())
+        with self.assertLogs("npc_verify.chat", level="WARNING") as cm:
+            _s, body = svc.post_chat({"message": "Hello"},
+                                     "203.0.113.7")
+        self.assertEqual(body["state"], "off")
+        line = " ".join(cm.output)
+        self.assertIn("error_type=HTTPError", line)
+        self.assertIn("http_status=429", line)
+
+    def test_provider_failure_logged_when_no_status(self):
+        svc, _store = _service(ExplodingProvider())
+        with self.assertLogs("npc_verify.chat", level="WARNING") as cm:
+            svc.post_chat({"message": "Hello"}, "203.0.113.7")
+        line = " ".join(cm.output)
+        self.assertIn("error_type=ProviderError", line)
+        self.assertIn("http_status=None", line)
+
     def test_per_ip_hour_limit(self):
         svc, _store = _service(FakeProvider())
         for i in range(chat_mod.IP_PER_HOUR):
@@ -238,6 +266,164 @@ class TestChatService(unittest.TestCase):
         self.assertEqual(len(provider.last_history), 2)
         self.assertIn("MATERIALS FOR THIS ANSWER",
                       provider.last_system)
+
+
+class _HttpStub(Exception):
+    """Stands in for urllib.error.HTTPError: _call reads only
+    .code and .headers."""
+
+    def __init__(self, code, headers=None):
+        super().__init__("HTTP %s" % code)
+        self.code = code
+        self.headers = headers or {}
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class _FakeTime:
+    """chat module time stand-in: the real monotonic clock, with
+    sleeps recorded instead of taken."""
+
+    def __init__(self):
+        self.sleeps = []
+
+    def monotonic(self):
+        return time.monotonic()
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+
+
+class TestGeminiProvider(unittest.TestCase):
+    """The Oct 21 retry hardening and generation budget (fixes
+    b and c from the Oct 18 off-state diagnosis). No network: the
+    urlopen and the clock are fakes."""
+
+    def _provider(self):
+        return chat_mod.GeminiChatProvider("test-key")
+
+    def _run_call(self, provider, outcomes):
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            outcome = outcomes[min(calls["n"], len(outcomes) - 1)]
+            calls["n"] += 1
+            if isinstance(outcome, Exception):
+                raise outcome
+            return _FakeResponse(outcome)
+
+        fake_time = _FakeTime()
+        with mock.patch.object(chat_mod.urllib.request, "urlopen",
+                               fake_urlopen), \
+                mock.patch.object(chat_mod, "time", fake_time):
+            try:
+                result = provider._call({"contents": []})
+            except Exception as exc:
+                return None, exc, calls["n"], fake_time.sleeps
+        return result, None, calls["n"], fake_time.sleeps
+
+    def test_success_first_try_no_sleep(self):
+        result, exc, n, sleeps = self._run_call(
+            self._provider(), [{"ok": True}])
+        self.assertIsNone(exc)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(n, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_throttles_retry_then_succeed(self):
+        result, exc, n, sleeps = self._run_call(
+            self._provider(),
+            [_HttpStub(429), _HttpStub(503), {"ok": True}])
+        self.assertIsNone(exc)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(n, 3)
+        self.assertEqual(len(sleeps), 2)
+        # Exponential bases 1s then 2s, jittered by 0.5x-1.5x.
+        self.assertTrue(0.5 <= sleeps[0] <= 1.5)
+        self.assertTrue(1.0 <= sleeps[1] <= 3.0)
+
+    def test_non_transient_status_raises_at_once(self):
+        result, exc, n, sleeps = self._run_call(
+            self._provider(), [_HttpStub(400)])
+        self.assertIsNone(result)
+        self.assertIsInstance(exc, _HttpStub)
+        self.assertEqual(exc.code, 400)
+        self.assertEqual(n, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_attempts_cap_at_four(self):
+        result, exc, n, sleeps = self._run_call(
+            self._provider(), [_HttpStub(429)] * 6)
+        self.assertIsNone(result)
+        self.assertIsInstance(exc, _HttpStub)
+        self.assertEqual(n, 4)
+        self.assertEqual(len(sleeps), 3)
+
+    def test_retry_after_header_is_honored(self):
+        result, exc, n, sleeps = self._run_call(
+            self._provider(),
+            [_HttpStub(429, {"Retry-After": "7"}), {"ok": True}])
+        self.assertIsNone(exc)
+        self.assertEqual(sleeps, [7.0])
+
+    def test_retry_after_is_capped(self):
+        result, exc, n, sleeps = self._run_call(
+            self._provider(),
+            [_HttpStub(503, {"Retry-After": "60"}), {"ok": True}])
+        self.assertIsNone(exc)
+        self.assertEqual(sleeps, [chat_mod.GeminiChatProvider
+                                  ._RETRY_AFTER_CAP_S])
+
+    def test_deadline_stops_further_retries(self):
+        provider = self._provider()
+        provider._OVERALL_BUDGET_S = 0.2
+        provider._BACKOFF_BASE_S = (5.0, 5.0, 5.0)
+        result, exc, n, sleeps = self._run_call(
+            provider, [_HttpStub(429)] * 4)
+        self.assertIsNone(result)
+        self.assertIsInstance(exc, _HttpStub)
+        self.assertEqual(n, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_complete_payload_budget_and_thinking(self):
+        captured = {}
+
+        class CapturingProvider(chat_mod.GeminiChatProvider):
+            def _call(self, payload):
+                captured.update(payload)
+                return {"candidates": [{"content": {"parts": [
+                    {"text": " hello "}]}}],
+                    "usageMetadata": {"promptTokenCount": 11,
+                                      "candidatesTokenCount": 7}}
+
+        reply, tok_in, tok_out = CapturingProvider(
+            "test-key").complete("sys", [], "hi")
+        self.assertEqual((reply, tok_in, tok_out), ("hello", 11, 7))
+        cfg = captured["generationConfig"]
+        self.assertEqual(cfg["maxOutputTokens"], 1200)
+        self.assertEqual(cfg["thinkingConfig"]["thinkingBudget"], 0)
+
+    def test_complete_wraps_error_with_status(self):
+        class FailingProvider(chat_mod.GeminiChatProvider):
+            def _call(self, payload):
+                raise _HttpStub(503)
+
+        with self.assertRaises(chat_mod.ProviderError) as ctx:
+            FailingProvider("test-key").complete("sys", [], "hi")
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(ctx.exception.cause_type, "_HttpStub")
 
 
 class TestCorpus(unittest.TestCase):

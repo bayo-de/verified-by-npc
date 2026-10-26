@@ -19,6 +19,17 @@ Agent registration follows the Agent Registry spec
 accountable owner is required (no anonymous or team-alias owners), and
 the issued claim states registration, not verification.
 
+An agent registration may also carry two optional declarations from
+the owner: `agent_id`, the identifier the agent's attestations will
+be issued under (recording it is what links an attestation's subject
+back to this registration's accountable owner), and `declared_scope`,
+the scope of authority the owner declares for the agent, in the same
+scope shape attestations use. Both are declarations, recorded as
+declared: NPC has not reviewed or verified either at intake, and
+scope_review stays in checks_not_run whether or not a scope was
+declared. Records that carry neither are exactly the records this API
+has always minted: the fields are omitted, never null.
+
 Intake checks (content): what can be honestly checked from what was
 provided runs at intake and is written into the record:
 
@@ -51,7 +62,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 
-from . import c2pa, c2pa_validate, media_probe, pact
+from . import c2pa, c2pa_validate, kya, media_probe, pact
 from .detector import DetectorError
 from .models import is_iso8601, utcnow_iso
 
@@ -79,6 +90,10 @@ FETCH_MAX_BYTES = 8 * 1024 * 1024
 
 _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s]{2,}$")
 _HASH_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{32,128}$")
+# An agent_id is the identifier attestations name as their subject:
+# the same opaque-handle discipline as an identity signal's subject
+# reference, bounded to the subject_id length discipline.
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-+]{0,127}$")
 
 # -- integration source provenance (optional, additive) ---------------------
 # POST /v1/register/content may carry a `source` object when the work
@@ -91,12 +106,79 @@ _HASH_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{32,128}$")
 # this API has always minted: the field is omitted, never null.
 SOURCE_PLATFORMS = ("youtube", "instagram", "tiktok", "x", "spotify",
                     "google_drive", "microsoft_onedrive", "box")
+SOURCE_PLATFORM_DISPLAY = {
+    "youtube": "YouTube", "instagram": "Instagram",
+    "tiktok": "TikTok", "x": "X", "spotify": "Spotify",
+    "google_drive": "Google Drive",
+    "microsoft_onedrive": "Microsoft OneDrive", "box": "Box",
+}
+# Social-profiles lane provenance (integrations/DESIGN.md; the lane
+# itself lives in npc_verify.social). A source minted by that lane
+# may carry three more fields: `account_id` (the platform's own id
+# for the account the work was enumerated from: a YouTube channel
+# id, an Instagram user id, a Spotify artist id; never NPC's opaque
+# connection reference), `enumerated_at` (when the lane read the
+# work's details), and `enumerated_from` (how it read them). The
+# fields are carried only while NPC_SOCIAL_PROFILES=1: with the lane
+# off they are unknown fields, ignored exactly as any other unknown
+# field is today, so records stay byte-identical.
+SOCIAL_PROFILES_ENV = "NPC_SOCIAL_PROFILES"
+SOURCE_ENUMERATED_FROM = ("connected_account", "public_catalog",
+                          "owner_supplied")
 SOURCE_BYTE_CLASSES = ("bytes_fetchable", "metadata_only",
                        "permalink_only")
 _SOURCE_CHECKSUM_ALGORITHMS = ("md5", "sha1", "sha256", "crc32",
                                "quickxor")
 _METADATA_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _RECORD_ID_RE = re.compile(r"^reg_[A-Za-z0-9]{8,64}$")
+
+# -- federated identity signals (optional, additive, flag-gated) ----------
+# A registration (content or agent) may carry `identity_signals`: the
+# outside identity checks the owner linked through a linking service
+# (World ID, a Google or GitHub account, a Coinbase attestation, a
+# hosted document check; design in integrations/
+# federated-identity-signals-DESIGN-2026-10-19.md). A signal records
+# what the named provider confirmed about the owner. It is evidence
+# a beholder weighs, never an NPC verdict: signals change no status,
+# issue no mark, and the verification decision stays in
+# checks_not_run. The block is gated by NPC_IDENTITY_SIGNALS=1: a
+# deployment without a linking service refuses the block outright
+# rather than signing claims it cannot stand behind. Records
+# without the block are exactly the records this API has always
+# minted: the field is omitted, never null.
+IDENTITY_SIGNALS_ENV = "NPC_IDENTITY_SIGNALS"
+IDENTITY_SIGNALS_MAX = 8
+IDENTITY_SIGNAL_KINDS = {
+    "world_id": ("proof_of_human", "passport", "selfie_check",
+                 "identity_check"),
+    "google": ("account",),
+    "github": ("account",),
+    "x": ("account",),
+    "coinbase": ("verified_account", "verified_country"),
+    "gitcoin_passport": ("score",),
+    "stripe_identity": ("document_check",),
+    "persona": ("document_check",),
+    "siwe": ("wallet_control",),
+}
+# The assurance class is derived from the provider and signal, never
+# taken from the caller: a caller cannot upgrade what a link means
+# by naming a stronger class.
+IDENTITY_SIGNAL_ASSURANCE = {
+    ("world_id", "proof_of_human"): "unique_human",
+    ("world_id", "passport"): "document_check",
+    ("world_id", "selfie_check"): "unique_human",
+    ("world_id", "identity_check"): "document_check",
+    ("google", "account"): "account_control",
+    ("github", "account"): "account_control",
+    ("x", "account"): "account_control",
+    ("coinbase", "verified_account"): "kyc_backed_account",
+    ("coinbase", "verified_country"): "kyc_backed_account",
+    ("gitcoin_passport", "score"): "aggregated_personhood",
+    ("stripe_identity", "document_check"): "document_check",
+    ("persona", "document_check"): "document_check",
+    ("siwe", "wallet_control"): "account_control",
+}
+_SUBJECT_REF_RE = re.compile(r"^[A-Za-z0-9._:\-+]+$")
 
 
 # -- fetching -----------------------------------------------------------------
@@ -122,6 +204,14 @@ LOOPBACK_FETCH_ENV = "NPC_ALLOW_LOOPBACK_FETCH"
 
 def _loopback_fetch_allowed():
     return os.environ.get(LOOPBACK_FETCH_ENV) == "1"
+
+
+def _identity_signals_enabled():
+    return os.environ.get(IDENTITY_SIGNALS_ENV) == "1"
+
+
+def _social_profiles_enabled():
+    return os.environ.get(SOCIAL_PROFILES_ENV) == "1"
 
 
 def _ip_literal(host):
@@ -274,6 +364,7 @@ def validate_content_input(fields):
     source = fields.get("source")
     if source is not None:
         problems.extend(validate_source(source))
+    problems.extend(_identity_signals_gate_problems(fields))
     return problems
 
 
@@ -372,6 +463,25 @@ def validate_source(source):
             problems.append(
                 "source.previous_record_id must be an NPC "
                 "registration record ID (reg_...)")
+    # Social-profiles lane provenance: validated only on a
+    # deployment running the lane. With the lane off the three
+    # fields are unknown fields here, ignored exactly as before.
+    if _social_profiles_enabled():
+        _check_source_str(problems, source, "account_id", 256,
+                          required=False)
+        enumerated_at = source.get("enumerated_at")
+        if enumerated_at is not None:
+            if not isinstance(enumerated_at, str) \
+                    or not is_iso8601(enumerated_at):
+                problems.append(
+                    "source.enumerated_at must be an ISO-8601 "
+                    "timestamp")
+        enumerated_from = source.get("enumerated_from")
+        if enumerated_from is not None \
+                and enumerated_from not in SOURCE_ENUMERATED_FROM:
+            problems.append(
+                "source.enumerated_from must be one of %s"
+                % (list(SOURCE_ENUMERATED_FROM),))
     return problems
 
 
@@ -412,6 +522,17 @@ def normalize_source(source):
         v = _s(name)
         if v is not None:
             out[name] = v
+    if _social_profiles_enabled():
+        # Lane provenance, carried only while the lane runs (see
+        # the note at SOURCE_ENUMERATED_FROM). enumerated_from is
+        # carried only when it names a known enumeration kind.
+        for name in ("account_id", "enumerated_at"):
+            v = _s(name)
+            if v is not None:
+                out[name] = v
+        enumerated_from = _s("enumerated_from")
+        if enumerated_from in SOURCE_ENUMERATED_FROM:
+            out["enumerated_from"] = enumerated_from
     marker = source.get("version_marker")
     if isinstance(marker, dict):
         kind = marker.get("kind")
@@ -429,6 +550,176 @@ def normalize_source(source):
             out["platform_checksum"] = {
                 "algorithm": algorithm, "value": value.strip()}
     return out
+
+
+def validate_identity_signals(signals):
+    """Validate the optional `identity_signals` list.
+
+    Shape only, exactly like validate_source: this checks that each
+    claimed link is well formed, never that the link is genuine.
+    Genuineness is the linking service's job before it submits; the
+    registry signs what it was given and labels it as the named
+    provider's confirmation, not NPC's.
+    """
+    problems = []
+    if not isinstance(signals, list):
+        return ["identity_signals must be a list"]
+    if not signals:
+        problems.append("identity_signals must not be empty")
+    if len(signals) > IDENTITY_SIGNALS_MAX:
+        problems.append(
+            "identity_signals is limited to %d entries"
+            % IDENTITY_SIGNALS_MAX)
+    seen = set()
+    for i, sig in enumerate(signals):
+        where = "identity_signals[%d]" % i
+        if not isinstance(sig, dict):
+            problems.append("%s must be an object" % where)
+            continue
+        provider = sig.get("provider")
+        if provider not in IDENTITY_SIGNAL_KINDS:
+            problems.append(
+                "%s.provider must be one of %s"
+                % (where, list(IDENTITY_SIGNAL_KINDS)))
+            continue
+        signal = sig.get("signal")
+        if signal not in IDENTITY_SIGNAL_KINDS[provider]:
+            problems.append(
+                "%s.signal must be one of %s for provider %s"
+                % (where, list(IDENTITY_SIGNAL_KINDS[provider]),
+                   provider))
+        subject = sig.get("subject_ref")
+        subject_ok = isinstance(subject, str) and subject.strip() \
+            and len(subject.strip()) <= 128 \
+            and _SUBJECT_REF_RE.match(subject.strip())
+        if not subject_ok:
+            problems.append(
+                "%s.subject_ref is required (an opaque provider "
+                "handle: letters, digits, and . _ : - + only, "
+                "max 128 chars)" % where)
+        for name in ("linked_at", "observed_at"):
+            v = sig.get(name)
+            if v is None:
+                if name == "linked_at":
+                    problems.append(
+                        "%s.linked_at is required (an ISO-8601 "
+                        "timestamp)" % where)
+            elif not isinstance(v, str) or not is_iso8601(v):
+                problems.append(
+                    "%s.%s must be an ISO-8601 timestamp"
+                    % (where, name))
+        evidence = sig.get("evidence_ref")
+        if evidence is not None:
+            if not isinstance(evidence, str) or not evidence.strip() \
+                    or len(evidence) > 256 \
+                    or any(c.isspace() for c in evidence):
+                problems.append(
+                    "%s.evidence_ref must be a string without "
+                    "spaces (max 256 chars)" % where)
+        key = (provider, signal,
+               subject.strip() if isinstance(subject, str) else None)
+        if key in seen:
+            problems.append("%s duplicates an earlier signal" % where)
+        seen.add(key)
+    return problems
+
+
+def normalize_identity_signals(signals):
+    """Return the cleaned `identity_signals` list for the signed
+    record core, or None when there is nothing usable or the block
+    is not enabled on this deployment.
+
+    Only known fields survive, in a fixed key order. The assurance
+    class is derived here from the provider and signal, never taken
+    from the caller. Entries are deduplicated and sorted by
+    provider, signal, then subject, so the signed shape stays
+    canonical however the caller ordered them. Callers validate
+    first; this stays defensive about types rather than
+    re-reporting problems.
+    """
+    if not _identity_signals_enabled():
+        return None
+    if not isinstance(signals, list):
+        return None
+    out = []
+    seen = set()
+    for sig in signals:
+        if not isinstance(sig, dict):
+            continue
+        provider = sig.get("provider")
+        signal = sig.get("signal")
+        if provider not in IDENTITY_SIGNAL_KINDS \
+                or signal not in IDENTITY_SIGNAL_KINDS.get(
+                        provider, ()):
+            continue
+        subject = sig.get("subject_ref")
+        if not isinstance(subject, str) or not subject.strip() \
+                or len(subject.strip()) > 128 \
+                or not _SUBJECT_REF_RE.match(subject.strip()):
+            continue
+        subject = subject.strip()
+        linked_at = sig.get("linked_at")
+        if not isinstance(linked_at, str) \
+                or not is_iso8601(linked_at.strip()):
+            continue
+        key = (provider, signal, subject)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = {
+            "provider": provider,
+            "signal": signal,
+            "assurance_class":
+                IDENTITY_SIGNAL_ASSURANCE[(provider, signal)],
+            "subject_ref": subject,
+            "linked_at": linked_at.strip(),
+        }
+        observed = sig.get("observed_at")
+        if isinstance(observed, str) and is_iso8601(observed.strip()):
+            entry["observed_at"] = observed.strip()
+        evidence = sig.get("evidence_ref")
+        if isinstance(evidence, str) and evidence.strip() \
+                and len(evidence) <= 256 \
+                and not any(c.isspace() for c in evidence):
+            entry["evidence_ref"] = evidence.strip()
+        out.append(entry)
+    if not out:
+        return None
+    out.sort(key=lambda e: (e["provider"], e["signal"],
+                            e["subject_ref"]))
+    return out[:IDENTITY_SIGNALS_MAX]
+
+
+def _identity_signals_gate_problems(fields):
+    """The gate both registration kinds share for the optional
+    `identity_signals` block. Absent block, no problems. Present
+    block on a deployment that has not enabled it, one problem: the
+    deployment refuses the claims rather than signing them
+    unbacked."""
+    signals = fields.get("identity_signals")
+    if signals is None:
+        return []
+    if not _identity_signals_enabled():
+        return ["identity_signals are not enabled on this deployment"]
+    return validate_identity_signals(signals)
+
+
+def _identity_signals_check_entry(signals):
+    """The one checks_run entry a record with signals carries. It
+    states the boundary in the record itself, in the same spirit as
+    the platform_metadata entry: a linked check is evidence about
+    the owner, not an NPC identity check and not a verdict."""
+    return {
+        "check": "identity_signals",
+        "status": "recorded",
+        "signals": len(signals),
+        "detail": "The owner linked the outside identity checks "
+                  "named in this record. Each link was confirmed "
+                  "with the service named, and it shows only what "
+                  "that service confirmed about the owner. A linked "
+                  "check is not an identity check by NPC, and it "
+                  "does not change this record's status.",
+    }
 
 
 def validate_verification_request_input(fields):
@@ -521,7 +812,107 @@ def validate_agent_input(fields):
             and not (isinstance(fields.get("description"), str)
                      and fields["description"].strip()):
         problems.append("provide a homepage or a description")
+    agent_id = fields.get("agent_id")
+    if agent_id is not None:
+        if not isinstance(agent_id, str) \
+                or not _AGENT_ID_RE.match(agent_id):
+            problems.append(
+                "agent_id must be an agent identifier (letters, "
+                "digits, and . _ : - +, max 128 chars)")
+    problems.extend(
+        validate_declared_scope(fields.get("declared_scope")))
+    problems.extend(_identity_signals_gate_problems(fields))
     return problems
+
+
+# -- declared scope (optional agent-registration intake) ------------------
+DECLARED_SCOPE_MAX_ENTRIES = 32
+
+
+def _check_scope_value(problems, where, value, list_shaped=False):
+    """One declared-scope value: a short string, or a short list of
+    short strings. The known scope keys (the ones npc_verify.kya
+    splits into permissions and constraints) are list shaped in
+    every attestation on record, so for those keys only the list
+    form validates."""
+    if isinstance(value, list):
+        if len(value) > DECLARED_SCOPE_MAX_ENTRIES or any(
+                not isinstance(v, str) or not v.strip()
+                or len(v) > 128 for v in value):
+            problems.append(
+                "%s must be a list of strings (max %d entries, "
+                "each max 128 chars)"
+                % (where, DECLARED_SCOPE_MAX_ENTRIES))
+    elif isinstance(value, str) and not list_shaped:
+        if not value.strip() or len(value) > 256:
+            problems.append(
+                "%s must be a string (max 256 chars)" % where)
+    elif list_shaped:
+        problems.append(
+            "%s must be a list of strings (max %d entries, "
+            "each max 128 chars)"
+            % (where, DECLARED_SCOPE_MAX_ENTRIES))
+    else:
+        problems.append(
+            "%s must be a string or a list of strings" % where)
+
+
+def validate_declared_scope(scope):
+    """Validate the optional `declared_scope` on an agent
+    registration: the scope of authority the owner declares for the
+    agent, in the same shape an attestation's scope uses (the keys
+    npc_verify.kya splits into permissions and constraints, plus
+    any other keys carried verbatim). Shape only: a declaration is
+    recorded as declared, never reviewed or verified at intake."""
+    problems = []
+    if scope is None:
+        return problems
+    if not isinstance(scope, dict):
+        return ["declared_scope must be an object"]
+    if not scope:
+        problems.append("declared_scope must not be empty")
+    for key, value in scope.items():
+        if not isinstance(key, str) or not key.strip() \
+                or len(key) > 64:
+            problems.append(
+                "declared_scope keys must be strings (max 64 chars)")
+            continue
+        known = key in kya.PERMISSION_SCOPE_KEYS \
+            or key in kya.CONSTRAINT_SCOPE_KEYS
+        _check_scope_value(problems, "declared_scope.%s" % key,
+                           value, list_shaped=known)
+    return problems
+
+
+def normalize_declared_scope(scope):
+    """Return the cleaned `declared_scope` dict for the signed
+    record core, or None when there is nothing usable.
+
+    Only validated shapes survive, strings trimmed, lists cleaned
+    of blanks: the signed record shape stays under this module's
+    control even though the owner supplied the values. Callers
+    validate first (validate_agent_input); this stays defensive
+    about types rather than re-reporting problems.
+    """
+    if not isinstance(scope, dict):
+        return None
+    out = {}
+    for key, value in scope.items():
+        if not isinstance(key, str) or not key.strip() \
+                or len(key) > 64:
+            continue
+        known = key in kya.PERMISSION_SCOPE_KEYS \
+            or key in kya.CONSTRAINT_SCOPE_KEYS
+        if isinstance(value, str) and not known:
+            if value.strip() and len(value) <= 256:
+                out[key] = value.strip()
+        elif isinstance(value, list):
+            items = [v.strip() for v in value
+                     if isinstance(v, str) and v.strip()
+                     and len(v.strip()) <= 128]
+            if items:
+                out[key] = items[:DECLARED_SCOPE_MAX_ENTRIES]
+    return out or None
 
 
 # -- caps -----------------------------------------------------------------------
@@ -656,6 +1047,48 @@ def _c2pa_check_entries(data):
     return run, not_run
 
 
+def _platform_metadata_detail(source):
+    """The platform_metadata entry's detail sentence.
+
+    Without lane provenance this is the sentence the record has
+    always carried. With it, the sentence states exactly how the
+    lane read the work and what that reading shows: enumeration
+    from a connected account shows the account controls this
+    content on the platform, printed in those words, and none of
+    the three forms is verification of the work.
+    """
+    enumerated_from = source.get("enumerated_from")
+    if not enumerated_from:
+        return ("The platform returned this work's details for "
+                "an account the customer connected to Verified "
+                "by NPC. The details are recorded as the "
+                "platform gave them. Connecting an account "
+                "shows control of that account at connect "
+                "time; it is not verification of the work.")
+    platform = SOURCE_PLATFORM_DISPLAY.get(
+        source["platform"], source["platform"])
+    at = source.get("enumerated_at") or ""
+    if enumerated_from == "connected_account":
+        return ("This work was enumerated from the owner's "
+                "connected account on %s at %s. The account "
+                "controls this content on the platform. The "
+                "details are recorded as the platform gave "
+                "them. Enumerating a work from a connected "
+                "account is not verification of the work."
+                % (platform, at))
+    if enumerated_from == "public_catalog":
+        return ("This work's details were read from the public "
+                "catalog on %s at %s, from a reference the owner "
+                "provided. The details are recorded as the "
+                "platform gave them. A catalog reading is not "
+                "verification of the work." % (platform, at))
+    return ("The owner provided this work's address on %s; it "
+            "was recorded at %s. NPC has not read the work from "
+            "the platform for this registration. Recording an "
+            "address the owner provided is not verification of "
+            "the work." % (platform, at))
+
+
 def run_content_intake(detector, fetcher, content_kind, locator,
                        source=None):
     """Run the intake checks that can honestly run. Returns
@@ -673,18 +1106,18 @@ def run_content_intake(detector, fetcher, content_kind, locator,
     kind_of_locator = locator_kind(locator)
     data = None
     if source is not None:
-        run.append({
+        metadata_entry = {
             "check": "platform_metadata",
             "status": "observed",
             "platform": source["platform"],
             "external_id": source["external_id"],
-            "detail": "The platform returned this work's details for "
-                      "an account the customer connected to Verified "
-                      "by NPC. The details are recorded as the "
-                      "platform gave them. Connecting an account "
-                      "shows control of that account at connect "
-                      "time; it is not verification of the work.",
-        })
+            "detail": _platform_metadata_detail(source),
+        }
+        for name in ("account_id", "enumerated_at",
+                     "enumerated_from"):
+            if source.get(name):
+                metadata_entry[name] = source[name]
+        run.append(metadata_entry)
         checksum = source.get("platform_checksum")
         if checksum:
             run.append({
@@ -853,6 +1286,11 @@ def mint_content_registration(store, keys, fields, checks_run,
     source = normalize_source(fields.get("source"))
     if source is not None:
         core["source"] = source
+    signals = normalize_identity_signals(fields.get("identity_signals"))
+    if signals is not None:
+        core["identity_signals"] = signals
+        core["checks_run"] = list(core["checks_run"]) + [
+            _identity_signals_check_entry(signals)]
     rec = pact.sign_record(keys, core)
     store.add_registration(rec, email, client_ip)
     return rec
@@ -895,11 +1333,18 @@ def mint_agent_registration(store, keys, fields, email, client_ip):
 
     Per the Agent Registry spec: registration is free, the owner is a
     named accountable person, and the claim states registration, not
-    verification.
+    verification. The owner may also declare the agent_id the agent's
+    attestations will be issued under and a declared scope of
+    authority; both are recorded as declarations, and the declared
+    scope is what fills the registration's KYA permissions and
+    constraints (see the module header).
     """
     now = utcnow_iso()
     homepage = fields.get("homepage")
     description = fields.get("description")
+    agent_id = fields.get("agent_id")
+    declared_scope = normalize_declared_scope(
+        fields.get("declared_scope"))
     core = {
         "record_type": AGENT_RECORD_TYPE,
         "record_id": "reg_" + secrets.token_hex(12),
@@ -940,6 +1385,39 @@ def mint_agent_registration(store, keys, fields, email, client_ip):
             dict(_PENDING_DECISION),
         ],
     }
+    if isinstance(agent_id, str) and _AGENT_ID_RE.match(agent_id):
+        core["agent_id"] = agent_id
+    if declared_scope is not None:
+        core["declared_scope"] = declared_scope
+        core["checks_run"].append({
+            "check": "declared_scope",
+            "status": "recorded",
+            "detail": "The owner declared the scope of authority "
+                      "printed on this record. NPC records the "
+                      "declaration as the owner made it; the scope "
+                      "has not been reviewed or verified.",
+        })
+    signals = normalize_identity_signals(fields.get("identity_signals"))
+    if signals is not None:
+        core["identity_signals"] = signals
+        core["checks_run"].append(
+            _identity_signals_check_entry(signals))
+    if kya.kya_enabled():
+        # KYA block (npc_verify.kya), signed into the record like
+        # every other core field. The principal is the named
+        # accountable owner this registration already carries; the
+        # owner's linked identity signals, when present, ride under
+        # the principal because they are checks about the owner.
+        # Permissions and constraints come from the owner's declared
+        # scope when one was declared, and are honestly null when
+        # none was (scope_review sits in checks_not_run above either
+        # way: a declaration is not a review). A registration has no
+        # verdict or revocation and is not an attestation, so
+        # reputation is honestly null here.
+        core["kya"] = kya.build_kya_block(
+            principal=kya.registration_principal(
+                fields["owner_name"], signals),
+            scope=declared_scope)
     rec = pact.sign_record(keys, core)
     store.add_registration(rec, email, client_ip)
     return rec
