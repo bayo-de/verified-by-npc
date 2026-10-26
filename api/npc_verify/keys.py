@@ -20,11 +20,51 @@ from .models import utcnow_iso
 
 PURPOSES = ("api_signing", "issuer")
 
+# Deployment-supplied signing key (audit item D1): when BOTH of these
+# environment variables are set, the deployment's api_signing key is
+# loaded from them instead of being generated or bundled, so the
+# production seed never lives in a deploy artifact. The bundled/demo
+# key stays published alongside it (see KeyRegistry.register_external_key).
+SIGNING_SEED_ENV = "NPC_SIGNING_SEED"
+SIGNING_KEY_ID_ENV = "NPC_SIGNING_KEY_ID"
+
 
 def _key_id(purpose: str) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     rand = secrets.token_hex(3)
     return f"npc-{purpose}-{stamp}-{rand}"
+
+
+def env_signing_key(env=None):
+    """The deployment-supplied api_signing key, or None when unset.
+
+    Reads NPC_SIGNING_SEED (base64 of the 32-byte Ed25519 seed) and
+    NPC_SIGNING_KEY_ID from `env` (default os.environ). Both or
+    neither: a half-configured deployment raises ValueError, because
+    silently falling back to a bundled key is exactly the failure D1
+    exists to remove.
+    """
+    env = os.environ if env is None else env
+    seed_b64 = (env.get(SIGNING_SEED_ENV) or "").strip()
+    key_id = (env.get(SIGNING_KEY_ID_ENV) or "").strip()
+    if not seed_b64 and not key_id:
+        return None
+    if not seed_b64 or not key_id:
+        raise ValueError(
+            f"{SIGNING_SEED_ENV} and {SIGNING_KEY_ID_ENV} must be "
+            "set together (or both left unset)")
+    if len(key_id) > 128 or any(
+            not (c.isalnum() or c in "-_") for c in key_id):
+        raise ValueError(f"{SIGNING_KEY_ID_ENV} is not a safe key id")
+    try:
+        seed = base64.b64decode(seed_b64, validate=True)
+    except Exception as exc:
+        raise ValueError(
+            f"{SIGNING_SEED_ENV} is not valid base64") from exc
+    if len(seed) != 32:
+        raise ValueError(
+            f"{SIGNING_SEED_ENV} must decode to a 32-byte seed")
+    return key_id, seed
 
 
 class KeyRegistry:
@@ -71,6 +111,42 @@ class KeyRegistry:
     def rotate(self, purpose: str) -> dict:
         """Rotate = generate a fresh key; the old one retires, never deleted."""
         return self.generate(purpose)
+
+    def register_external_key(self, purpose: str, key_id: str,
+                              seed: bytes, created_at: str) -> str:
+        """Register a signing key whose seed the deployment supplies
+        (audit D1; see env_signing_key).
+
+        The seed is written to the keys dir like any private key —
+        the store only ever holds the public half. The key becomes
+        the purpose's active signer; the previously active key (the
+        bundled demo key at first cutover) retires into the published
+        history, so GET /v1/keys lists BOTH keys and old signatures
+        stay verifiable. Idempotent across cold starts: a key already
+        on record with the same public half is reactivated in place,
+        and one on record with a DIFFERENT public half is a
+        configuration error that fails loudly.
+        """
+        if purpose not in PURPOSES:
+            raise ValueError(f"purpose must be one of {PURPOSES}")
+        if len(seed) != 32:
+            raise ValueError("external signing seed must be 32 bytes")
+        pub_b64 = base64.b64encode(ed25519.publickey(seed)).decode()
+        existing = self.store.public_key_b64(key_id)
+        if existing is not None and existing != pub_b64:
+            raise ValueError(
+                f"key id {key_id} is already registered with a "
+                "different public key")
+        self._write_seed(key_id, seed)
+        if existing is None:
+            self.store.register_key(key_id, purpose, pub_b64,
+                                    created_at)
+        elif self.store.active_key_id(purpose) != key_id:
+            if not self.store.activate_key(key_id, purpose,
+                                           created_at):
+                raise RuntimeError(
+                    f"could not activate external key {key_id}")
+        return key_id
 
     def active_key_id(self, purpose: str):
         return self.store.active_key_id(purpose)

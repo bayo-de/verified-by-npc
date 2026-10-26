@@ -1,9 +1,8 @@
-# NPC Verification API (demo) - Netlify site config.
+# NPC Verification API - Netlify site config.
 #
-# Demo-only public surface for the Verified by NPC plugin review:
-# read-only verification endpoints over the demo fixtures, every response
-# Ed25519-signed. No write endpoints ship in this bundle (see demoapp.py).
-# Stdlib-only Python function; no build step, no dependencies.
+# The static landing page lives in public/. The /v1/* paths proxy to the
+# AWS Lambda API (see the redirects below); no API function ships in this
+# bundle.
 
 [build]
   publish = "public"
@@ -11,10 +10,17 @@
 [functions]
   directory = "netlify/functions"
 
-# Keep the API's URL shape: /v1/* is served by the function.
+# Keep the API's URL shape: /v1/* proxies to the AWS Lambda API.
 [[redirects]]
   from = "/v1/*"
-  to = "/.netlify/functions/api"
+  to = "https://no7xc8f0x5.execute-api.us-east-2.amazonaws.com/v1/:splat"
+  status = 200
+
+# OpenAI plugin domain verification: serve the portal-issued challenge token
+# from the Lambda (env NPC_OPENAI_APPS_CHALLENGE) at the public well-known path.
+[[redirects]]
+  from = "/.well-known/openai-apps-challenge"
+  to = "https://no7xc8f0x5.execute-api.us-east-2.amazonaws.com/.well-known/openai-apps-challenge"
   status = 200
 
 [[headers]]

@@ -1,0 +1,17 @@
+Hello,
+
+We received your request to verify this record:
+
+$subject_name
+Record ID: $subject_record_id
+Request ID: $request_id
+
+Your request is in NPC's queue. Verification is a separate step from registration: it is the step where the checks listed on your record as not yet run get run, and the outcome is written to the public record.
+
+We will email this address again when your record's status changes. You can check the record at any time here:
+
+$record_link
+
+NPC Labs
+
+You are receiving this email because this address was given when the record above was registered. We use it only for messages about this record, never for marketing.
