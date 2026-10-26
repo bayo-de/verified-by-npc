@@ -1,16 +1,39 @@
 /* NPC Verify: popup styles.
- * Quiet dark panel, one accent, huge verdict. Radical subtraction.
+ *
+ * One design language with the rest of NPC: the space grey and Inter of
+ * npclabs.xyz, the paper and ink of the public record dashboard, and a
+ * single accent, NPC orange (#ec662b), reserved for the check and the
+ * way through to the record. Follows the system color scheme: dark is
+ * the space-grey ground, light is the dashboard's paper. Radical
+ * subtraction; one huge verdict.
  */
 
 :root {
-  --ground: #141412;
-  --panel: #1d1d1b;
+  color-scheme: dark;
+  --ground: #181818;
+  --panel: #212121;
+  --well: #101010;
   --line: rgba(255, 255, 255, 0.09);
-  --text: #f5f4f0;
-  --muted: #a3a19a;
-  --dim: #6e6c66;
-  --accent: #ff6a00;
+  --text: #f4f4f4;
+  --muted: #a9a9a9;
+  --dim: #8a8a8a;
+  --accent: #ec662b;
   --good: #7fc97f;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --ground: #fbfbf9;
+    --panel: #ffffff;
+    --well: #f4f4f2;
+    --line: #e6e6e4;
+    --text: #181818;
+    --muted: #6f6f6f;
+    --dim: #9a9a9a;
+    --accent: #ec662b;
+    --good: #1a7a3c;
+  }
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -19,9 +42,10 @@ body {
   width: 380px;
   background: var(--ground);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   font-size: 14px;
   line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
 }
 
 #app { padding: 16px 16px 12px; }
@@ -65,7 +89,7 @@ body {
   border: 1px solid var(--line);
   border-radius: 10px;
   overflow: hidden;
-  background: #0e0e0d;
+  background: var(--well);
   margin-bottom: 10px;
 }
 .selected-wrap img { display: block; width: 100%; max-height: 220px; object-fit: contain; }
@@ -89,7 +113,7 @@ body {
   font-weight: 600;
   cursor: pointer;
 }
-.cta:hover { background: #ffffff; }
+.cta:hover { opacity: 0.88; }
 .cta:disabled { opacity: 0.4; cursor: default; }
 
 .ghost-btn {
