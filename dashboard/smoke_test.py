@@ -91,34 +91,129 @@ def main():
     check("records shows sanitized findings",
           "Mechanical drop test, 1.2m, 50 cycles." in b)
 
+    check("records has no claim form", "Check a claim" not in b
+          and "claim_text" not in b)
+    check("records links the archive", 'href="/archive"' in b)
     s, b = get(dash_port, "/records", method="POST",
                fields={"claim_text": "The test widget passes drop testing"})
-    check("claim check matches (200)", s == 200 and "Matched a record" in b)
+    check("claim check route is gone (404)", s == 404)
 
-    s, b = get(dash_port, "/credentials?id=cred_test_001")
+    s, b = get(dash_port, "/search")
+    check("search renders (200)", s == 200)
+    check("search merges digital and physical IDs",
+          "Digital IDs" in b and "Physical IDs" in b)
+    check("search links the Verify yours surface",
+          'href="/verify"' in b and "Verify yours" in b)
+
+    s, b = get(dash_port, "/verify")
+    check("verify yours renders (200)", s == 200)
+    check("verify yours carries both registration forms",
+          'id="npc-content-form"' in b and 'id="npc-agent-form"' in b)
+    check("verify yours states the honest status",
+          "Registration is not verification" in b
+          and "registered, checks pending" in b)
+    check("verify yours carries the plain down-state",
+          "The verification service is not answering yet" in b)
+
+    # Register a piece of work directly against the API (public, no
+    # key), then resolve its issued ID through the dashboard Search.
+    import json as _json
+    conn = http.client.HTTPConnection("127.0.0.1", api_port, timeout=10)
+    conn.request("POST", "/v1/register/content",
+                 body=_json.dumps({
+                     "title": "Smoke registration", "kind": "text",
+                     "locator": "sha256:" + "ef" * 32,
+                     "creator_name": "Smoke Maker",
+                     "creator_email": "smoke@example.com"}).encode(),
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    reg = _json.loads(resp.read())
+    conn.close()
+    check("public registration issues an ID (201)",
+          resp.status == 201 and reg["record_id"].startswith("reg_"))
+    s, b = get(dash_port, "/search?id=" + reg["record_id"])
+    check("search resolves the API-issued ID",
+          s == 200 and "Smoke registration" in b
+          and "Registered, checks pending" in b)
+    check("registration email is never rendered",
+          "smoke@example.com" not in b)
+
+    s, b = get(dash_port, "/search?id=cred_test_001")
     check("credential detail (200)", s == 200)
     check("credential shows fixture data",
           "Test Artisan Certificate" in b and "Valid" in b)
 
-    s, b = get(dash_port, "/credentials?id=cred_test_003")
+    s, b = get(dash_port, "/search?id=cred_test_003")
     check("expired credential renders", s == 200 and "Expired" in b)
 
-    s, b = get(dash_port, "/products?tag=tag_test_authentic")
+    s, b = get(dash_port, "/search?id=tag_test_authentic")
     check("product lookup (200)", s == 200)
     check("product shows authentic + provenance",
           "Authentic" in b and "manufactured" in b)
 
-    s, b = get(dash_port, "/keys")
-    check("keys page (200)", s == 200)
-    check("keys page publishes signing key", "npc-api_signing" in b)
+    s, b = get(dash_port, "/search?id=tag_archive_seeker_hat_1")
+    check("archive item resolves in search", s == 200
+          and "tag_archive_seeker_hat_1" in b and "minted" in b)
+
+    s, b = get(dash_port, "/search/keys")
+    check("search keys subview (200)", s == 200)
+    check("search keys publishes signing key", "npc-api_signing" in b)
+
+    # Pull a published signing key ID from the keys subview.
+    import re as _re
+    m = _re.search(r"npc-api_signing-[A-Za-z0-9_-]+", b)
+    check("published signing key ID visible", m is not None)
+    if m:
+        s, b = get(dash_port, "/search?id=" + m.group(0))
+        check("public key resolves in search", s == 200
+              and "Public key found" in b)
+
+    s, b = get(dash_port, "/search/unknown")
+    check("unknown route is the Unknown answer", s == 200
+          and "Unknown." in b and "Nothing here." not in b)
+
+    s, b = get(dash_port, "/archive")
+    check("archive renders from records structure", s == 200
+          and "Company history, on chain." in b)
 
     s, b = get(dash_port, "/plugins")
     check("plugins page (200)", s == 200 and "MCP" in b)
+    check("plugins page is honest about status",
+          "None is available to install today." in b
+          and "Not submitted." in b)
 
-    s, b = get(dash_port, "/credentials?id=cred_nope")
-    check("unknown credential fail-closed",
+    s, b = get(dash_port, "/api")
+    check("api page (200)", s == 200
+          and "The signed record, from your own code." in b)
+    check("api page documents the live endpoints",
+          "/v1/register/agent" in b and "/v1/keys" in b
+          and "/v1/mcp" in b and "request-verification" not in b)
+    check("nav carries API next to Plugins",
+          '<a href="/plugins">Plugins</a><a href="/api">API</a>' in b)
+
+    s, b = get(dash_port, "/privacy")
+    check("privacy page (200)", s == 200)
+    check("privacy page carries the policy",
+          "NPC Verify Privacy Policy" in b and "SHA-256 hash" in b)
+    check("footer links the privacy page", 'href="/privacy"' in b)
+
+    s, b = get(dash_port, "/help")
+    check("help page (200)", s == 200)
+    check("help page explains the site",
+          "How it works" in b and "What if something has no record?" in b)
+    check("help page is linked sitewide", 'href="/help"' in b)
+
+    s, b = get(dash_port, "/search?id=cred_nope")
+    check("unknown search fail-closed",
           s == 200 and "Unknown" in b
           and "Test Artisan Certificate" not in b)
+
+    s, b = get(dash_port, "/credentials")
+    check("old credentials page is gone (404)", s == 404)
+    s, b = get(dash_port, "/products")
+    check("old products page is gone (404)", s == 404)
+    s, b = get(dash_port, "/keys")
+    check("old keys page is gone (404)", s == 404)
 
     s, b = get(dash_port, "/nope")
     check("404 page", s == 404)
