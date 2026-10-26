@@ -37,7 +37,36 @@ Endpoints:
   GET  /v1/records/{id}                   (PUBLIC; the signed record for
                                            any API-issued ID: registrations,
                                            credentials, products, agents,
-                                           attestations, PACT consents)
+                                           attestations, PACT consents;
+                                           social batch receipts too,
+                                           while NPC_SOCIAL_PROFILES=1)
+  POST /v1/records/{id}/identity-links/siwe/challenge
+  POST /v1/records/{id}/identity-links/siwe/verify
+  POST /v1/records/{id}/identity-links/{github|google}/start
+  GET  /v1/link/{github|google}/callback
+  POST /v1/records/{id}/identity-links/coinbase/refresh
+  GET  /v1/records/{id}/identity-panel     (PUBLIC; the "Identity the
+                                           owner has linked" panel
+                                           data at current observed
+                                           state. All six linking
+                                           routes are gated by
+                                           NPC_IDENTITY_SIGNALS=1)
+  POST /v1/social/{youtube|instagram|tiktok}/connect/start
+  GET  /v1/social/{youtube|instagram|tiktok}/callback
+  POST /v1/social/connections/list
+  POST /v1/social/connections/{id}/scan
+  POST /v1/social/connections/{id}/register
+  POST /v1/social/connections/{id}/disconnect
+  POST /v1/social/connections/{id}/overview
+  POST /v1/social/x/register
+  POST /v1/social/spotify/register        (the social profiles
+                                           content-registration
+                                           lane: owners connect a
+                                           profile and register
+                                           the content on it as
+                                           signed records. All
+                                           routes gated by
+                                           NPC_SOCIAL_PROFILES=1)
   POST /v1/chat                           (PUBLIC; Biblo site chat:
                                            grounded answers over the
                                            public corpus; UNSIGNED,
@@ -58,7 +87,7 @@ import sqlite3
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import errors
 from .auth import Auth, RateLimiter, hash_key
@@ -69,11 +98,15 @@ from .detector import (DetectorError, DetectorNotConfigured,
 from .keys import KeyRegistry
 from .models import Attestation, utcnow_iso
 from . import chat as chat_module
+from . import linking as linking_module
 from . import mailer as mailer_module
+from . import social as social_module
+from . import kya as kya_module
 from . import pact
 from . import registry
 from .seed import ANCHOR_CHAIN
 from .store import Store, make_store  # noqa: F401  (Store re-exported)
+from .store import registration_email_hash as _email_hash_of
 
 # Trust-layer memory (DESIGN v1 section 5). The memory library owns record
 # validation, chain checks, scoping, and verification status; the endpoints
@@ -106,11 +139,12 @@ CHAIN_STATUS = {"network": "none", "anchoring": "disabled",
 
 
 class Request:
-    def __init__(self, method, path, headers, body):
+    def __init__(self, method, path, headers, body, query=None):
         self.method = method
         self.path = path
         self.headers = headers  # lowercased keys
         self.body = body  # parsed JSON dict, or None
+        self.query = query or {}  # first value per query parameter
         self.key = None  # set by auth wrapper
         # TCP peer (or gateway-reported source IP), injected by the
         # transport, never taken from a client-supplied header. Used
@@ -189,7 +223,7 @@ def _agent_body(store, row):
         anchor = {"chain": att["anchor_chain"], "tx": att["anchor_tx"],
                   "hash": att["anchor_hash"],
                   "status": att["anchor_status"]}
-    return {
+    body = {
         "agent_id": row["agent_id"],
         "verdict": row["verdict"],
         "scope": json.loads(row["scope_json"]),
@@ -199,10 +233,34 @@ def _agent_body(store, row):
         "onchain_anchor": anchor,
         "notes": row["notes"],
     }
+    if kya_module.kya_enabled():
+        # KYA block (npc_verify.kya). The principal is resolved
+        # from the recorded chain: the agent registration that
+        # names this agent_id and its accountable owner; when no
+        # registration names the agent, the chain is not recorded
+        # and the principal stays null. The reputation is the
+        # agent's rating, computed here from its whole attestation
+        # history (this module's store-backed reads are where a
+        # history is visible). The revoked flag is read from the
+        # linked attestation when one exists; without one it stays
+        # out of the block.
+        body["kya"] = kya_module.kya_for_scope(
+            scope=body["scope"], valid_from=row["valid_from"],
+            valid_until=row["valid_until"],
+            revoked=(bool(att["revoked"]) if att is not None
+                     else None),
+            verdict=row["verdict"],
+            principal=kya_module.principal_from_registration(
+                store.registration_for_agent(row["agent_id"])),
+            rating=kya_module.compute_agent_rating(
+                store.attestations_for_subject(
+                    "agent", row["agent_id"]),
+                as_of=utcnow_iso()))
+    return body
 
 
-def _attestation_body(row):
-    return {
+def _attestation_body(store, row):
+    body = {
         "id": row["id"],
         "subject_type": row["subject_type"],
         "subject_id": row["subject_id"],
@@ -222,6 +280,21 @@ def _attestation_body(row):
         "revoked": bool(row["revoked"]),
         "created_at": row["created_at"],
     }
+    if row["subject_type"] == "agent" and kya_module.kya_enabled():
+        # Agent subjects resolve like _agent_body: the principal
+        # from the registration that names this agent (null when
+        # the chain is not recorded), and the reputation as the
+        # rating computed from the subject's attestation history.
+        body["kya"] = kya_module.kya_for_scope(
+            scope=body["scope"], expires_at=row["expires_at"],
+            revoked=bool(row["revoked"]), verdict=row["verdict"],
+            principal=kya_module.principal_from_registration(
+                store.registration_for_agent(row["subject_id"])),
+            rating=kya_module.compute_agent_rating(
+                store.attestations_for_subject(
+                    row["subject_type"], row["subject_id"]),
+                as_of=utcnow_iso()))
+    return body
 
 
 class UnsignedBody:
@@ -239,7 +312,7 @@ class UnsignedBody:
 class App:
     def __init__(self, db_path: str, keys_dir: str, detector=None,
                  fetcher=None, chat_provider=None, chat_config=None,
-                 mailer=None):
+                 mailer=None, link_http=None, coinbase_reader=None):
         self.store = make_store(db_path)
         self.keys = KeyRegistry(self.store, keys_dir)
         self.auth = Auth(self.store)
@@ -267,6 +340,16 @@ class App:
         # Every send fails soft: mail never breaks a request.
         self.mailer = mailer if mailer is not None \
             else mailer_module.mailer_from_env()
+        # Federated identity linking (phase 1). Every external call
+        # the linking service makes (OAuth exchanges, the Coinbase
+        # EAS read) goes through this one injectable HTTP callable,
+        # so tests never touch the network. The Coinbase reader is
+        # built on the same callable unless one is injected whole.
+        self.link_http = link_http if link_http is not None \
+            else linking_module.default_http
+        self.coinbase_reader = coinbase_reader \
+            if coinbase_reader is not None \
+            else linking_module.CoinbaseReader(self.link_http)
         self.keys.ensure_bootstrap()
         # Trust-layer memory shares the API store's connection and
         # lock on the SQLite backend. The DynamoDB backend has no
@@ -591,7 +674,11 @@ class App:
             Registrations return the signed record minted at issuance.
             Existing record types return exactly the body their own
             endpoint returns, so Search has one resolution path for
-            every NPC ID. Unknown IDs fail closed.
+            every NPC ID. While the social profiles lane is enabled,
+            its signed batch receipts (npc.social.registration_batch)
+            resolve here too, as the stored signed record; with the
+            lane off a receipt ID answers exactly as it did before
+            the lane existed. Unknown IDs fail closed.
             """
             rec = app.store.get_registration(id)
             if rec is not None:
@@ -607,11 +694,15 @@ class App:
                 return 200, _agent_body(app.store, row)
             row = app.store.get_attestation(id)
             if row is not None:
-                return 200, _attestation_body(row)
+                return 200, _attestation_body(app.store, row)
             consent = app.store.get_pact_consent(id) \
                 or app.store.get_pact_consent_by_record_id(id)
             if consent is not None:
                 return 200, consent
+            if social_module.social_enabled():
+                batch = app.store.get_social_batch(id)
+                if batch is not None:
+                    return 200, batch
             return errors.unknown()
 
         # -- Request verification (cycle completion, 2026-10-15) ---------
@@ -674,6 +765,518 @@ class App:
                 if request else None,
                 "request": request,
             }
+
+        # -- Federated identity linking (phase 1, 2026-10-19) ------------
+        # The linking service behind the registry's identity_signals
+        # block (design: integrations/federated-identity-signals-
+        # DESIGN-2026-10-19.md). Every route here is gated by the
+        # same NPC_IDENTITY_SIGNALS=1 flag: with the flag off the
+        # service answers a clear 503 rather than signing claims it
+        # cannot stand behind. Owner-driven POSTs prove record
+        # ownership exactly like request-verification (the
+        # registration email, compared by hash, attempts counted
+        # before the match under the same caps), and a wrong email
+        # and an unknown ID get the identical signed "unknown"
+        # answer. A completed link is its own signed record; the
+        # registration is never edited and no status changes.
+
+        def _identity_gate(req, id):
+            """Returns (error, subject, email): on success error is
+            None and subject is the registration record."""
+            if not linking_module.linking_enabled():
+                return errors.unavailable(
+                    "identity_linking_not_enabled",
+                    "identity linking is not enabled on this "
+                    "deployment"), None, None
+            if not isinstance(req.body, dict):
+                return errors.bad_request(
+                    "JSON object body required"), None, None
+            problems = registry.validate_verification_request_input(
+                req.body)
+            if problems:
+                return errors.unprocessable(
+                    "; ".join(problems)), None, None
+            email = req.body["email"].strip().lower()
+            now = utcnow_iso()
+            hit = linking_module.link_cap_exceeded(
+                app.store, email, req.client_ip, now)
+            if hit:
+                return errors.rate_limited(3600), None, None
+            matched = linking_module.email_matches_record(
+                app.store, id, email)
+            app.store.record_identity_link_attempt(
+                id, email, req.client_ip, matched, now)
+            if not matched:
+                return errors.unknown(), None, None
+            return None, app.store.get_registration(id), email
+
+        def _link_not_configured(provider):
+            return errors.unavailable(
+                "identity_linking_not_configured",
+                "the %s link is not configured on this deployment"
+                % provider)
+
+        def _siwe_challenge_impl(req, id):
+            err, subject, email = _identity_gate(req, id)
+            if err is not None:
+                return err
+            wallet = req.body.get("wallet_address")
+            if not linking_module.valid_wallet(wallet):
+                return errors.unprocessable(
+                    "wallet_address must be a valid Ethereum "
+                    "address")
+            out = linking_module.start_siwe_challenge(
+                app.store, subject, email, wallet, utcnow_iso())
+            return 201, {"record_id": id, "challenge": out}
+
+        @app.route("POST",
+                   r"^/v1/records/(?P<id>[^/]{1,128})"
+                   r"/identity-links/siwe/challenge$")
+        def siwe_challenge(req, id):
+            return app._idempotent(
+                req, "POST /v1/records/%s/identity-links/siwe/"
+                "challenge" % id,
+                lambda: _siwe_challenge_impl(req, id))
+
+        def _siwe_verify_impl(req, id):
+            err, subject, _email = _identity_gate(req, id)
+            if err is not None:
+                return err
+            challenge_id = req.body.get("challenge_id")
+            message = req.body.get("message")
+            signature = req.body.get("signature")
+            if not isinstance(challenge_id, str) \
+                    or not isinstance(message, str) \
+                    or not isinstance(signature, str):
+                return errors.bad_request(
+                    "challenge_id, message, and signature are "
+                    "required strings")
+            rec, problems = linking_module.complete_siwe(
+                app.store, app.keys, subject, challenge_id, message,
+                signature, utcnow_iso())
+            if problems:
+                return errors.unprocessable("; ".join(problems))
+            return 201, {"record_id": id, "link": rec,
+                         "signal": rec["signal"]}
+
+        @app.route("POST",
+                   r"^/v1/records/(?P<id>[^/]{1,128})"
+                   r"/identity-links/siwe/verify$")
+        def siwe_verify(req, id):
+            return app._idempotent(
+                req, "POST /v1/records/%s/identity-links/siwe/"
+                "verify" % id,
+                lambda: _siwe_verify_impl(req, id))
+
+        def _oauth_start_impl(req, id, provider):
+            err, subject, email = _identity_gate(req, id)
+            if err is not None:
+                return err
+            out, problems = linking_module.start_oauth(
+                app.store, provider, subject, email, utcnow_iso())
+            if problems:
+                return _link_not_configured(provider)
+            return 201, dict({"record_id": id}, **out)
+
+        @app.route("POST",
+                   r"^/v1/records/(?P<id>[^/]{1,128})"
+                   r"/identity-links/(?P<provider>github|google)"
+                   r"/start$")
+        def oauth_start(req, id, provider):
+            return app._idempotent(
+                req, "POST /v1/records/%s/identity-links/%s/start"
+                % (id, provider),
+                lambda: _oauth_start_impl(req, id, provider))
+
+        @app.route("GET",
+                   r"^/v1/link/(?P<provider>github|google)"
+                   r"/callback$")
+        def oauth_callback(req, provider):
+            """The browser landing for an OAuth link. The state is
+            consumed before the token exchange, so a callback can
+            never be replayed, whatever its outcome."""
+            if not linking_module.linking_enabled():
+                return errors.unavailable(
+                    "identity_linking_not_enabled",
+                    "identity linking is not enabled on this "
+                    "deployment")
+            code = req.query.get("code")
+            state = req.query.get("state")
+            if not code or not state:
+                return errors.bad_request(
+                    "code and state query parameters are required")
+            rec, problems = linking_module.complete_oauth(
+                app.store, app.keys, provider, code, state,
+                app.link_http, utcnow_iso())
+            if problems:
+                if problems == ["not_configured"]:
+                    return _link_not_configured(provider)
+                return errors.unprocessable("; ".join(problems))
+            return 200, {
+                "linked": True,
+                "record_id": rec["subject_record_id"],
+                "link_record_id": rec["record_id"],
+                "provider": provider,
+                "signal": rec["signal"],
+            }
+
+        def _coinbase_refresh_impl(req, id):
+            err, subject, _email = _identity_gate(req, id)
+            if err is not None:
+                return err
+            summary = linking_module.refresh_coinbase(
+                app.store, app.keys, subject, app.coinbase_reader,
+                utcnow_iso())
+            return 200, {"record_id": id, "observations": summary}
+
+        @app.route("POST",
+                   r"^/v1/records/(?P<id>[^/]{1,128})"
+                   r"/identity-links/coinbase/refresh$")
+        def coinbase_refresh(req, id):
+            return app._idempotent(
+                req, "POST /v1/records/%s/identity-links/coinbase/"
+                "refresh" % id,
+                lambda: _coinbase_refresh_impl(req, id))
+
+        @app.route("GET",
+                   r"^/v1/records/(?P<id>[^/]{1,128})"
+                   r"/identity-panel$")
+        def identity_panel(req, id):
+            """The "Identity the owner has linked" panel data for a
+            registration: the drafted labels and boundary line, the
+            signals grouped by assurance class at their current
+            observed state, and the links that no longer count.
+            Unknown IDs fail closed, same answer as everywhere."""
+            if not linking_module.linking_enabled():
+                return errors.unavailable(
+                    "identity_linking_not_enabled",
+                    "identity linking is not enabled on this "
+                    "deployment")
+            subject = app.store.get_registration(id)
+            if subject is None:
+                return errors.unknown()
+            return 200, linking_module.build_identity_panel(
+                app.store, subject, utcnow_iso())
+
+        # -- Social profiles lane (build pass 1, 2026-10-19) ------------
+        # Owners connect a social profile (read-only OAuth) and
+        # register the content on it as signed records, plus the
+        # connection-less X permalink and Spotify catalog lanes.
+        # Every route is gated by NPC_SOCIAL_PROFILES=1; with the
+        # flag off the lane answers a clean 503 and nothing about
+        # the rest of the API changes. The connect callback carries
+        # no owner proof in the browser redirect, so its handler
+        # result rides a signed JSON response, the same deviation
+        # as the Phase 1 linking callbacks. Owner-driven POSTs
+        # prove ownership by matching the connection's stored
+        # email hash, behind attempts counted before the match
+        # under the registry caps: a wrong email and an unknown
+        # connection are the same signed 404.
+        def _social_flag_gate():
+            if not social_module.social_enabled():
+                return errors.unavailable(
+                    "social_profiles_not_enabled",
+                    "social profile registration is not enabled "
+                    "on this deployment")
+            return None
+
+        def _social_not_configured(platform):
+            return errors.unavailable(
+                "social_profiles_not_configured",
+                "the %s lane is not configured on this deployment"
+                % platform)
+
+        def _social_email_problems(body):
+            if not isinstance(body, dict):
+                return ["request body must be a JSON object"]
+            return registry.validate_verification_request_input(
+                {"email": body.get("email")})
+
+        def _social_creator_name(body):
+            name = body.get("creator_name")
+            if not isinstance(name, str) or not name.strip() \
+                    or len(name.strip()) > 128:
+                return None
+            return name.strip()
+
+        def _social_connection_gate(req, id):
+            """(error, connection_row, email): the flag gate, the
+            body and caps gates, then the ownership match. The
+            attempt is recorded before the match, and a mismatch is
+            the storefront unknown."""
+            gate = _social_flag_gate()
+            if gate is not None:
+                return gate, None, None
+            body = req.body if isinstance(req.body, dict) else {}
+            problems = _social_email_problems(body)
+            if problems:
+                return errors.unprocessable(problems), None, None
+            email = body["email"].strip().lower()
+            now = utcnow_iso()
+            capped = social_module.social_cap_exceeded(
+                app.store, email, req.client_ip, now)
+            if capped:
+                return errors.cap(capped), None, None
+            conn = app.store.get_social_connection(id)
+            matched = conn is not None \
+                and conn.get("status") == "active" \
+                and conn.get("email_hash") == \
+                _email_hash_of(email)
+            app.store.record_social_attempt(
+                id, email, req.client_ip, matched, now)
+            if not matched:
+                return errors.unknown(), None, None
+            return None, conn, email
+
+        @app.route("POST",
+                   r"^/v1/social/(?P<platform>youtube|instagram"
+                   r"|tiktok)/connect/start$")
+        def social_connect_start(req, platform):
+            def _impl():
+                gate = _social_flag_gate()
+                if gate is not None:
+                    return gate
+                body = req.body if isinstance(req.body, dict) \
+                    else {}
+                problems = _social_email_problems(body)
+                if problems:
+                    return errors.unprocessable(problems)
+                email = body["email"].strip().lower()
+                now = utcnow_iso()
+                capped = social_module.social_cap_exceeded(
+                    app.store, email, req.client_ip, now)
+                if capped:
+                    return errors.cap(capped)
+                app.store.record_social_attempt(
+                    "connect:" + platform, email, req.client_ip,
+                    True, now)
+                out, problems = social_module.start_connect(
+                    app.store, platform, email, now)
+                if problems == ["not_configured"]:
+                    return _social_not_configured(platform)
+                if problems:
+                    return errors.unprocessable(problems)
+                return 201, out
+            return app._idempotent(
+                req, "POST /v1/social/%s/connect/start" % platform,
+                _impl)
+
+        @app.route("GET",
+                   r"^/v1/social/(?P<platform>youtube|instagram"
+                   r"|tiktok)/callback$")
+        def social_callback(req, platform):
+            params = req.query or {}
+            code = params.get("code", "")
+            state = params.get("state", "")
+            if not code or not state:
+                return errors.unprocessable(
+                    ["the platform did not return a code and "
+                     "state"])
+            conn, problems = social_module.complete_connect(
+                app.store, platform, code, state, app.link_http,
+                utcnow_iso())
+            if problems:
+                return errors.unprocessable(problems)
+            return 201, {"connection": conn}
+
+        @app.route("POST", r"^/v1/social/connections/list$")
+        def social_connections_list(req):
+            def _impl():
+                gate = _social_flag_gate()
+                if gate is not None:
+                    return gate
+                body = req.body if isinstance(req.body, dict) \
+                    else {}
+                problems = _social_email_problems(body)
+                if problems:
+                    return errors.unprocessable(problems)
+                email = body["email"].strip().lower()
+                now = utcnow_iso()
+                capped = social_module.social_cap_exceeded(
+                    app.store, email, req.client_ip, now)
+                if capped:
+                    return errors.cap(capped)
+                email_hash = _email_hash_of(email)
+                app.store.record_social_attempt(
+                    "connections", email, req.client_ip, True, now)
+                rows = app.store.list_social_connections(email_hash)
+                return 200, {"connections": [
+                    social_module.connection_public(r) for r in rows]}
+            return app._idempotent(
+                req, "POST /v1/social/connections/list", _impl)
+
+        @app.route("POST",
+                   r"^/v1/social/connections/(?P<id>[^/]{1,128})"
+                   r"/scan$")
+        def social_connection_scan(req, id):
+            def _impl():
+                error, conn, _email = _social_connection_gate(
+                    req, id)
+                if error is not None:
+                    return error
+                summary, problems = social_module.scan_connection(
+                    app.store, conn, app.link_http, utcnow_iso())
+                if problems:
+                    return errors.unavailable(
+                        "social_platform_read_failed", problems[0])
+                return 201, summary
+            return app._idempotent(
+                req, "POST /v1/social/connections/%s/scan" % id,
+                _impl)
+
+        @app.route("POST",
+                   r"^/v1/social/connections/(?P<id>[^/]{1,128})"
+                   r"/register$")
+        def social_connection_register(req, id):
+            def _impl():
+                error, conn, email = _social_connection_gate(req, id)
+                if error is not None:
+                    return error
+                body = req.body if isinstance(req.body, dict) \
+                    else {}
+                creator_name = _social_creator_name(body)
+                if creator_name is None:
+                    return errors.unprocessable(
+                        ["creator_name is required (string, max "
+                         "128 chars)"])
+                scan_id = body.get("scan_id")
+                if not isinstance(scan_id, str) or not scan_id:
+                    return errors.unprocessable(
+                        ["scan_id is required"])
+                selected = body.get("external_ids")
+                if selected is not None:
+                    if not isinstance(selected, list) or any(
+                            not isinstance(v, str)
+                            for v in selected):
+                        return errors.unprocessable(
+                            ["external_ids must be a list of "
+                             "strings"])
+                batch, summary, problems = \
+                    social_module.register_scan(
+                        app.store, app.keys, conn, scan_id, email,
+                        creator_name, req.client_ip, selected,
+                        utcnow_iso())
+                if problems == ["unknown_scan"]:
+                    return errors.unknown()
+                if problems:
+                    return errors.unprocessable(problems)
+                return 201, {"batch": batch, "summary": summary}
+            return app._idempotent(
+                req, "POST /v1/social/connections/%s/register" % id,
+                _impl)
+
+        @app.route("POST",
+                   r"^/v1/social/connections/(?P<id>[^/]{1,128})"
+                   r"/disconnect$")
+        def social_connection_disconnect(req, id):
+            def _impl():
+                error, conn, _email = _social_connection_gate(
+                    req, id)
+                if error is not None:
+                    return error
+                return 200, social_module.disconnect(
+                    app.store, conn, app.link_http, utcnow_iso())
+            return app._idempotent(
+                req, "POST /v1/social/connections/%s/disconnect" % id,
+                _impl)
+
+        @app.route("POST",
+                   r"^/v1/social/connections/(?P<id>[^/]{1,128})"
+                   r"/overview$")
+        def social_connection_overview(req, id):
+            """The read side of the lane for one connection: its
+            public view, last scan, and registration outcomes,
+            behind the same ownership gate as scan and register.
+            Read-only: it never reads a platform and never mints."""
+            def _impl():
+                error, conn, _email = _social_connection_gate(
+                    req, id)
+                if error is not None:
+                    return error
+                return 200, social_module.build_connection_overview(
+                    app.store, conn)
+            return app._idempotent(
+                req, "POST /v1/social/connections/%s/overview" % id,
+                _impl)
+
+        def _social_manual_gate(req, target):
+            """(error, email, creator_name) for the two lanes with
+            no connection (X permalinks, Spotify references). The
+            caller's email is the registrations' owner key, the
+            same trust level as the public registration form,
+            counted under the lane caps."""
+            gate = _social_flag_gate()
+            if gate is not None:
+                return gate, None, None
+            body = req.body if isinstance(req.body, dict) else {}
+            problems = _social_email_problems(body)
+            if problems:
+                return errors.unprocessable(problems), None, None
+            creator_name = _social_creator_name(body)
+            if creator_name is None:
+                return errors.unprocessable(
+                    ["creator_name is required (string, max 128 "
+                     "chars)"]), None, None
+            email = body["email"].strip().lower()
+            now = utcnow_iso()
+            capped = social_module.social_cap_exceeded(
+                app.store, email, req.client_ip, now)
+            if capped:
+                return errors.cap(capped), None, None
+            app.store.record_social_attempt(
+                target, email, req.client_ip, True, now)
+            return None, email, creator_name
+
+        @app.route("POST", r"^/v1/social/x/register$")
+        def social_x_register(req):
+            def _impl():
+                error, email, creator_name = _social_manual_gate(
+                    req, "x")
+                if error is not None:
+                    return error
+                body = req.body if isinstance(req.body, dict) \
+                    else {}
+                permalinks = body.get("permalinks")
+                if not isinstance(permalinks, list) \
+                        or not permalinks:
+                    return errors.unprocessable(
+                        ["permalinks is required (a non-empty "
+                         "list)"])
+                batch, summary = \
+                    social_module.register_x_permalinks(
+                        app.store, app.keys, email, creator_name,
+                        req.client_ip, permalinks, utcnow_iso())
+                return 201, {"batch": batch, "summary": summary}
+            return app._idempotent(
+                req, "POST /v1/social/x/register", _impl)
+
+        @app.route("POST", r"^/v1/social/spotify/register$")
+        def social_spotify_register(req):
+            def _impl():
+                error, email, creator_name = _social_manual_gate(
+                    req, "spotify")
+                if error is not None:
+                    return error
+                body = req.body if isinstance(req.body, dict) \
+                    else {}
+                references = body.get("references")
+                if not isinstance(references, list) \
+                        or not references:
+                    return errors.unprocessable(
+                        ["references is required (a non-empty "
+                         "list)"])
+                batch, summary, problems = \
+                    social_module.register_spotify_references(
+                        app.store, app.keys, email, creator_name,
+                        req.client_ip, references, app.link_http,
+                        utcnow_iso())
+                if problems == ["not_configured"]:
+                    return _social_not_configured("spotify")
+                if problems:
+                    return errors.unprocessable(problems)
+                return 201, {"batch": batch, "summary": summary}
+            return app._idempotent(
+                req, "POST /v1/social/spotify/register", _impl)
 
         # -- Biblo site chat (biblo-chat-SPEC-2026-10-15.md) --------------
         # Public, no API key, and UNSIGNED: chat is never a record, so
@@ -1103,7 +1706,10 @@ class App:
 
     # -- dispatch ------------------------------------------------------------
     def dispatch(self, method, raw_path, headers, body_bytes):
-        path = urlparse(raw_path).path
+        parsed_url = urlparse(raw_path)
+        path = parsed_url.path
+        query = {k: values[0] for k, values in
+                 parse_qs(parsed_url.query).items()}
         body = None
         if body_bytes:
             if len(body_bytes) > MAX_BODY:
@@ -1118,7 +1724,8 @@ class App:
                 continue
             m = pattern.match(path)
             if m:
-                req = Request(method, path, headers, body)
+                req = Request(method, path, headers, body,
+                              query=query)
                 try:
                     status, resp_body = fn(req, **m.groupdict())
                 except Exception:  # never leak internals
@@ -1214,10 +1821,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def create_app(db_path: str, keys_dir: str, detector=None,
                fetcher=None, chat_provider=None, chat_config=None,
-               mailer=None) -> App:
+               mailer=None, link_http=None,
+               coinbase_reader=None) -> App:
     return App(db_path, keys_dir, detector=detector, fetcher=fetcher,
                chat_provider=chat_provider, chat_config=chat_config,
-               mailer=mailer)
+               mailer=mailer, link_http=link_http,
+               coinbase_reader=coinbase_reader)
 
 
 def run(db_path: str, keys_dir: str, host="127.0.0.1", port=8787):

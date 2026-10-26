@@ -658,6 +658,15 @@ paths:
         not run. Connecting an account shows control of that
         account at connect time; it is not verification of the
         work, and a source changes no status and issues no mark.
+
+        The request may also carry `identity_signals`, on
+        deployments that have enabled them: the outside identity
+        checks the owner linked, each confirmed with the service
+        named (a World ID proof, a Google or GitHub account, a
+        Coinbase attestation, a hosted document check). Signals are
+        recorded as the provider confirmed them and presented as
+        their own tier on the record; they are not an identity
+        check by NPC, and they change no status and issue no mark.
       security: []
       requestBody:
         required: true
@@ -698,7 +707,10 @@ paths:
         GET /v1/records/{record_id}. Abuse minimums: the owner email
         is required and per-email and per-IP submission caps apply
         (429 past the cap). The email is kept server-side only and
-        never appears in the signed public record.
+        never appears in the signed public record. The request may
+        also carry `identity_signals` (see the content registration),
+        with the same rule: a linked outside check is recorded as
+        the provider confirmed it and is never an NPC verdict.
       security: []
       requestBody:
         required: true
@@ -734,7 +746,12 @@ paths:
         Registration IDs return the signed registration record minted
         at issuance; credential, product, agent, attestation, and PACT
         consent IDs return exactly the body their own endpoint
-        returns. Unknown IDs fail closed.
+        returns. While the social profiles lane is enabled
+        (NPC_SOCIAL_PROFILES=1), a social batch receipt ID
+        (record_type npc.social.registration_batch) also resolves
+        here, returning the stored signed receipt; with the lane off
+        a receipt ID answers exactly as it did before the lane
+        existed. Unknown IDs fail closed.
       security: []
       parameters:
         - name: id
@@ -864,6 +881,564 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UnknownVerdict'
+
+  /records/{id}/identity-links/siwe/challenge:
+    post:
+      operationId: startSiweChallenge
+      summary: Issue a Sign-In with Ethereum challenge for a record
+      description: |
+        Federated identity linking, phase 1. Gated by the
+        NPC_IDENTITY_SIGNALS flag: with the flag off this answers
+        503 identity_linking_not_enabled, and nothing is signed.
+        Ownership is proven by the registration email (compared by
+        hash; attempts counted before the match under the
+        registration caps). A wrong email and an unknown ID return
+        the same signed "unknown" answer as everywhere else. The
+        response carries the exact EIP-4361 message for the owner
+        to sign with the wallet.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, wallet_address]
+              properties:
+                email: { type: string, format: email }
+                wallet_address:
+                  type: string
+                  description: The wallet to link, as a valid
+                    Ethereum address (checksummed when mixed case).
+      responses:
+        '201': { description: Challenge issued (signed JSON). }
+        '404': { description: Unknown record or email mismatch (signed verdict unknown). }
+        '422': { description: Validation error. }
+        '429': { description: Link attempt cap reached. }
+        '503': { description: Identity linking not enabled. }
+
+  /records/{id}/identity-links/siwe/verify:
+    post:
+      operationId: verifySiweChallenge
+      summary: Verify a signed SIWE message and link the wallet
+      description: |
+        The signature must recover to the challenged wallet, and
+        the message's domain, URI, chain ID, nonce, and expiry
+        must match the challenge the server issued. Any mismatch
+        fails closed with 422 and nothing is attached. On success
+        the challenge is consumed (single use) and an
+        npc.identity.signal_link record is minted carrying the
+        siwe wallet_control signal (assurance class
+        account_control, derived server-side). The registration
+        record is never edited and no status changes.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, challenge_id, message, signature]
+              properties:
+                email: { type: string, format: email }
+                challenge_id: { type: string }
+                message: { type: string }
+                signature: { type: string }
+      responses:
+        '201': { description: Wallet linked; the signed link record (signed JSON). }
+        '404': { description: Unknown record or email mismatch (signed verdict unknown). }
+        '422': { description: Verification failed; nothing attached. }
+        '429': { description: Link attempt cap reached. }
+        '503': { description: Identity linking not enabled. }
+
+  /records/{id}/identity-links/{provider}/start:
+    post:
+      operationId: startOAuthLink
+      summary: Begin a GitHub or Google account link
+      description: |
+        Returns the provider authorization URL for the owner's
+        browser. Scopes are the minimum that carry the identity
+        fact: github read:user, google openid email. The redirect
+        URI registered with the provider must be exactly
+        {NPC_PUBLIC_BASE_URL}/v1/link/github/callback or
+        {NPC_PUBLIC_BASE_URL}/v1/link/google/callback (production
+        base https://api.npclabs.xyz). With no OAuth app
+        configured this answers 503
+        identity_linking_not_configured; it never fakes a link.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string, enum: [github, google] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '201': { description: Authorization URL and state issued (signed JSON). }
+        '404': { description: Unknown record or email mismatch (signed verdict unknown). }
+        '422': { description: Validation error. }
+        '429': { description: Link attempt cap reached. }
+        '503': { description: Identity linking not enabled, or this provider is not configured. }
+
+  /link/{provider}/callback:
+    get:
+      operationId: oauthLinkCallback
+      summary: OAuth callback landing for an account link
+      description: |
+        The redirect target registered with the provider. The
+        state is consumed before the token exchange, so a
+        callback can never be replayed, whatever its outcome. On
+        success an npc.identity.signal_link record is minted: the
+        signal's subject reference is the provider's opaque
+        account id (the GitHub numeric id, the Google sub). No
+        provider email and no OAuth token is written into any
+        record.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string, enum: [github, google] }
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Account linked (signed JSON). }
+        '400': { description: Missing code or state. }
+        '422': { description: The link could not be completed; nothing attached. }
+        '503': { description: Identity linking not enabled, or this provider is not configured. }
+
+  /records/{id}/identity-links/coinbase/refresh:
+    post:
+      operationId: refreshCoinbaseLink
+      summary: Re-read Coinbase Verifications for the record's wallets
+      description: |
+        Reads Coinbase's public EAS attestations on Base for every
+        wallet the owner has proven control of (a SIWE link), and
+        stores each read as an observation. A signal whose latest
+        attestation is valid gets (or keeps) its link record; a
+        revoked, expired, or vanished attestation stops producing
+        the signal on the panel. No Coinbase agreement is needed;
+        the reads are public.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { description: Observation summary per wallet and signal (signed JSON). }
+        '404': { description: Unknown record or email mismatch (signed verdict unknown). }
+        '422': { description: Validation error. }
+        '429': { description: Link attempt cap reached. }
+        '503': { description: Identity linking not enabled. }
+
+  /records/{id}/identity-panel:
+    get:
+      operationId: getIdentityPanel
+      summary: The "Identity the owner has linked" panel for a record
+      description: |
+        PUBLIC: no API key. Everything the record page panel
+        needs: the drafted heading, intro, and boundary line, the
+        record's own status (a linked signal never changes it),
+        the signals grouped by assurance class at their current
+        observed state, and the links that no longer count, with
+        the reason in customer words. Coinbase signals are
+        evaluated against the latest stored observation, with
+        expiry re-checked at read time. Gated by the same
+        NPC_IDENTITY_SIGNALS flag: 503 when linking is not
+        enabled.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: Signed panel document.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdentityPanel'
+        '404': { description: Unknown record (signed verdict unknown). }
+        '503': { description: Identity linking not enabled. }
+
+  /social/{platform}/connect/start:
+    post:
+      operationId: startSocialConnect
+      summary: Start connecting a social profile (YouTube, Instagram, TikTok)
+      description: |
+        Social profiles lane, build pass 1. Gated by the
+        NPC_SOCIAL_PROFILES flag: with it off, every lane route
+        answers 503 social_profiles_not_enabled and nothing is
+        signed. Opens a read-only OAuth connect: the response
+        carries the platform authorize URL and a single-use state
+        (10 minute TTL) bound to the email's hash. The owner
+        approves on the platform's own pages; NPC never sees a
+        customer password, and no adapter requests a write scope.
+        Scopes are the minimum that carry the lane: YouTube
+        https://www.googleapis.com/auth/youtube.readonly,
+        Instagram instagram_business_basic, TikTok
+        user.info.basic,video.list. A platform whose developer app
+        is not configured on this deployment answers 503
+        social_profiles_not_configured; it never fakes a connect.
+      security: []
+      parameters:
+        - name: platform
+          in: path
+          required: true
+          schema: { type: string, enum: [youtube, instagram, tiktok] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '201': { description: Authorize URL, state, expiry, and the exact redirect URI to register with the platform (signed JSON). }
+        '422': { description: Validation error. }
+        '429': { description: Lane attempt cap reached. }
+        '503': { description: Lane not enabled, or the platform not configured. }
+
+  /social/{platform}/callback:
+    get:
+      operationId: socialConnectCallback
+      summary: OAuth callback for a social profile connect
+      description: |
+        The platform redirects the owner's browser here with a
+        code and the state. The state is consumed before the token
+        exchange (single use; a replay fails 422). On success the
+        connection is stored server-side (tokens never appear in
+        any response or signed record) and the response is the
+        connection's public view. The result rides a signed JSON
+        response rather than a browser page, since the redirect
+        carries no owner proof; the dashboard polls the
+        connections list to observe completion.
+      security: []
+      parameters:
+        - name: platform
+          in: path
+          required: true
+          schema: { type: string, enum: [youtube, instagram, tiktok] }
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '201': { description: The stored connection's public view (signed JSON). }
+        '422': { description: Unknown, expired, or replayed state, or the platform refused the exchange. }
+
+  /social/connections/list:
+    post:
+      operationId: listSocialConnections
+      summary: List the owner's social profile connections
+      description: |
+        The caller's active connections, proven by the email the
+        connections were made under. Public views only: platform,
+        the platform's account id, display name, scopes, status.
+        Tokens are never returned.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { description: The owner's connections (signed JSON). }
+        '422': { description: Validation error. }
+        '429': { description: Lane attempt cap reached. }
+        '503': { description: Lane not enabled. }
+
+  /social/connections/{id}/scan:
+    post:
+      operationId: scanSocialConnection
+      summary: Enumerate the connected account's works
+      description: |
+        Reads the connected account's catalog through the
+        platform's API (YouTube: the channel's uploads playlist,
+        then videos.list; Instagram: /me/media with cursor paging,
+        professional accounts only; TikTok: /v2/video/list/ with
+        cursor paging, public videos) and stores the scan. The
+        response is the catalog view: every work with its platform
+        id, title, permalink, publish date as the platform reports
+        it, and byte class, plus totals. Enumeration stops at the
+        lane ceiling of 2000 works and says so (truncated).
+        Ownership is proven by matching the connection's stored
+        email hash, behind attempts counted before the match under
+        the registry caps: a wrong email and an unknown connection
+        are the same signed 404.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '201': { description: The stored scan and its catalog view (signed JSON). }
+        '404': { description: Unknown connection or email mismatch (signed verdict unknown). }
+        '422': { description: Validation error. }
+        '429': { description: Lane attempt cap reached. }
+        '503': { description: Lane not enabled, or the platform read failed. }
+
+  /social/connections/{id}/register:
+    post:
+      operationId: registerSocialScan
+      summary: Register works from a scan as signed records
+      description: |
+        The batch's one consent call: registers every work in the
+        scan (or the selected external_ids) for the connection's
+        owner. Each work is classified against the owner's
+        registration index: unchanged (same version; the existing
+        record is returned), new, or new_version (a changed
+        version mints a new record linked to the earlier one
+        through previous_record_id; records are never edited).
+        Each registered work is its own signed content
+        registration whose source states it was enumerated from
+        the owner's connected account at the scan's time, and
+        whose platform_metadata entry reads: "The account
+        controls this content on the platform." The response
+        carries one signed batch receipt record
+        (npc.social.registration_batch) naming the individual
+        records; the receipt does not stand in for any of them.
+        An item that fails validation fails alone in the receipt,
+        never the batch. Status stays "registered, checks
+        pending": enumeration shows account control, never
+        verification.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, creator_name, scan_id]
+              properties:
+                email: { type: string, format: email }
+                creator_name: { type: string, maxLength: 128 }
+                scan_id: { type: string }
+                external_ids:
+                  type: array
+                  items: { type: string }
+                  description: Optional selection; omit to register the whole scan.
+      responses:
+        '201': { description: The signed batch receipt and the per-item summary (signed JSON). }
+        '404': { description: Unknown connection, email mismatch, or unknown scan (signed verdict unknown). }
+        '422': { description: Validation error. }
+        '429': { description: Lane attempt cap reached. }
+        '503': { description: Lane not enabled. }
+
+  /social/connections/{id}/disconnect:
+    post:
+      operationId: disconnectSocialConnection
+      summary: Disconnect a social profile
+      description: |
+        Ends the connection: a best-effort revoke at the platform
+        (the outcome is reported as platform_revocation), the
+        stored tokens are blanked, and the cached scans are
+        dropped. The signed records the customer holds stay;
+        disconnecting never unmakes a record.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { description: Disconnection result (signed JSON). }
+        '404': { description: Unknown connection or email mismatch (signed verdict unknown). }
+        '422': { description: Validation error. }
+        '429': { description: Lane attempt cap reached. }
+        '503': { description: Lane not enabled. }
+
+  /social/connections/{id}/overview:
+    post:
+      operationId: socialConnectionOverview
+      summary: A connection's read-only overview
+      description: |
+        The read side of the lane for one connection, behind the
+        same ownership gate as scan and register (the email must
+        match the connection; attempts are counted before the
+        match). Returns the connection's public view (no token
+        material), the provenance sentence its records carry, the
+        last scan (when it ran and how many works it held), and
+        the registration outcomes of every batch minted from the
+        connection, per batch and in total. Read-only: this call
+        never reads a platform and never mints a record.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { description: The connection overview (signed JSON). }
+        '404': { description: Unknown connection or email mismatch (signed verdict unknown). }
+        '422': { description: Validation error. }
+        '429': { description: Lane attempt cap reached. }
+        '503': { description: Lane not enabled. }
+
+  /social/x/register:
+    post:
+      operationId: registerXPermalinks
+      summary: Register X posts from owner-provided permalinks
+      description: |
+        The manual permalink lane (no connection): the owner
+        pastes X or Twitter post permalinks, each validated and
+        registered on its own (a bad permalink fails in the
+        receipt, never the batch). NPC does not read the post in
+        this lane: items are permalink_only, carry no publish
+        date, and their records say the owner provided the
+        address. A missing title defaults to a plain label naming
+        the account.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, creator_name, permalinks]
+              properties:
+                email: { type: string, format: email }
+                creator_name: { type: string, maxLength: 128 }
+                permalinks:
+                  type: array
+                  minItems: 1
+                  items:
+                    oneOf:
+                      - { type: string }
+                      - type: object
+                        required: [url]
+                        properties:
+                          url: { type: string }
+                          title: { type: string, maxLength: 200 }
+      responses:
+        '201': { description: The signed batch receipt and the per-item summary (signed JSON). }
+        '422': { description: Validation error. }
+        '429': { description: Lane attempt cap reached. }
+        '503': { description: Lane not enabled. }
+
+  /social/spotify/register:
+    post:
+      operationId: registerSpotifyReferences
+      summary: Register Spotify works from permalinks and ISRCs
+      description: |
+        The catalog lane (no customer connection): NPC reads
+        public catalog metadata with its own app credentials
+        (client credentials), from references the owner provides.
+        A track or episode permalink registers directly; an
+        artist or show permalink enumerates its catalog in
+        (tracks and episodes hydrated one by one, stopping at the
+        lane ceiling of 500 works, noted in the receipt); an ISRC
+        resolves to the track that carries it. The ISRC is
+        bookkeeping only and never enters a signed record.
+        Records state the details were read from the public
+        catalog at a stated time.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, creator_name, references]
+              properties:
+                email: { type: string, format: email }
+                creator_name: { type: string, maxLength: 128 }
+                references:
+                  type: array
+                  minItems: 1
+                  items:
+                    oneOf:
+                      - { type: string }
+                      - type: object
+                        properties:
+                          permalink: { type: string }
+                          isrc: { type: string }
+      responses:
+        '201': { description: The signed batch receipt and the per-item summary (signed JSON). }
+        '422': { description: Validation error. }
+        '429': { description: Lane attempt cap reached. }
+        '503': { description: Lane not enabled, or the Spotify app not configured. }
 
 components:
   securitySchemes:
@@ -1331,6 +1906,12 @@ components:
           description: Required. Kept server-side only (submission caps and contact); never published in the signed record.
         source:
           $ref: '#/components/schemas/RegistrationSource'
+        identity_signals:
+          type: array
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/IdentitySignal'
+          description: Optional, and only on deployments that have enabled it (NPC_IDENTITY_SIGNALS=1). The outside identity checks the owner linked; see IdentitySignal.
 
     RegistrationSource:
       type: object
@@ -1350,7 +1931,18 @@ components:
         names the form the bytes take when they are an export or
         conversion rather than the native file. `previous_record_id`
         links a changed version of a work to the registration of
-        its earlier version.
+        its earlier version. Three more fields belong to the
+        social profiles lane and are kept only on deployments that
+        run it (NPC_SOCIAL_PROFILES=1): `account_id` (the
+        platform's own id for the account the work was enumerated
+        from), `enumerated_at` (when the lane read the work's
+        details), and `enumerated_from` (how: `connected_account`,
+        the owner's connected account; `public_catalog`, the
+        platform's public catalog from a reference the owner
+        provided; `owner_supplied`, an address the owner provided
+        that NPC has not read from the platform). With the lane
+        off the three are unknown fields and are dropped, exactly
+        as any other unknown field is.
       required: [platform, external_id, permalink, byte_class]
       properties:
         platform:
@@ -1372,6 +1964,15 @@ components:
           type: string
           maxLength: 128
           description: The connected account's display name, as the platform shows it.
+        account_id:
+          type: string
+          maxLength: 256
+          description: Social profiles lane only (NPC_SOCIAL_PROFILES=1). The platform's own id for the account the work was enumerated from (a YouTube channel id, an Instagram user id, a Spotify artist or show id, an X username). Never NPC's opaque connection reference.
+        enumerated_at: { type: string, format: date-time, description: 'Social profiles lane only. When the lane read the work''s details.' }
+        enumerated_from:
+          type: string
+          enum: [connected_account, public_catalog, owner_supplied]
+          description: Social profiles lane only. How the lane read the work (see the schema description).
         native_type:
           type: string
           maxLength: 128
@@ -1403,6 +2004,108 @@ components:
           pattern: '^reg_[A-Za-z0-9]{8,64}$'
           description: The NPC record ID of the earlier version of this work, when this registration is a changed version.
 
+    IdentitySignal:
+      type: object
+      description: |
+        One outside identity check the record's owner linked through
+        a linking service, recorded as the named provider confirmed
+        it. A signal is evidence a beholder weighs, never an NPC
+        verdict: it changes no status, issues no mark, and the
+        record's verification decision stays pending unless NPC runs
+        its own check. `subject_ref` is an opaque provider handle
+        (a World ID nullifier, a numeric account ID, a wallet
+        address); it never carries an email address or a legal name.
+        `assurance_class` is assigned by NPC from the provider and
+        signal, never by the caller: `account_control` (the owner
+        controls an account), `aggregated_personhood` (a score
+        combined from several weaker signals), `unique_human` (a
+        uniqueness proof), `kyc_backed_account` (an account whose
+        operator checked the holder's identity documents), or
+        `document_check` (a document check named by the provider).
+        `evidence_ref` names the provider-side proof or attestation
+        a beholder can look up, when the provider issues one.
+      required: [provider, signal, subject_ref, linked_at]
+      properties:
+        provider:
+          type: string
+          enum: [world_id, google, github, x, coinbase,
+                 gitcoin_passport, stripe_identity, persona, siwe]
+        signal: { type: string, maxLength: 64 }
+        assurance_class:
+          type: string
+          enum: [account_control, aggregated_personhood,
+                 unique_human, kyc_backed_account, document_check]
+        subject_ref:
+          type: string
+          maxLength: 128
+          pattern: '^[A-Za-z0-9._:\-+]+$'
+        linked_at: { type: string, format: date-time }
+        observed_at: { type: string, format: date-time }
+        evidence_ref: { type: string, maxLength: 256 }
+
+    IdentityPanelSignal:
+      type: object
+      description: |
+        One linked signal as the panel shows it: the IdentitySignal
+        fields plus the drafted customer label and the signal's
+        current observed state. State is `current` (confirmed and
+        standing), `recorded` (carried on the record, not yet
+        re-checked against the provider), or, in the not_current
+        list, `revoked`, `expired`, or `not_seen_at_last_check`,
+        each with a plain-language reason.
+      properties:
+        provider: { type: string }
+        signal: { type: string }
+        assurance_class: { type: string }
+        label: { type: string }
+        subject_ref: { type: string }
+        linked_at: { type: string, format: date-time }
+        observed_at: { type: string, format: date-time }
+        evidence_ref: { type: string }
+        state:
+          type: string
+          enum: [current, recorded, revoked, expired,
+                 not_seen_at_last_check]
+        reason: { type: string }
+
+    IdentityPanel:
+      type: object
+      description: |
+        The record page panel document for the identity links a
+        record's owner has attached. The heading, intro, and
+        boundary line are the design's drafted customer words; a
+        linked signal is evidence about the owner, never an NPC
+        identity check, and it never changes the record's status,
+        which rides along here so a panel can show both honestly.
+      properties:
+        record_id: { type: string }
+        record_status: { type: string }
+        record_status_label: { type: string }
+        panel:
+          type: object
+          properties:
+            heading: { type: string }
+            intro: { type: string }
+            boundary: { type: string }
+            groups:
+              type: array
+              items:
+                type: object
+                properties:
+                  assurance_class: { type: string }
+                  heading: { type: string }
+                  signals:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/IdentityPanelSignal'
+            not_current:
+              type: array
+              items:
+                $ref: '#/components/schemas/IdentityPanelSignal'
+            not_current_note: { type: string, nullable: true }
+            signals_current: { type: integer }
+            signals_not_current: { type: integer }
+
     RegisterAgentRequest:
       type: object
       required: [agent_name, owner_name, owner_email]
@@ -1419,6 +2122,12 @@ components:
           description: Required. Kept server-side only (submission caps and contact); never published in the signed record.
         homepage: { type: string, maxLength: 2048 }
         description: { type: string, maxLength: 2000 }
+        identity_signals:
+          type: array
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/IdentitySignal'
+          description: Optional, and only on deployments that have enabled it (NPC_IDENTITY_SIGNALS=1). The outside identity checks the owner linked; see IdentitySignal.
 
     RegistrationCheck:
       type: object
@@ -1465,6 +2174,10 @@ components:
         source:
           $ref: '#/components/schemas/RegistrationSource'
           description: Present only when the registration arrived through a connected platform account; omitted otherwise.
+        identity_signals:
+          type: array
+          items: { $ref: '#/components/schemas/IdentitySignal' }
+          description: Present only when the owner linked outside identity checks and the deployment has the block enabled; omitted otherwise.
         key_id: { type: string }
         signature: { type: string, description: Base64 NPC issuer signature over the record }
 
@@ -1535,5 +2248,9 @@ components:
         checks_not_run:
           type: array
           items: { $ref: '#/components/schemas/RegistrationCheck' }
+        identity_signals:
+          type: array
+          items: { $ref: '#/components/schemas/IdentitySignal' }
+          description: Present only when the owner linked outside identity checks and the deployment has the block enabled; omitted otherwise.
         key_id: { type: string }
         signature: { type: string, description: Base64 NPC issuer signature over the record }

@@ -18,13 +18,27 @@ Modes:
                 Proves the harness mechanics ONLY; fixed-string and
                 identity expectations will fail by design. Never
                 report a mock run as a grounding result.
+  --mode deployed
+                Posts the same question set to the DEPLOYED
+                endpoint (https://api.npclabs.xyz/v1/chat), so the
+                gate measures the real endpoint, its real key, and
+                its real governor (the Oct 18 diagnosis, fix 5c).
+                Responses with state "off" and HTTP 429s are counted
+                as ENVIRONMENT events, separate from grounding
+                failures (fix 5b): a throttled or resting endpoint
+                is not an answer-quality verdict. Paced at 200s
+                between questions by default (--pace to override):
+                the endpoint allows 20 served turns per hour per
+                IP, and this run must not throttle itself.
 
 Usage:
-  python3 eval_chat_grounding.py [--mode live|mock]
+  python3 eval_chat_grounding.py [--mode live|mock|deployed]
+                                 [--pace SECONDS]
 
-Exit code 0 when every question passes, 1 otherwise. One line per
-question, then a summary. Replies are printed (truncated) so a human
-can judge tone alongside the assertions.
+Exit code 0 when every question passes (in deployed mode: with
+zero environment events as well), 1 otherwise. One line per
+question, then a summary. Replies are printed (truncated) so a
+human can judge tone alongside the assertions.
 """
 import argparse
 import json
@@ -131,10 +145,92 @@ def check(question, body):
     return fails
 
 
+def run_deployed(questions, pace):
+    """POST each question to the deployed endpoint and grade the
+    replies with the same check() as the in-process modes. State
+    "off" replies and HTTP 429s are environment events, not
+    grounding failures; every other non-200 is environment too
+    (the endpoint's availability is not the corpus's fault)."""
+    import time
+    import urllib.error
+    import urllib.request
+
+    endpoint = "https://api.npclabs.xyz/v1/chat"
+    print("MODE: deployed (POST %s; pace %.0fs between questions)"
+          % (endpoint, pace))
+    print("START: %s" % time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                      time.gmtime()))
+    passed = failed = env = 0
+    for i, q in enumerate(questions):
+        if i:
+            time.sleep(pace)
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps({"message": q["question"],
+                             "page": "/help"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        status = None
+        body = {}
+        try:
+            with urllib.request.urlopen(req, timeout=40) as resp:
+                status = resp.status
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            try:
+                body = json.loads(exc.read().decode("utf-8"))
+            except Exception:
+                body = {}
+        except Exception as exc:
+            print("[ENV ] %-10s %s" % (q["id"], q["question"]))
+            print("       - network error: %s" % type(exc).__name__)
+            env += 1
+            continue
+        if status == 200 and body.get("state") == "ok":
+            fails = check(q, body)
+            if fails:
+                failed += 1
+                print("[FAIL] %-10s %s" % (q["id"], q["question"]))
+            else:
+                passed += 1
+                print("[PASS] %-10s %s" % (q["id"], q["question"]))
+            print("       reply: %s"
+                  % (body.get("reply", "")[:220].replace("\n", " ")))
+            for f_ in fails:
+                print("       - %s" % f_)
+        else:
+            env += 1
+            print("[ENV ] %-10s %s" % (q["id"], q["question"]))
+            print("       reply: %s"
+                  % (body.get("reply", "")[:220].replace("\n", " ")))
+            print("       - environment: HTTP %s, state %r "
+                  "(not a grounding failure)"
+                  % (status, body.get("state")))
+    print("\n%d passed, %d grounding failures, %d environment, "
+          "%d total" % (passed, failed, env, passed + failed + env))
+    print("END: %s" % time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                    time.gmtime()))
+    return 1 if (failed or env) else 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", choices=["live", "mock"], default="live")
+    ap.add_argument("--mode", choices=["live", "mock", "deployed"],
+                    default="live")
+    ap.add_argument("--pace", type=float, default=None,
+                    help="seconds between questions (deployed mode; "
+                         "default 200, sized to the endpoint's "
+                         "per-IP served-turn cap)")
     args = ap.parse_args(argv)
+
+    with open(QUESTIONS, encoding="utf-8") as f:
+        questions = json.load(f)
+
+    if args.mode == "deployed":
+        return run_deployed(questions,
+                            args.pace if args.pace is not None
+                            else 200.0)
 
     if args.mode == "live":
         provider = SurrogateGeminiProvider()
@@ -145,8 +241,6 @@ def main(argv):
         print("MODE: mock (parrot provider; harness smoke ONLY, not "
               "a grounding result)")
 
-    with open(QUESTIONS, encoding="utf-8") as f:
-        questions = json.load(f)
     tmp = tempfile.mkdtemp(prefix="npc_chat_eval_")
     store = Store(os.path.join(tmp, "eval.db"))
     svc = chat_mod.ChatService(store, provider=provider)

@@ -258,6 +258,147 @@ CREATE TABLE IF NOT EXISTS chat_ip_events (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_ip
   ON chat_ip_events (client_ip, created_at);
+
+-- Federated identity linking (phase 1, 2026-10-19; design in
+-- integrations/federated-identity-signals-DESIGN-2026-10-19.md).
+-- Everything here lives behind NPC_IDENTITY_SIGNALS=1. A link is its
+-- own signed record in identity_links, never an edit to the
+-- registration it attaches to. Challenges (a SIWE nonce, an OAuth
+-- state) are single-use and short-lived; the email is stored as a
+-- hash only, like every other server-side email touch. Observations
+-- are append-only: each Coinbase re-read adds a row, and the panel
+-- reads the latest one per (record, wallet, signal), so a revoked
+-- or expired attestation stops producing its signal without
+-- rewriting history.
+CREATE TABLE IF NOT EXISTS identity_link_challenges (
+  challenge_id      TEXT PRIMARY KEY,
+  kind              TEXT NOT NULL,
+  provider          TEXT NOT NULL DEFAULT '',
+  subject_record_id TEXT NOT NULL,
+  email_hash        TEXT NOT NULL DEFAULT '',
+  secret            TEXT NOT NULL,
+  wallet            TEXT NOT NULL DEFAULT '',
+  created_at        TEXT NOT NULL,
+  expires_at        TEXT NOT NULL,
+  consumed_at       TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS identity_links (
+  link_id           TEXT PRIMARY KEY,
+  subject_record_id TEXT NOT NULL,
+  provider          TEXT NOT NULL,
+  signal            TEXT NOT NULL,
+  subject_ref       TEXT NOT NULL,
+  linked_at         TEXT NOT NULL,
+  record_json       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ilink_subject
+  ON identity_links (subject_record_id, linked_at);
+CREATE TABLE IF NOT EXISTS identity_observations (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  subject_record_id TEXT NOT NULL,
+  wallet            TEXT NOT NULL,
+  provider          TEXT NOT NULL,
+  signal            TEXT NOT NULL,
+  attestation_uid   TEXT NOT NULL DEFAULT '',
+  state             TEXT NOT NULL,
+  attested_at       TEXT NOT NULL DEFAULT '',
+  expires_at        TEXT NOT NULL DEFAULT '',
+  observed_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_iobs_subject
+  ON identity_observations (subject_record_id, wallet, signal, id);
+CREATE TABLE IF NOT EXISTS identity_link_attempts (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_id    TEXT NOT NULL,
+  email_hash   TEXT NOT NULL DEFAULT '',
+  client_ip    TEXT NOT NULL DEFAULT '',
+  matched      INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ilatt_email
+  ON identity_link_attempts (email_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_ilatt_ip
+  ON identity_link_attempts (client_ip, created_at);
+
+-- Social profiles content-registration lane (build pass 1,
+-- 2026-10-19; design in integrations/DESIGN.md). Everything here
+-- lives behind NPC_SOCIAL_PROFILES=1. A connection is NPC's
+-- server-side handle on a customer's platform account: it holds
+-- the OAuth tokens (server-side only, never written into a signed
+-- record, a batch receipt, or a response) and the platform's own
+-- account id, which is the identity anchor for idempotency, so a
+-- reconnect dedupes against the same registrations. The owner's
+-- email is stored as a hash only, like every other server-side
+-- email touch. Scans are the cached platform metadata from one
+-- enumeration; registrations are indexed per owner so a rescan
+-- classifies unchanged / new-version instead of duplicating.
+-- Batches hold the signed batch receipt records.
+CREATE TABLE IF NOT EXISTS social_challenges (
+  challenge_id TEXT PRIMARY KEY,
+  platform     TEXT NOT NULL,
+  email_hash   TEXT NOT NULL DEFAULT '',
+  secret       TEXT NOT NULL,
+  created_at   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  consumed_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS social_connections (
+  connection_id       TEXT PRIMARY KEY,
+  platform            TEXT NOT NULL,
+  email_hash          TEXT NOT NULL DEFAULT '',
+  platform_account_id TEXT NOT NULL,
+  account_display_name TEXT NOT NULL DEFAULT '',
+  access_token        TEXT NOT NULL DEFAULT '',
+  refresh_token       TEXT NOT NULL DEFAULT '',
+  token_expires_at    TEXT NOT NULL DEFAULT '',
+  scopes              TEXT NOT NULL DEFAULT '',
+  status              TEXT NOT NULL DEFAULT 'active',
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_soconn_owner
+  ON social_connections (platform, email_hash, platform_account_id);
+CREATE TABLE IF NOT EXISTS social_scans (
+  scan_id       TEXT PRIMARY KEY,
+  connection_id TEXT NOT NULL,
+  enumerated_at TEXT NOT NULL,
+  item_count    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS social_scan_items (
+  scan_id         TEXT NOT NULL,
+  external_id     TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  item_json       TEXT NOT NULL,
+  PRIMARY KEY (scan_id, external_id)
+);
+CREATE TABLE IF NOT EXISTS social_registrations (
+  email_hash      TEXT NOT NULL,
+  identity_key    TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  record_id       TEXT NOT NULL,
+  batch_id        TEXT NOT NULL DEFAULT '',
+  platform        TEXT NOT NULL DEFAULT '',
+  created_at      TEXT NOT NULL,
+  PRIMARY KEY (email_hash, identity_key)
+);
+CREATE TABLE IF NOT EXISTS social_batches (
+  batch_id      TEXT PRIMARY KEY,
+  connection_id TEXT NOT NULL DEFAULT '',
+  record_json   TEXT NOT NULL,
+  created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS social_attempts (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  target     TEXT NOT NULL DEFAULT '',
+  email_hash TEXT NOT NULL DEFAULT '',
+  client_ip  TEXT NOT NULL DEFAULT '',
+  matched    INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_soatt_email
+  ON social_attempts (email_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_soatt_ip
+  ON social_attempts (client_ip, created_at);
 """
 
 
@@ -383,6 +524,18 @@ class Store:
             "SELECT * FROM attestations WHERE claim_hash=? AND revoked=0"
             " ORDER BY created_at DESC",
             (claim_hash,))
+
+    def attestations_for_subject(self, subject_type, subject_id):
+        """Every attestation ever issued for a subject, revoked
+        ones included, oldest first. This is the input set for the
+        agent rating (npc_verify.kya.compute_agent_rating):
+        reputation is formed from the whole history, so unlike the
+        latest-attestation reads this one filters nothing out."""
+        return self._fetchall(
+            "SELECT * FROM attestations WHERE subject_type=?"
+            " AND subject_id=? ORDER BY tested_at ASC,"
+            " created_at ASC, id ASC",
+            (subject_type, subject_id))
 
     def revoke_attestation(self, att_id, rev_id, reason, sig_b64, key_id,
                            created_at):
@@ -590,6 +743,33 @@ class Store:
             (record_id,))
         return json.loads(row["record_json"]) if row else None
 
+    def registration_for_agent(self, agent_id):
+        """The agent registration that names this agent_id, or None.
+
+        Agent registrations record the agent_id they cover only
+        when the owner supplied one (registry.validate_agent_input);
+        that recorded agent_id is the chain from an attestation's
+        subject back to the registration that names its accountable
+        owner. The newest matching registration wins. When no
+        registration names the agent, the chain is not recorded and
+        this returns None: callers print the principal as absent
+        rather than guess at one.
+        """
+        if not agent_id:
+            return None
+        rows = self._fetchall(
+            "SELECT record_json FROM registrations WHERE kind='agent'"
+            " ORDER BY created_at DESC")
+        for row in rows:
+            try:
+                record = json.loads(row["record_json"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(record, dict) \
+                    and record.get("agent_id") == agent_id:
+                return record
+        return None
+
     def count_registrations_since(self, dimension, value, since_iso):
         """Count registrations in a rolling window, for the caps.
 
@@ -702,6 +882,398 @@ class Store:
             row = self._fetchone(
                 "SELECT COUNT(*) AS n FROM"
                 " verification_request_attempts"
+                " WHERE client_ip=? AND created_at>=?",
+                (value, since_iso))
+        return row["n"] if row else 0
+
+    # -- federated identity linking (phase 1) ---------------------------
+    def add_identity_link_challenge(self, row) -> bool:
+        """Store a pending link challenge (a SIWE nonce or an OAuth
+        state). Put-if-absent on the challenge id."""
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO identity_link_challenges"
+                " (challenge_id, kind, provider, subject_record_id,"
+                " email_hash, secret, wallet, created_at, expires_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (row["challenge_id"], row["kind"],
+                 row.get("provider", ""), row["subject_record_id"],
+                 row.get("email_hash", ""), row["secret"],
+                 row.get("wallet", ""), row["created_at"],
+                 row["expires_at"]))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_identity_link_challenge(self, challenge_id):
+        return self._fetchone(
+            "SELECT * FROM identity_link_challenges"
+            " WHERE challenge_id=?", (challenge_id,))
+
+    def find_identity_link_challenge(self, kind, provider, secret):
+        """The open challenge carrying this secret (an OAuth state),
+        or None. Secrets are random and single-use; the lookup is by
+        exact match on all three fields."""
+        return self._fetchone(
+            "SELECT * FROM identity_link_challenges"
+            " WHERE kind=? AND provider=? AND secret=?"
+            " AND consumed_at=''",
+            (kind, provider, secret))
+
+    def consume_identity_link_challenge(self, challenge_id,
+                                        consumed_at) -> bool:
+        """Mark a challenge used. False when it was already consumed
+        (or never existed), so a replay fails closed."""
+        return self._write(
+            "UPDATE identity_link_challenges SET consumed_at=?"
+            " WHERE challenge_id=? AND consumed_at=''",
+            (consumed_at, challenge_id)) > 0
+
+    def add_identity_link(self, record) -> bool:
+        """Store a signed identity-link record. Put-if-absent on the
+        link id; the signal summary columns are denormalized from
+        the record's own signal entry for panel reads."""
+        entry = record["signal"]
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO identity_links (link_id,"
+                " subject_record_id, provider, signal, subject_ref,"
+                " linked_at, record_json) VALUES (?,?,?,?,?,?,?)",
+                (record["record_id"], record["subject_record_id"],
+                 entry["provider"], entry["signal"],
+                 entry["subject_ref"], record["linked_at"],
+                 json.dumps(record)))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_identity_link(self, link_id):
+        row = self._fetchone(
+            "SELECT record_json FROM identity_links WHERE link_id=?",
+            (link_id,))
+        return json.loads(row["record_json"]) if row else None
+
+    def list_identity_links(self, subject_record_id):
+        """Every link record attached to a registration, oldest
+        first."""
+        rows = self._fetchall(
+            "SELECT record_json FROM identity_links"
+            " WHERE subject_record_id=? ORDER BY linked_at ASC",
+            (subject_record_id,))
+        return [json.loads(r["record_json"]) for r in rows]
+
+    def add_identity_observation(self, row) -> None:
+        """Append one provider observation (a Coinbase re-read).
+        History is kept; readers take the latest row per key."""
+        self._write(
+            "INSERT INTO identity_observations (subject_record_id,"
+            " wallet, provider, signal, attestation_uid, state,"
+            " attested_at, expires_at, observed_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (row["subject_record_id"], row["wallet"].lower(),
+             row["provider"], row["signal"],
+             row.get("attestation_uid", ""), row["state"],
+             row.get("attested_at", ""), row.get("expires_at", ""),
+             row["observed_at"]))
+
+    def latest_identity_observations(self, subject_record_id):
+        """The latest observation per (wallet, provider, signal) for
+        a record, keyed by that tuple. The wallet key is lowercase;
+        callers compare case-insensitively."""
+        rows = self._fetchall(
+            "SELECT * FROM identity_observations"
+            " WHERE subject_record_id=? ORDER BY id ASC",
+            (subject_record_id,))
+        latest = {}
+        for row in rows:
+            latest[(row["wallet"], row["provider"],
+                    row["signal"])] = row
+        return latest
+
+    def record_identity_link_attempt(self, record_id, email,
+                                     client_ip, matched, created_at):
+        self._write(
+            "INSERT INTO identity_link_attempts (record_id,"
+            " email_hash, client_ip, matched, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (record_id, registration_email_hash(email),
+             client_ip or "", 1 if matched else 0, created_at))
+
+    def count_identity_link_attempts_since(self, dimension, value,
+                                           since_iso):
+        """Count link attempts in a rolling window, mirroring the
+        verification-request counters: the email dimension counts by
+        hash."""
+        if dimension == "email":
+            row = self._fetchone(
+                "SELECT COUNT(*) AS n FROM identity_link_attempts"
+                " WHERE email_hash=? AND created_at>=?",
+                (registration_email_hash(value), since_iso))
+        else:
+            row = self._fetchone(
+                "SELECT COUNT(*) AS n FROM identity_link_attempts"
+                " WHERE client_ip=? AND created_at>=?",
+                (value, since_iso))
+        return row["n"] if row else 0
+
+    # -- social profiles lane (build pass 1) ----------------------------
+    def add_social_challenge(self, row) -> bool:
+        """Store a pending connect challenge (an OAuth state).
+        Put-if-absent on the challenge id."""
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO social_challenges"
+                " (challenge_id, platform, email_hash, secret,"
+                " created_at, expires_at) VALUES (?,?,?,?,?,?)",
+                (row["challenge_id"], row["platform"],
+                 row.get("email_hash", ""), row["secret"],
+                 row["created_at"], row["expires_at"]))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def find_social_challenge(self, platform, secret):
+        """The open challenge carrying this OAuth state, or None.
+        States are random and single-use; the lookup is by exact
+        match on both fields."""
+        return self._fetchone(
+            "SELECT * FROM social_challenges"
+            " WHERE platform=? AND secret=? AND consumed_at=''",
+            (platform, secret))
+
+    def consume_social_challenge(self, challenge_id,
+                                 consumed_at) -> bool:
+        """Mark a challenge used. False when it was already consumed
+        (or never existed), so a replay fails closed."""
+        return self._write(
+            "UPDATE social_challenges SET consumed_at=?"
+            " WHERE challenge_id=? AND consumed_at=''",
+            (consumed_at, challenge_id)) > 0
+
+    def add_social_connection(self, row) -> bool:
+        """Store a platform connection. Put-if-absent on the
+        connection id. Tokens live only in this row."""
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO social_connections"
+                " (connection_id, platform, email_hash,"
+                " platform_account_id, account_display_name,"
+                " access_token, refresh_token, token_expires_at,"
+                " scopes, status, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (row["connection_id"], row["platform"],
+                 row.get("email_hash", ""),
+                 row["platform_account_id"],
+                 row.get("account_display_name", ""),
+                 row.get("access_token", ""),
+                 row.get("refresh_token", ""),
+                 row.get("token_expires_at", ""),
+                 row.get("scopes", ""),
+                 row.get("status", "active"),
+                 row["created_at"], row["updated_at"]))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_social_connection(self, connection_id):
+        return self._fetchone(
+            "SELECT * FROM social_connections"
+            " WHERE connection_id=?", (connection_id,))
+
+    def find_social_connection(self, platform, email_hash,
+                               platform_account_id):
+        """The connection for one (platform, owner, platform
+        account), any status, or None. This is the reconnect
+        lookup: the platform account is the identity anchor."""
+        return self._fetchone(
+            "SELECT * FROM social_connections WHERE platform=?"
+            " AND email_hash=? AND platform_account_id=?"
+            " ORDER BY created_at DESC",
+            (platform, email_hash, platform_account_id))
+
+    def list_social_connections(self, email_hash):
+        """Every active connection the owner holds, oldest first.
+        Rows carry tokens; the service strips them before any
+        response."""
+        return self._fetchall(
+            "SELECT * FROM social_connections WHERE email_hash=?"
+            " AND status='active' ORDER BY created_at ASC",
+            (email_hash,))
+
+    def update_social_connection(self, connection_id, fields) -> bool:
+        """Refresh a connection's tokens and display fields (a
+        reconnect, a token refresh). Only the named columns move;
+        the column names are fixed literals chosen by the caller,
+        never user input."""
+        allowed = ("access_token", "refresh_token",
+                   "token_expires_at", "account_display_name",
+                   "scopes", "status", "updated_at")
+        sets = [(k, fields[k]) for k in allowed if k in fields]
+        if not sets:
+            return False
+        sql = "UPDATE social_connections SET %s WHERE connection_id=?" \
+            % ", ".join("%s=?" % k for k, _v in sets)
+        return self._write(sql, tuple(v for _k, v in sets)
+                           + (connection_id,)) > 0
+
+    def disconnect_social_connection(self, connection_id,
+                                     updated_at) -> bool:
+        """End a connection: status disconnected, tokens blanked.
+        The signed records the customer holds are untouched."""
+        return self._write(
+            "UPDATE social_connections SET status='disconnected',"
+            " access_token='', refresh_token='', updated_at=?"
+            " WHERE connection_id=? AND status='active'",
+            (updated_at, connection_id)) > 0
+
+    def add_social_scan(self, row) -> bool:
+        """Store one enumeration (the scan header). Put-if-absent
+        on the scan id."""
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO social_scans (scan_id,"
+                " connection_id, enumerated_at, item_count)"
+                " VALUES (?,?,?,?)",
+                (row["scan_id"], row["connection_id"],
+                 row["enumerated_at"], row.get("item_count", 0)))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_social_scan(self, scan_id):
+        return self._fetchone(
+            "SELECT * FROM social_scans WHERE scan_id=?",
+            (scan_id,))
+
+    def add_social_scan_item(self, scan_id, item) -> bool:
+        """Store one enumerated work under its scan. Put-if-absent
+        on (scan, external id)."""
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO social_scan_items (scan_id,"
+                " external_id, idempotency_key, item_json)"
+                " VALUES (?,?,?,?)",
+                (scan_id, item["external_id"],
+                 item["idempotency_key"], json.dumps(item)))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def list_social_scan_items(self, scan_id):
+        """Every work one scan enumerated, in scan order."""
+        rows = self._fetchall(
+            "SELECT item_json FROM social_scan_items"
+            " WHERE scan_id=? ORDER BY rowid ASC", (scan_id,))
+        return [json.loads(r["item_json"]) for r in rows]
+
+    def delete_social_scans(self, connection_id) -> None:
+        """Drop a connection's cached enumerations (the platform
+        metadata the disconnect duty covers). Signed records are
+        never touched."""
+        with self._lock:
+            self.db.execute(
+                "DELETE FROM social_scan_items WHERE scan_id IN"
+                " (SELECT scan_id FROM social_scans"
+                " WHERE connection_id=?)", (connection_id,))
+            self.db.execute(
+                "DELETE FROM social_scans WHERE connection_id=?",
+                (connection_id,))
+            self.db.commit()
+
+    def get_social_registration(self, email_hash, identity_key):
+        return self._fetchone(
+            "SELECT * FROM social_registrations"
+            " WHERE email_hash=? AND identity_key=?",
+            (email_hash, identity_key))
+
+    def list_social_registrations(self, email_hash):
+        """Every lane registration the owner holds, for the
+        planner's existing-map."""
+        return self._fetchall(
+            "SELECT * FROM social_registrations WHERE email_hash=?",
+            (email_hash,))
+
+    def add_social_registration(self, row) -> bool:
+        """Index one minted registration under its owner and
+        identity key. Put-if-absent: False when the identity is
+        already indexed (the caller returns the existing record)."""
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO social_registrations"
+                " (email_hash, identity_key, idempotency_key,"
+                " record_id, batch_id, platform, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (row["email_hash"], row["identity_key"],
+                 row["idempotency_key"], row["record_id"],
+                 row.get("batch_id", ""), row.get("platform", ""),
+                 row["created_at"]))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def update_social_registration(self, email_hash, identity_key,
+                                   idempotency_key, record_id,
+                                   batch_id) -> None:
+        """Repoint an identity at its newest version's record (a
+        changed work registers as a new record; the index follows
+        it, the earlier record is never edited)."""
+        self._write(
+            "UPDATE social_registrations SET idempotency_key=?,"
+            " record_id=?, batch_id=? WHERE email_hash=?"
+            " AND identity_key=?",
+            (idempotency_key, record_id, batch_id, email_hash,
+             identity_key))
+
+    def add_social_batch(self, record, connection_id) -> bool:
+        """Store a signed batch receipt record. Put-if-absent on
+        the batch id."""
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO social_batches (batch_id,"
+                " connection_id, record_json, created_at)"
+                " VALUES (?,?,?,?)",
+                (record["record_id"], connection_id or "",
+                 json.dumps(record), record["registered_at"]))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_social_batch(self, batch_id):
+        row = self._fetchone(
+            "SELECT record_json FROM social_batches WHERE batch_id=?",
+            (batch_id,))
+        return json.loads(row["record_json"]) if row else None
+
+    def list_social_scans(self, connection_id):
+        """Every stored scan header for one connection, oldest
+        first (the overview's last-scan read)."""
+        return self._fetchall(
+            "SELECT * FROM social_scans WHERE connection_id=?"
+            " ORDER BY enumerated_at ASC, scan_id ASC",
+            (connection_id,))
+
+    def list_social_batches(self, connection_id):
+        """Every batch receipt minted for one connection, oldest
+        first, as the parsed signed records."""
+        rows = self._fetchall(
+            "SELECT record_json FROM social_batches"
+            " WHERE connection_id=?"
+            " ORDER BY created_at ASC, batch_id ASC",
+            (connection_id,))
+        return [json.loads(r["record_json"]) for r in rows]
+
+    def record_social_attempt(self, target, email, client_ip,
+                              matched, created_at):
+        self._write(
+            "INSERT INTO social_attempts (target, email_hash,"
+            " client_ip, matched, created_at) VALUES (?,?,?,?,?)",
+            (target or "", registration_email_hash(email),
+             client_ip or "", 1 if matched else 0, created_at))
+
+    def count_social_attempts_since(self, dimension, value,
+                                    since_iso):
+        """Count lane attempts in a rolling window, mirroring the
+        other counters: the email dimension counts by hash."""
+        if dimension == "email":
+            row = self._fetchone(
+                "SELECT COUNT(*) AS n FROM social_attempts"
+                " WHERE email_hash=? AND created_at>=?",
+                (registration_email_hash(value), since_iso))
+        else:
+            row = self._fetchone(
+                "SELECT COUNT(*) AS n FROM social_attempts"
                 " WHERE client_ip=? AND created_at>=?",
                 (value, since_iso))
         return row["n"] if row else 0

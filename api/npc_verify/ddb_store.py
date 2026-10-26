@@ -164,6 +164,19 @@ class DynamoDBStore:
         rows.sort(key=lambda r: (r["created_at"], r["id"]), reverse=True)
         return rows
 
+    def attestations_for_subject(self, subject_type, subject_id):
+        """Every attestation ever issued for a subject, revoked
+        ones included, oldest first. Mirrors the SQLite store: the
+        input set for the agent rating, so nothing is filtered
+        out."""
+        with self._lock:
+            rows = [r for r in self._query_rows("ATT")
+                    if r["subject_type"] == subject_type
+                    and r["subject_id"] == subject_id]
+        rows.sort(key=lambda r: (r["tested_at"], r["created_at"],
+                                 r["id"]))
+        return rows
+
     def revoke_attestation(self, att_id, rev_id, reason, sig_b64, key_id,
                            created_at):
         with self._lock:
@@ -386,6 +399,29 @@ class DynamoDBStore:
             row = self._get_row("REG", record_id)
         return json.loads(row["record_json"]) if row else None
 
+    def registration_for_agent(self, agent_id):
+        """The agent registration that names this agent_id, or
+        None. Mirrors the SQLite store: the recorded agent_id on a
+        registration is the chain from an attestation's subject to
+        its accountable owner; the newest match wins, and no match
+        means the chain is not recorded."""
+        if not agent_id:
+            return None
+        with self._lock:
+            rows = self._query_rows("REG")
+        rows.sort(key=lambda r: r["created_at"], reverse=True)
+        for row in rows:
+            if row.get("kind") != "agent":
+                continue
+            try:
+                record = json.loads(row["record_json"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(record, dict) \
+                    and record.get("agent_id") == agent_id:
+                return record
+        return None
+
     def count_registrations_since(self, dimension, value, since_iso):
         """Count registrations in a rolling window, for the caps.
 
@@ -496,6 +532,365 @@ class DynamoDBStore:
         registration counters: the email dimension counts by hash."""
         with self._lock:
             rows = self._query_rows("VREQATT")
+        if dimension == "email":
+            wanted = registration_email_hash(value)
+            return sum(1 for r in rows
+                       if r.get("email_hash") == wanted
+                       and r["created_at"] >= since_iso)
+        return sum(1 for r in rows
+                   if r.get("client_ip") == value
+                   and r["created_at"] >= since_iso)
+
+    # -- federated identity linking (phase 1) ---------------------------
+    # Partitions: challenges under "ILCHAL" (sk = challenge id), link
+    # records under "ILINK" (sk = link id), observations under
+    # "IOBS#<subject_record_id>" (sk = wallet|provider|signal, latest
+    # write wins: this backend keeps the latest observation per key,
+    # which is all the panel reads), attempts under "ILATT".
+    def add_identity_link_challenge(self, row) -> bool:
+        """Store a pending link challenge. Put-if-absent on the id."""
+        with self._lock:
+            return self._put_row("ILCHAL", row["challenge_id"],
+                                 dict(row), if_absent=True)
+
+    def get_identity_link_challenge(self, challenge_id):
+        with self._lock:
+            return self._get_row("ILCHAL", challenge_id)
+
+    def find_identity_link_challenge(self, kind, provider, secret):
+        """The open challenge carrying this secret (an OAuth state),
+        or None, mirroring the SQLite store."""
+        with self._lock:
+            rows = self._query_rows("ILCHAL")
+        for row in rows:
+            if row.get("kind") == kind \
+                    and row.get("provider") == provider \
+                    and row.get("secret") == secret \
+                    and not row.get("consumed_at"):
+                return row
+        return None
+
+    def consume_identity_link_challenge(self, challenge_id,
+                                        consumed_at) -> bool:
+        """Mark a challenge used. False when already consumed, so a
+        replay fails closed. (Read-modify-write under the store
+        lock, the same pattern the rest of this backend uses.)"""
+        with self._lock:
+            row = self._get_row("ILCHAL", challenge_id)
+            if row is None or row.get("consumed_at"):
+                return False
+            row["consumed_at"] = consumed_at
+            self._put_row("ILCHAL", challenge_id, row)
+            return True
+
+    def add_identity_link(self, record) -> bool:
+        """Store a signed identity-link record, put-if-absent."""
+        entry = record["signal"]
+        row = {"link_id": record["record_id"],
+               "subject_record_id": record["subject_record_id"],
+               "provider": entry["provider"],
+               "signal": entry["signal"],
+               "subject_ref": entry["subject_ref"],
+               "linked_at": record["linked_at"],
+               "record_json": json.dumps(record)}
+        with self._lock:
+            return self._put_row("ILINK", record["record_id"], row,
+                                 if_absent=True)
+
+    def get_identity_link(self, link_id):
+        with self._lock:
+            row = self._get_row("ILINK", link_id)
+        return json.loads(row["record_json"]) if row else None
+
+    def list_identity_links(self, subject_record_id):
+        """Every link record attached to a registration, oldest
+        first."""
+        with self._lock:
+            rows = self._query_rows("ILINK")
+        records = [json.loads(r["record_json"]) for r in rows
+                   if r["subject_record_id"] == subject_record_id]
+        records.sort(key=lambda r: r.get("linked_at", ""))
+        return records
+
+    def add_identity_observation(self, row) -> None:
+        """Record the latest provider observation for a key. This
+        backend keeps only the latest per (subject, wallet, provider,
+        signal); the SQLite backend keeps the full history. The
+        panel contract reads the latest either way."""
+        sk = "|".join((row["wallet"].lower(), row["provider"],
+                       row["signal"]))
+        with self._lock:
+            self._put_row("IOBS#" + row["subject_record_id"], sk,
+                          dict(row))
+
+    def latest_identity_observations(self, subject_record_id):
+        """The latest observation per (wallet, provider, signal),
+        keyed by that tuple, mirroring the SQLite store."""
+        with self._lock:
+            rows = self._query_rows("IOBS#" + subject_record_id)
+        latest = {}
+        for row in rows:
+            latest[(row["wallet"].lower(), row["provider"],
+                    row["signal"])] = row
+        return latest
+
+    def record_identity_link_attempt(self, record_id, email,
+                                     client_ip, matched, created_at):
+        import secrets as _secrets
+        row = {"record_id": record_id,
+               "email_hash": registration_email_hash(email),
+               "client_ip": client_ip or "",
+               "matched": bool(matched),
+               "created_at": created_at}
+        sk = created_at + "#" + _secrets.token_hex(6)
+        with self._lock:
+            self._put_row("ILATT", sk, row)
+
+    def count_identity_link_attempts_since(self, dimension, value,
+                                           since_iso):
+        """Count link attempts in a rolling window, mirroring the
+        verification-request counters."""
+        with self._lock:
+            rows = self._query_rows("ILATT")
+        if dimension == "email":
+            wanted = registration_email_hash(value)
+            return sum(1 for r in rows
+                       if r.get("email_hash") == wanted
+                       and r["created_at"] >= since_iso)
+        return sum(1 for r in rows
+                   if r.get("client_ip") == value
+                   and r["created_at"] >= since_iso)
+
+    # -- social profiles lane (build pass 1) ----------------------------
+    # Partitions: connect challenges under "SOCHAL" (sk = challenge
+    # id), connections under "SOCONN" (sk = connection id), scan
+    # headers under "SOSCAN" (sk = scan id), scan items under
+    # "SOSCANITEM#<scan_id>" (sk = external id), the registration
+    # index under "SOREG" (sk = email hash + "|" + identity key),
+    # batch receipts under "SOBATCH" (sk = batch id), attempts
+    # under "SOATT". This backend uses only Get/Put/Query like the
+    # rest of the store, so a disconnect tombstones the cached scan
+    # rows (their data is replaced by a purged marker) instead of
+    # deleting them; readers treat a tombstone as gone, which is
+    # what the platform data-deletion duty covers.
+    def add_social_challenge(self, row) -> bool:
+        with self._lock:
+            return self._put_row("SOCHAL", row["challenge_id"],
+                                 dict(row), if_absent=True)
+
+    def find_social_challenge(self, platform, secret):
+        with self._lock:
+            rows = self._query_rows("SOCHAL")
+        for row in rows:
+            if row.get("platform") == platform \
+                    and row.get("secret") == secret \
+                    and not row.get("consumed_at"):
+                return row
+        return None
+
+    def consume_social_challenge(self, challenge_id,
+                                 consumed_at) -> bool:
+        with self._lock:
+            row = self._get_row("SOCHAL", challenge_id)
+            if row is None or row.get("consumed_at"):
+                return False
+            row["consumed_at"] = consumed_at
+            self._put_row("SOCHAL", challenge_id, row)
+            return True
+
+    def add_social_connection(self, row) -> bool:
+        with self._lock:
+            return self._put_row("SOCONN", row["connection_id"],
+                                 dict(row), if_absent=True)
+
+    def get_social_connection(self, connection_id):
+        with self._lock:
+            row = self._get_row("SOCONN", connection_id)
+        return row if row and not row.get("purged") else None
+
+    def find_social_connection(self, platform, email_hash,
+                               platform_account_id):
+        with self._lock:
+            rows = self._query_rows("SOCONN")
+        matches = [r for r in rows
+                   if r.get("platform") == platform
+                   and r.get("email_hash") == email_hash
+                   and r.get("platform_account_id")
+                   == platform_account_id]
+        if not matches:
+            return None
+        matches.sort(key=lambda r: r.get("created_at", ""))
+        return matches[-1]
+
+    def list_social_connections(self, email_hash):
+        with self._lock:
+            rows = self._query_rows("SOCONN")
+        out = [r for r in rows
+               if r.get("email_hash") == email_hash
+               and r.get("status") == "active"]
+        out.sort(key=lambda r: r.get("created_at", ""))
+        return out
+
+    def update_social_connection(self, connection_id, fields) -> bool:
+        allowed = ("access_token", "refresh_token",
+                   "token_expires_at", "account_display_name",
+                   "scopes", "status", "updated_at")
+        with self._lock:
+            row = self._get_row("SOCONN", connection_id)
+            if row is None:
+                return False
+            for key in allowed:
+                if key in fields:
+                    row[key] = fields[key]
+            self._put_row("SOCONN", connection_id, row)
+            return True
+
+    def disconnect_social_connection(self, connection_id,
+                                     updated_at) -> bool:
+        with self._lock:
+            row = self._get_row("SOCONN", connection_id)
+            if row is None or row.get("status") != "active":
+                return False
+            row["status"] = "disconnected"
+            row["access_token"] = ""
+            row["refresh_token"] = ""
+            row["updated_at"] = updated_at
+            self._put_row("SOCONN", connection_id, row)
+            return True
+
+    def add_social_scan(self, row) -> bool:
+        with self._lock:
+            return self._put_row("SOSCAN", row["scan_id"],
+                                 dict(row), if_absent=True)
+
+    def get_social_scan(self, scan_id):
+        with self._lock:
+            row = self._get_row("SOSCAN", scan_id)
+        return row if row and not row.get("purged") else None
+
+    def add_social_scan_item(self, scan_id, item) -> bool:
+        row = {"scan_id": scan_id,
+               "external_id": item["external_id"],
+               "idempotency_key": item["idempotency_key"],
+               "item_json": json.dumps(item)}
+        with self._lock:
+            return self._put_row("SOSCANITEM#" + scan_id,
+                                 item["external_id"], row,
+                                 if_absent=True)
+
+    def list_social_scan_items(self, scan_id):
+        with self._lock:
+            rows = self._query_rows("SOSCANITEM#" + scan_id)
+        return [json.loads(r["item_json"]) for r in rows
+                if not r.get("purged")]
+
+    def delete_social_scans(self, connection_id) -> None:
+        """Tombstone the connection's cached enumerations (see the
+        section note). Signed records are never touched."""
+        with self._lock:
+            scans = [r for r in self._query_rows("SOSCAN")
+                     if r.get("connection_id") == connection_id
+                     and not r.get("purged")]
+            for scan in scans:
+                items = self._query_rows(
+                    "SOSCANITEM#" + scan["scan_id"])
+                for item in items:
+                    self._put_row(
+                        "SOSCANITEM#" + scan["scan_id"],
+                        item["external_id"],
+                        {"scan_id": scan["scan_id"],
+                         "external_id": item["external_id"],
+                         "purged": True})
+                self._put_row("SOSCAN", scan["scan_id"],
+                              {"scan_id": scan["scan_id"],
+                               "connection_id": connection_id,
+                               "purged": True})
+
+    def get_social_registration(self, email_hash, identity_key):
+        with self._lock:
+            return self._get_row(
+                "SOREG", email_hash + "|" + identity_key)
+
+    def list_social_registrations(self, email_hash):
+        with self._lock:
+            rows = self._query_rows("SOREG")
+        return [r for r in rows
+                if r.get("email_hash") == email_hash]
+
+    def add_social_registration(self, row) -> bool:
+        with self._lock:
+            return self._put_row(
+                "SOREG",
+                row["email_hash"] + "|" + row["identity_key"],
+                dict(row), if_absent=True)
+
+    def update_social_registration(self, email_hash, identity_key,
+                                   idempotency_key, record_id,
+                                   batch_id) -> None:
+        with self._lock:
+            row = self._get_row(
+                "SOREG", email_hash + "|" + identity_key)
+            if row is None:
+                return
+            row["idempotency_key"] = idempotency_key
+            row["record_id"] = record_id
+            row["batch_id"] = batch_id
+            self._put_row(
+                "SOREG", email_hash + "|" + identity_key, row)
+
+    def add_social_batch(self, record, connection_id) -> bool:
+        row = {"batch_id": record["record_id"],
+               "connection_id": connection_id or "",
+               "record_json": json.dumps(record),
+               "created_at": record["registered_at"]}
+        with self._lock:
+            return self._put_row("SOBATCH", record["record_id"],
+                                 row, if_absent=True)
+
+    def get_social_batch(self, batch_id):
+        with self._lock:
+            row = self._get_row("SOBATCH", batch_id)
+        return json.loads(row["record_json"]) if row else None
+
+    def list_social_scans(self, connection_id):
+        """Every stored scan header for one connection, oldest
+        first; tombstoned rows are gone, as everywhere."""
+        with self._lock:
+            rows = self._query_rows("SOSCAN")
+        out = [r for r in rows
+               if r.get("connection_id") == connection_id
+               and not r.get("purged")]
+        out.sort(key=lambda r: (r.get("enumerated_at", ""),
+                                r.get("scan_id", "")))
+        return out
+
+    def list_social_batches(self, connection_id):
+        """Every batch receipt minted for one connection, oldest
+        first, as the parsed signed records."""
+        with self._lock:
+            rows = self._query_rows("SOBATCH")
+        mine = [r for r in rows
+                if r.get("connection_id") == (connection_id or "")]
+        mine.sort(key=lambda r: (r.get("created_at", ""),
+                                 r.get("batch_id", "")))
+        return [json.loads(r["record_json"]) for r in mine]
+
+    def record_social_attempt(self, target, email, client_ip,
+                              matched, created_at):
+        import secrets as _secrets
+        row = {"target": target or "",
+               "email_hash": registration_email_hash(email),
+               "client_ip": client_ip or "",
+               "matched": bool(matched),
+               "created_at": created_at}
+        sk = created_at + "#" + _secrets.token_hex(6)
+        with self._lock:
+            self._put_row("SOATT", sk, row)
+
+    def count_social_attempts_since(self, dimension, value,
+                                    since_iso):
+        with self._lock:
+            rows = self._query_rows("SOATT")
         if dimension == "email":
             wanted = registration_email_hash(value)
             return sum(1 for r in rows
