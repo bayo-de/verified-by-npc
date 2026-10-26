@@ -30,7 +30,11 @@ rules, no edges, no other marks.
 
 ## Color
 
-- Default: NPC Orange, `#FF6A00`, on light or dark grounds.
+Color lock (Bayo, 2026-10-13): NPC Orange is `#ec662b`, program-wide.
+It supersedes the earlier `#FF6A00` everywhere the mark or the brand
+orange appears.
+
+- Default: NPC Orange, `#ec662b`, on light or dark grounds.
 - Mono black, `#181818`: one-color printing and single-color light-ground use.
 - Mono white, `#FFFFFF`: one-color use on dark grounds.
 - No other colors. Never recolor the mark to match a partner, a theme, or
