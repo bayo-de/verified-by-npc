@@ -18,6 +18,11 @@ Routes:
                           registration forms (they POST from the
                           visitor's browser to the verification API;
                           this server never proxies a submission)
+  GET  /social            Social connections: the read-only view of
+                          the social profiles lane (registered only
+                          while NPC_SOCIAL_PROFILES=1 on this
+                          deployment; the visitor's browser reads
+                          the API, this server never proxies)
   GET  /archive           archive of NPC Labs' real historical on-chain
                           mints (company history; reached from Records)
   GET  /plugins           the plugin surfaces and their honest status
@@ -298,6 +303,16 @@ class _App:
         def help_page(req):
             return views.help_view(api_base=app.api_url)
 
+        # The social connections view exists only while the social
+        # profiles lane is enabled on this deployment. With the
+        # flag off the route is never registered: /social is the
+        # same 404 it has always been and no page carries the nav
+        # entry.
+        if views.social_enabled():
+            @app.route("GET", r"^/social$")
+            def social(req):
+                return views.social_view(api_base=app.api_url)
+
     # -- dispatch -------------------------------------------------------
     def dispatch(self, req):
         for route_method, pattern, fn in self.routes:
@@ -327,6 +342,7 @@ def _title_for(path):
         "/privacy": "Privacy",
         "/help": "How it works",
         "/verify": "Verify yours",
+        "/social": "Social connections",
     }.get(path, "Not found")
 
 def make_handler(api_url, api_key):

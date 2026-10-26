@@ -5,6 +5,7 @@ Copy explains the why, never the internal method. No em-dashes anywhere
 in user-facing text. Every API-derived value is HTML-escaped at render.
 """
 import html as _html
+import os
 
 CSS = """
 :root{
@@ -278,6 +279,49 @@ VERIFY_JS = """
     frag.appendChild(ul);
     return frag;
   }
+  function kyaText(v) {
+    if (v === null || v === undefined) return "Not on this record.";
+    if (Array.isArray(v)) return v.map(kyaText).join(", ");
+    if (typeof v === "object") {
+      return Object.keys(v).sort().filter(function (k) {
+        return k !== "detail";
+      }).map(function (k) {
+        return k.replace(/_/g, " ") + ": " + kyaText(v[k]);
+      }).join("; ");
+    }
+    return String(v);
+  }
+  function kyaBlock(kya) {
+    if (!kya || typeof kya !== "object") return null;
+    var frag = document.createDocumentFragment();
+    frag.appendChild(el("h3", "Know Your Agent"));
+    var dl = document.createElement("dl");
+    dl.className = "kv";
+    var rep = kya.reputation;
+    var repText;
+    if (rep && typeof rep === "object" && rep.state === "rated") {
+      var rb = rep.based_on || {};
+      var n = rb.attestations || 0;
+      repText = "Rating: " + rep.rating
+        + " (NPC agent rating rule v" + rep.rule_version
+        + "; based on " + n + " attestation" + (n === 1 ? "" : "s")
+        + ", " + (rb.revocations || 0) + " revoked).";
+    } else if (rep && typeof rep === "object") {
+      repText = "No reputation score yet. Standing on this record: "
+        + kyaText(rep.based_on || {});
+    } else {
+      repText = kyaText(rep);
+    }
+    [["Principal", kyaText(kya.principal)],
+     ["Permissions", kyaText(kya.permissions)],
+     ["Constraints", kyaText(kya.constraints)],
+     ["Reputation", repText]].forEach(function (pair) {
+      dl.appendChild(el("dt", pair[0]));
+      dl.appendChild(el("dd", pair[1]));
+    });
+    frag.appendChild(dl);
+    return frag;
+  }
   function showResult(rec) {
     resultBox.innerHTML = "";
     resultBox.appendChild(el("h3", "Registered."));
@@ -304,6 +348,8 @@ VERIFY_JS = """
     var pending = checkList("Checks that have not run yet",
                             rec.checks_not_run, "reason");
     if (pending) resultBox.appendChild(pending);
+    var kya = kyaBlock(rec.kya);
+    if (kya) resultBox.appendChild(kya);
     if (window.npcRequestVerificationBox && rec.record_id) {
       resultBox.appendChild(
         window.npcRequestVerificationBox(rec.record_id, base));
@@ -436,6 +482,49 @@ LIVE_LOOKUP_JS = """
     frag.appendChild(ul);
     return frag;
   }
+  function kyaText(v) {
+    if (v === null || v === undefined) return "Not on this record.";
+    if (Array.isArray(v)) return v.map(kyaText).join(", ");
+    if (typeof v === "object") {
+      return Object.keys(v).sort().filter(function (k) {
+        return k !== "detail";
+      }).map(function (k) {
+        return k.replace(/_/g, " ") + ": " + kyaText(v[k]);
+      }).join("; ");
+    }
+    return String(v);
+  }
+  function kyaBlock(kya) {
+    if (!kya || typeof kya !== "object") return null;
+    var frag = document.createDocumentFragment();
+    frag.appendChild(el("h3", "Know Your Agent"));
+    var dl = document.createElement("dl");
+    dl.className = "kv";
+    var rep = kya.reputation;
+    var repText;
+    if (rep && typeof rep === "object" && rep.state === "rated") {
+      var rb = rep.based_on || {};
+      var n = rb.attestations || 0;
+      repText = "Rating: " + rep.rating
+        + " (NPC agent rating rule v" + rep.rule_version
+        + "; based on " + n + " attestation" + (n === 1 ? "" : "s")
+        + ", " + (rb.revocations || 0) + " revoked).";
+    } else if (rep && typeof rep === "object") {
+      repText = "No reputation score yet. Standing on this record: "
+        + kyaText(rep.based_on || {});
+    } else {
+      repText = kyaText(rep);
+    }
+    [["Principal", kyaText(kya.principal)],
+     ["Permissions", kyaText(kya.permissions)],
+     ["Constraints", kyaText(kya.constraints)],
+     ["Reputation", repText]].forEach(function (pair) {
+      dl.appendChild(el("dt", pair[0]));
+      dl.appendChild(el("dd", pair[1]));
+    });
+    frag.appendChild(dl);
+    return frag;
+  }
   var notice = document.getElementById("npc-unknown-notice");
   var head = document.getElementById("npc-unknown-head");
   var pending = document.getElementById("npc-lookup-pending");
@@ -498,8 +587,13 @@ LIVE_LOOKUP_JS = """
       var notRan = checkList("Checks that have not run yet",
                              rec.checks_not_run, "reason");
       if (notRan) card.appendChild(notRan);
+      var kya = kyaBlock(rec.kya);
+      if (kya) card.appendChild(kya);
       marker.appendChild(card);
       marker.hidden = false;
+      if (window.npcIdentityPanel) {
+        try { window.npcIdentityPanel(id, base); } catch (e) {}
+      }
       // The request-verification state rides along: the card shows
       // "Verification requested" when the registrant has asked, and
       // the ask itself when they have not. A failed state read adds
@@ -836,10 +930,10 @@ def chat_widget_html(api_base):
 
 def live_lookup_marker(api_base, record_id=None):
     return ('<div id="npc-live-lookup" data-api-base="%s"%s hidden></div>'
-            '<script>%s</script><script>%s</script>' % (
+            '<script>%s</script><script>%s</script>%s' % (
                 esc(api_base),
                 (' data-id="%s"' % esc(record_id)) if record_id else "",
-                LIVE_LOOKUP_JS, REQUEST_VERIFY_JS))
+                LIVE_LOOKUP_JS, REQUEST_VERIFY_JS, IDENTITY_PANEL_JS))
 
 
 def request_verification_html(record_id, api_base):
@@ -862,6 +956,364 @@ def request_verification_html(record_id, api_base):
         % (esc(record_id), esc(api_base)))
 
 
+def identity_panel_html(panel):
+    """Render the "Identity the owner has linked" panel from the API
+    panel payload (GET /v1/records/{id}/identity-panel). The labels,
+    headings, and boundary line come from the API payload itself, so
+    the words on the page are the words the design approved. Renders
+    nothing when nothing is linked: no section, no heading, no
+    claim."""
+    if not isinstance(panel, dict):
+        return ""
+    p = panel.get("panel") or {}
+    groups = p.get("groups") or []
+    gone = p.get("not_current") or []
+    if not groups and not gone:
+        return ""
+    parts = ['<div class="card">']
+    parts.append("<h3>%s</h3>" % esc(p.get("heading")))
+    parts.append("<p>%s</p>" % esc(p.get("intro")))
+    for group in groups:
+        parts.append("<h4>%s</h4><ul>" % esc(group.get("heading")))
+        for signal in group.get("signals") or []:
+            parts.append("<li>%s</li>" % esc(signal.get("label")))
+        parts.append("</ul>")
+    if gone:
+        parts.append("<h4>No longer confirmed</h4><ul>")
+        for signal in gone:
+            parts.append("<li>%s %s</li>" % (
+                esc(signal.get("label")), esc(signal.get("reason"))))
+        parts.append("</ul>")
+        if p.get("not_current_note"):
+            parts.append("<p>%s</p>" % esc(p.get("not_current_note")))
+    parts.append('<p class="small">%s</p>' % esc(p.get("boundary")))
+    parts.append("</div>")
+    return "".join(parts)
+
+
+# The live panel loader. Fetches the panel endpoint for a record and
+# fills any .npc-identity-panel container for it (server-rendered
+# record pages carry the container; the lookup flow gets one
+# appended). Behind the API's NPC_IDENTITY_SIGNALS flag like the
+# rest of the linking surface: with the flag off the endpoint
+# answers 503 and the panel simply never appears, and a record with
+# nothing linked renders no section at all.
+IDENTITY_PANEL_JS = """
+<script>
+window.npcIdentityPanel = function (recordId, base) {
+  var host = document.querySelector(
+    '.npc-identity-panel[data-record-id="' + recordId + '"]');
+  if (!host) {
+    var result = document.getElementById('live-lookup-result')
+      || document.getElementById('npc-live-lookup');
+    if (!result) { return; }
+    host = document.createElement('div');
+    host.className = 'npc-identity-panel';
+    host.setAttribute('data-record-id', recordId);
+    result.appendChild(host);
+  }
+  if (host.getAttribute('data-loaded')) { return; }
+  host.setAttribute('data-loaded', '1');
+  fetch(base + '/v1/records/' + encodeURIComponent(recordId)
+        + '/identity-panel')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (doc) {
+      if (!doc || !doc.panel) { return; }
+      var p = doc.panel;
+      var hasCurrent = p.groups && p.groups.length;
+      var hasGone = p.not_current && p.not_current.length;
+      if (!hasCurrent && !hasGone) { return; }
+      function esc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g,
+          function (c) {
+            return {'&': '&amp;', '<': '&lt;', '>': '&gt;',
+                    '"': '&quot;', "'": '&#39;'}[c];
+          });
+      }
+      var h = '<div class="card"><h3>' + esc(p.heading) + '</h3>'
+        + '<p>' + esc(p.intro) + '</p>';
+      (p.groups || []).forEach(function (g) {
+        h += '<h4>' + esc(g.heading) + '</h4><ul>';
+        (g.signals || []).forEach(function (s) {
+          h += '<li>' + esc(s.label) + '</li>';
+        });
+        h += '</ul>';
+      });
+      if (hasGone) {
+        h += '<h4>No longer confirmed</h4><ul>';
+        p.not_current.forEach(function (s) {
+          h += '<li>' + esc(s.label) + ' ' + esc(s.reason)
+            + '</li>';
+        });
+        h += '</ul>';
+        if (p.not_current_note) {
+          h += '<p>' + esc(p.not_current_note) + '</p>';
+        }
+      }
+      h += '<p class="small">' + esc(p.boundary) + '</p></div>';
+      host.innerHTML = h;
+    })
+    .catch(function () {});
+};
+document.addEventListener('DOMContentLoaded', function () {
+  var nodes = document.querySelectorAll(
+    '.npc-identity-panel[data-record-id]');
+  for (var i = 0; i < nodes.length; i++) {
+    var base = nodes[i].getAttribute('data-api-base');
+    if (base) {
+      window.npcIdentityPanel(
+        nodes[i].getAttribute('data-record-id'), base);
+    }
+  }
+});
+</script>
+"""
+
+
+# -- Social connections (social profiles lane, phase 1.5) --------------
+# The read-only view of the social profiles lane, on the identity
+# panel pattern: the API builds an overview payload per connection
+# and this module renders it (social_connection_html server-side,
+# SOCIAL_CONNECTIONS_JS in the browser). The view ships only while
+# the lane is enabled on this deployment, gated by the same flag
+# the API gates on: with NPC_SOCIAL_PROFILES off there is no nav
+# entry, no page, and no script, and every dashboard page renders
+# exactly as before.
+
+SOCIAL_PROFILES_ENV = "NPC_SOCIAL_PROFILES"
+
+_SOCIAL_PLATFORM_DISPLAY = {
+    "youtube": "YouTube",
+    "instagram": "Instagram",
+    "tiktok": "TikTok",
+}
+
+
+def social_enabled():
+    return os.environ.get(SOCIAL_PROFILES_ENV) == "1"
+
+
+def _social_counts_text(counts):
+    counts = counts or {}
+    return ("%d registered, %d new versions, %d unchanged, "
+            "%d failed, %d deferred" % (
+                int(counts.get("registered") or 0),
+                int(counts.get("new_version") or 0),
+                int(counts.get("unchanged") or 0),
+                int(counts.get("failed") or 0),
+                int(counts.get("deferred") or 0)))
+
+
+def social_connection_html(overview):
+    """Render one connection's overview payload (POST
+    /v1/social/connections/{id}/overview): the platform, the
+    account as the platform names it, the connection's state, its
+    last scan, and what its registration batches did, each batch
+    named by its receipt's record ID. The provenance sentence
+    prints exactly as the payload carries it, which is exactly
+    how the records carry it. Display only: a connection shows
+    account control on a platform and is never rendered as
+    verification. Renders nothing for an empty payload."""
+    if not isinstance(overview, dict):
+        return ""
+    conn = overview.get("connection") or {}
+    if not conn.get("connection_id"):
+        return ""
+    platform = conn.get("platform") or ""
+    display = _SOCIAL_PLATFORM_DISPLAY.get(platform, platform)
+    name = conn.get("account_display_name") or ""
+    parts = ['<div class="card npc-social-connection">']
+    parts.append("<h3>%s</h3>" % esc(
+        display + (": " + name if name else "")))
+    parts.append('<dl class="kv">')
+    parts.append("<dt>Account</dt><dd>"
+                 '<span class="mono">%s</span></dd>'
+                 % esc(conn.get("platform_account_id")))
+    parts.append("<dt>State</dt><dd>%s</dd>"
+                 % esc(conn.get("status")))
+    parts.append("<dt>Connected</dt><dd>%s</dd>"
+                 % esc(conn.get("created_at")))
+    last_scan = overview.get("last_scan")
+    if last_scan:
+        parts.append("<dt>Last scan</dt><dd>%s, %d works</dd>" % (
+            esc(last_scan.get("enumerated_at")),
+            int(last_scan.get("item_count") or 0)))
+    else:
+        parts.append("<dt>Last scan</dt><dd>No scan yet</dd>")
+    parts.append("</dl>")
+    batches = overview.get("batches") or []
+    if batches:
+        parts.append("<h4>Registration batches</h4><ul>")
+        for batch in batches:
+            parts.append(
+                '<li><span class="mono">%s</span> %s: %s</li>' % (
+                    esc(batch.get("batch_id")),
+                    esc(batch.get("registered_at")),
+                    esc(_social_counts_text(batch.get("counts")))))
+        parts.append("</ul>")
+        if len(batches) > 1:
+            parts.append("<p>In total: %s.</p>" % esc(
+                _social_counts_text(overview.get("totals"))))
+    else:
+        parts.append(
+            "<p>No registrations yet from this connection.</p>")
+    if overview.get("provenance"):
+        parts.append('<p class="small">%s</p>'
+                     % esc(overview.get("provenance")))
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def social_connections_html(overviews):
+    """Every connection card for one owner, or nothing at all."""
+    if not overviews:
+        return ""
+    return "".join(social_connection_html(o) for o in overviews)
+
+
+# The browser half of the view. The visitor enters the email they
+# connected with; the script asks the API for that owner's
+# connections and then each connection's overview, and builds the
+# same cards social_connection_html builds. It offers no write
+# action: if the API does not answer, or the lane is off, the page
+# says so plainly and shows nothing it cannot back.
+SOCIAL_CONNECTIONS_JS = """
+(function () {
+  var root = document.getElementById('npc-social');
+  if (!root || !window.fetch) { return; }
+  var base = (root.getAttribute('data-api-base') || '')
+    .replace(/\\/+$/, '');
+  var form = document.getElementById('npc-social-form');
+  var status = document.getElementById('npc-social-status');
+  var results = document.getElementById('npc-social-results');
+  var DISPLAY = {youtube: 'YouTube', instagram: 'Instagram',
+                 tiktok: 'TikTok'};
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g,
+      function (c) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;',
+                '"': '&quot;', "'": '&#39;'}[c];
+      });
+  }
+  function countsText(c) {
+    c = c || {};
+    function n(k) { return parseInt(c[k] || 0, 10) || 0; }
+    return n('registered') + ' registered, ' + n('new_version')
+      + ' new versions, ' + n('unchanged') + ' unchanged, '
+      + n('failed') + ' failed, ' + n('deferred') + ' deferred';
+  }
+  function card(o) {
+    if (!o || !o.connection || !o.connection.connection_id) {
+      return '';
+    }
+    var conn = o.connection;
+    var display = DISPLAY[conn.platform] || conn.platform || '';
+    var name = conn.account_display_name || '';
+    var h = '<div class="card npc-social-connection"><h3>'
+      + esc(display + (name ? ': ' + name : '')) + '</h3>'
+      + '<dl class="kv">'
+      + '<dt>Account</dt><dd><span class="mono">'
+      + esc(conn.platform_account_id) + '</span></dd>'
+      + '<dt>State</dt><dd>' + esc(conn.status) + '</dd>'
+      + '<dt>Connected</dt><dd>' + esc(conn.created_at) + '</dd>';
+    if (o.last_scan) {
+      h += '<dt>Last scan</dt><dd>'
+        + esc(o.last_scan.enumerated_at) + ', '
+        + (parseInt(o.last_scan.item_count || 0, 10) || 0)
+        + ' works</dd>';
+    } else {
+      h += '<dt>Last scan</dt><dd>No scan yet</dd>';
+    }
+    h += '</dl>';
+    var batches = o.batches || [];
+    if (batches.length) {
+      h += '<h4>Registration batches</h4><ul>';
+      batches.forEach(function (b) {
+        h += '<li><span class="mono">' + esc(b.batch_id)
+          + '</span> ' + esc(b.registered_at) + ': '
+          + esc(countsText(b.counts)) + '</li>';
+      });
+      h += '</ul>';
+      if (batches.length > 1) {
+        h += '<p>In total: ' + esc(countsText(o.totals))
+          + '.</p>';
+      }
+    } else {
+      h += '<p>No registrations yet from this connection.</p>';
+    }
+    if (o.provenance) {
+      h += '<p class="small">' + esc(o.provenance) + '</p>';
+    }
+    return h + '</div>';
+  }
+  function post(path, email) {
+    return fetch(base + path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email: email})
+    }).then(function (r) { return r.ok ? r.json() : null; });
+  }
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var email = document.getElementById('npc-social-email').value;
+    results.innerHTML = '';
+    status.textContent = 'Loading your connections...';
+    post('/v1/social/connections/list', email)
+      .then(function (doc) {
+        if (!doc || !doc.connections) {
+          status.textContent = 'Your connections could not be '
+            + 'loaded. The service may be unavailable; try again '
+            + 'shortly.';
+          return;
+        }
+        if (!doc.connections.length) {
+          status.textContent = 'No connections found for that '
+            + 'email.';
+          return;
+        }
+        status.textContent = '';
+        doc.connections.forEach(function (conn) {
+          post('/v1/social/connections/'
+               + encodeURIComponent(conn.connection_id)
+               + '/overview', email)
+            .then(function (overview) {
+              var h = card(overview);
+              if (h) { results.innerHTML += h; }
+            })
+            .catch(function () {});
+        });
+      })
+      .catch(function () {
+        status.textContent = 'Your connections could not be '
+          + 'loaded. The service may be unavailable; try again '
+          + 'shortly.';
+      });
+  });
+})();
+"""
+
+
+def social_view(api_base=PUBLIC_API_BASE):
+    """Your social connections: the lane's read-only view. The
+    visitor enters the email they connected with and sees their
+    connections, each one's last scan, and its registration
+    outcomes. This page exists only while the lane is enabled
+    (see social_enabled); it carries no write action."""
+    return """
+<h1>Social connections</h1>
+<p class="lede">The accounts you have connected to Verified by NPC, what the last scan of each one held, and what came of its registrations.</p>
+<p>Connecting an account shows control of that account on its platform. Registration is the start of verification, not the result.</p>
+<div id="npc-social" data-api-base="%s">
+<form class="npc-social-form" id="npc-social-form">
+<label>The email you connected with
+<input type="email" id="npc-social-email" required autocomplete="email"></label>
+<button type="submit">Show my connections</button></form>
+<p class="npc-social-status" role="status"></p>
+<div id="npc-social-results"></div>
+</div>
+<script>%s</script>""" % (esc(api_base), SOCIAL_CONNECTIONS_JS)
+
+
 def page(title, body, api_url):
     return """<!DOCTYPE html>
 <html lang="en">
@@ -875,7 +1327,7 @@ def page(title, body, api_url):
 <header class="top"><div class="wrap top-in">
 <a class="brand" href="/">Verified by NPC</a>
 <nav>
-<a href="/records">Records</a><a href="/search">Search</a><a href="/plugins">Plugins</a><a href="/api">API</a><a href="/verify">Verify yours</a><a href="/help">How it works</a>
+<a href="/records">Records</a><a href="/search">Search</a><a href="/plugins">Plugins</a><a href="/api">API</a><a href="/verify">Verify yours</a><a href="/help">How it works</a>%s
 </nav>
 </div></header>
 <main class="wrap">
@@ -887,7 +1339,10 @@ def page(title, body, api_url):
 </footer>
 %s
 </body>
-</html>""" % (esc(title), CSS, body, esc(api_url),
+</html>""" % (esc(title), CSS,
+              '<a href="/social">Social</a>' if social_enabled()
+              else "",
+              body, esc(api_url),
               chat_widget_html(api_url) if CHAT_WIDGET_ENABLED else "")
 
 
@@ -930,6 +1385,92 @@ def scope_chips(scope):
         out.append('<span>%s: %s</span>' % (esc(key), esc(val)))
     out.append('</div>')
     return "".join(out)
+
+
+def _kya_value_text(value):
+    """One KYA field value as plain display text."""
+    if value is None:
+        return "Not on this record."
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return ", ".join(_kya_value_text(v) for v in value)
+    if isinstance(value, dict):
+        bits = []
+        for key in sorted(value):
+            if key == "identity_signals" \
+                    and isinstance(value[key], list):
+                providers = ", ".join(
+                    str(s.get("provider", "")) for s in value[key]
+                    if isinstance(s, dict))
+                bits.append("linked identity checks: %s" % providers)
+            elif key == "detail":
+                continue
+            else:
+                bits.append("%s: %s" % (
+                    str(key).replace("_", " "),
+                    _kya_value_text(value[key])))
+        return "; ".join(bits) if bits else "Not on this record."
+    return str(value)
+
+
+def kya_html(rec):
+    """Render a record's KYA block (Know Your Agent), when it has one.
+
+    The API adds the block to agent records only while
+    NPC_KYA_FIELDS=1, so a record without the block renders exactly
+    as before: this returns an empty string and no section appears.
+    Display only: every value prints as the record carries it, and
+    a field the record does not carry prints as not on this record.
+    A reputation entry that carries the agent's rating prints the
+    rating with its rule version and basis counts; a standing
+    facts entry with no rating prints that plainly rather than
+    inventing one.
+    """
+    if not isinstance(rec, dict):
+        return ""
+    kya = rec.get("kya")
+    if not isinstance(kya, dict):
+        return ""
+    reputation = kya.get("reputation")
+    if isinstance(reputation, dict) \
+            and reputation.get("state") == "rated":
+        basis = reputation.get("based_on") or {}
+        count = basis.get("attestations") or 0
+        reputation_text = (
+            "Rating: %s (NPC agent rating rule v%s; based on "
+            "%s attestation%s, %s revoked)."
+            % (reputation.get("rating"),
+               reputation.get("rule_version"), count,
+               "" if count == 1 else "s",
+               basis.get("revocations") or 0))
+    elif isinstance(reputation, dict):
+        basis = reputation.get("based_on") or {}
+        reputation_text = (
+            "No reputation score yet. Standing on this record: %s."
+            % _kya_value_text(basis)) if basis else \
+            "No reputation score yet."
+    else:
+        reputation_text = _kya_value_text(reputation)
+    rows = [
+        ("Principal", _kya_value_text(kya.get("principal"))),
+        ("Permissions", _kya_value_text(kya.get("permissions"))),
+        ("Constraints", _kya_value_text(kya.get("constraints"))),
+        ("Reputation", reputation_text),
+    ]
+    items = "".join(
+        "<dt>%s</dt><dd>%s</dd>" % (esc(name), esc(text))
+        for name, text in rows)
+    return ('<h3>Know Your Agent</h3>'
+            '<dl class="kv">%s</dl>'
+            "<p class=\"small\">These fields name who this agent "
+            "acts for, what it may do, the bounds on that, and its "
+            "standing, so a reader can check them without guessing."
+            "</p>" % items)
 
 
 def registration_invitation():
@@ -1528,10 +2069,17 @@ def registration_result(rec, verification_request=None,
             not verification_request.get("verification_requested"):
         ask = request_verification_html(rec.get("record_id"),
                                         api_base)
+    # The identity panel container: filled by IDENTITY_PANEL_JS from
+    # the API's panel endpoint when the record has linked identity
+    # checks and the linking service is enabled; stays empty
+    # otherwise, so no section appears for records without links.
+    panel_slot = ('<div class="npc-identity-panel" '
+                  'data-record-id="%s" data-api-base="%s"></div>'
+                  % (esc(rec.get("record_id")), esc(api_base)))
     body = ('<div class="card"><h3>%s</h3>'
             '<p>A registration record, signed by NPC at issuance. '
             'Registration is not verification.</p>'
-            '<dl class="kv">%s</dl>%s%s%s'
+            '<dl class="kv">%s</dl>%s%s%s%s%s'
             '<p>Signed with key <span class="mono">%s</span>. The public '
             'keys are published in Search, so this record can be '
             'confirmed independently.</p></div>' % (
@@ -1540,6 +2088,8 @@ def registration_result(rec, verification_request=None,
                                   rec.get("checks_run"), "detail"),
                 _checks_list_html("Checks that have not run yet",
                                   rec.get("checks_not_run"), "reason"),
+                kya_html(rec) if rec.get("kind") == "agent" else "",
+                panel_slot,
                 ask,
                 esc(rec.get("key_id"))))
     return body
@@ -1566,22 +2116,25 @@ def record_result(rec, verification_request=None,
                 '<dt>Record ID</dt><dd class="mono">%s</dd>'
                 '<dt>Tested</dt><dd>%s</dd>'
                 '<dt>Findings</dt><dd>%s</dd>'
-                '</dl></div>' % (
+                '</dl>%s</div>' % (
                     esc(rec.get("subject_id")),
                     verdict_pill(rec.get("verdict")),
                     esc(rec.get("id")), esc(rec.get("tested_at")),
-                    esc(rec.get("findings_summary"))))
+                    esc(rec.get("findings_summary")),
+                    kya_html(rec)
+                    if rec.get("subject_type") == "agent" else ""))
     if "agent_id" in rec and "verdict" in rec:
         return ('<div class="card"><h3>agent %s</h3>'
                 '<dl class="kv">'
                 '<dt>Result</dt><dd>%s</dd>'
                 '<dt>Attestation</dt><dd class="mono">%s</dd>'
                 '<dt>Notes</dt><dd>%s</dd>'
-                '</dl></div>' % (
+                '</dl>%s</div>' % (
                     esc(rec.get("agent_id")),
                     verdict_pill(rec.get("verdict")),
                     esc(rec.get("attestation_id")),
-                    esc(rec.get("notes"))))
+                    esc(rec.get("notes")),
+                    kya_html(rec)))
     return ""
 
 
