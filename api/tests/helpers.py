@@ -98,3 +98,124 @@ class ApiTestCase(unittest.TestCase):
         self.assertTrue(ed25519.verify(pub, body_bytes, sig),
                         "signature verification failed")
         return parsed
+
+
+# -- Gate G1 test support: a software passkey --------------------------------
+#
+# A minimal WebAuthn authenticator that speaks just enough of the
+# protocol to drive the account ceremonies in tests: it builds real
+# attestation objects and real assertions, signed with keys the
+# verifier accepts (Ed25519 by default, ES256 for one test), using
+# the package's own primitives the same way npc_verify.webauthn
+# verifies them.
+
+import hashlib as _hashlib  # noqa: E402
+
+from npc_verify import ed25519 as _ed25519  # noqa: E402
+from npc_verify.c2pa import _cbor_encode as _cbor_enc  # noqa: E402
+from npc_verify.webauthn import b64url_encode as _b64e  # noqa: E402
+
+
+class SoftAuthenticator:
+    def __init__(self, rp_id, origin, alg=-8):
+        self.rp_id = rp_id
+        self.origin = origin
+        self.alg = alg
+        self.credential_id = os.urandom(16)
+        self.sign_count = 0
+        if alg == -8:
+            self._seed = os.urandom(32)
+            self._cose_key = {1: 1, 3: -8, -1: 6,
+                              -2: _ed25519.publickey(self._seed)}
+        elif alg == -7:
+            from npc_verify import cose as _cose
+            self._cose = _cose
+            params = _cose._curve_params("P-256")
+            self._n = params[5]
+            self._priv = int.from_bytes(os.urandom(32), "big") % self._n
+            x, y = _cose._ec_mul(params, self._priv,
+                                 (params[3], params[4]))
+            self._cose_key = {
+                1: 2, 3: -7, -1: 1,
+                -2: x.to_bytes(32, "big"), -3: y.to_bytes(32, "big")}
+        else:
+            raise ValueError("unsupported test alg %r" % (alg,))
+
+    def _sign(self, message):
+        if self.alg == -8:
+            return _ed25519.sign(self._seed, message)
+        cose = self._cose
+        params = cose._curve_params("P-256")
+        z = int.from_bytes(_hashlib.sha256(message).digest(), "big")
+        while True:
+            k = int.from_bytes(os.urandom(32), "big") % self._n
+            if not k:
+                continue
+            point = cose._ec_mul(params, k, (params[3], params[4]))
+            r = point[0] % self._n
+            if not r:
+                continue
+            s = (cose._inv(k, self._n)
+                 * (z + r * self._priv)) % self._n
+            if s:
+                return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+    def _client_data(self, ceremony, challenge_b64):
+        return json.dumps({
+            "type": ceremony, "challenge": challenge_b64,
+            "origin": self.origin, "crossOrigin": False,
+        }, separators=(",", ":")).encode()
+
+    def _auth_data(self, flags, attested=None):
+        out = _hashlib.sha256(self.rp_id.encode()).digest()
+        out += bytes([flags])
+        out += self.sign_count.to_bytes(4, "big")
+        if attested is not None:
+            out += b"\x00" * 16
+            out += len(self.credential_id).to_bytes(2, "big")
+            out += self.credential_id
+            out += _cbor_enc(self._cose_key)
+        return out
+
+    def create(self, options, fmt="none"):
+        """Answer a registration ceremony. Returns the payload the
+        sign-in page would POST to register/finish."""
+        client_data = self._client_data("webauthn.create",
+                                        options["challenge"])
+        auth_data = self._auth_data(0x01 | 0x04 | 0x40, attested=True)
+        att_stmt = {}
+        if fmt == "packed":
+            signed = auth_data + _hashlib.sha256(client_data).digest()
+            att_stmt = {"alg": self.alg, "sig": self._sign(signed)}
+        att_obj = _cbor_enc({"fmt": fmt, "attStmt": att_stmt,
+                             "authData": auth_data})
+        return {
+            "id": _b64e(self.credential_id),
+            "rawId": _b64e(self.credential_id),
+            "type": "public-key",
+            "response": {
+                "clientDataJSON": _b64e(client_data),
+                "attestationObject": _b64e(att_obj),
+            },
+        }
+
+    def get(self, options, count=None):
+        """Answer an authentication ceremony."""
+        if count is None:
+            self.sign_count += 1
+        else:
+            self.sign_count = count
+        client_data = self._client_data("webauthn.get",
+                                        options["challenge"])
+        auth_data = self._auth_data(0x01 | 0x04)
+        signed = auth_data + _hashlib.sha256(client_data).digest()
+        return {
+            "id": _b64e(self.credential_id),
+            "rawId": _b64e(self.credential_id),
+            "type": "public-key",
+            "response": {
+                "clientDataJSON": _b64e(client_data),
+                "authenticatorData": _b64e(auth_data),
+                "signature": _b64e(self._sign(signed)),
+            },
+        }

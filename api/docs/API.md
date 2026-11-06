@@ -120,6 +120,16 @@ A match returns the sanitized attestation summary: verdict, scope, tested
 dates, caveats, and the onchain anchor reference. Findings are sanitized;
 methodology is never exposed.
 
+A hash with no attestation may still match a public registration:
+registrations are indexed by the hash of their locator address and by
+the content hash recorded at intake (the lookup a browser extension
+performs for an image on a page). That answer has `matched: true` and
+`match_type: "registration"`, carries the registration's record ID,
+creator, title, and registered date, and states the record's own
+standing, "registered, checks pending". A registration is not a
+verification: no verdict is issued and no verification mark exists for
+it.
+
 No match → `404 {"verdict": "unknown", "matched": false}`. An
 unverifiable claim is reported as unknown, never as false.
 
@@ -278,6 +288,188 @@ everything including the fleet stream (writes there still need an
 issuer key). Reads are wider than writes: a key reads streams on its
 branch in either direction (an agent reads its team and company streams)
 plus the fleet stream. Every memory carries its verification status.
+
+### Onchain anchoring (Base)
+
+Registration records gain a second, independent witness: the
+registry periodically batches the registrations it has not yet
+anchored, computes one Merkle root over the records' canonical
+hashes, and writes that root to Base mainnet in a single
+transaction. The lane is off unless `NPC_ANCHOR_ENABLED=1`; the
+anchoring key lives only in the Lambda environment
+(`NPC_ANCHOR_PRIVATE_KEY`), the same channel as the signing seed.
+
+**Verify a record's anchor yourself.** `GET /v1/records/{id}` on a
+registration returns a read-time `anchor` section (the stored
+record is never edited). When it says `"status": "anchored"`:
+
+1. Drop the `anchor` key from the body. Canonicalize the rest
+   (NPC-JCS-v1, the same canonical form the record's signature
+   uses) and take SHA-256: the digest is the section's `leaf_hash`.
+   The hash input is the public record only; the registrant email
+   is a server-side store field and is never in a record.
+2. Walk `proof`: each step names a sibling hash and its side;
+   SHA-256 the pair in order, leaf level first. The walk ends at
+   `merkle_root`.
+3. Open the transaction (`explorer_url`) on Basescan and read its
+   input: bytes 0..12 are the ASCII magic `NPC-ANCHOR-V2`, bytes
+   13..45 are the batch root, bytes 45..110 are the signer
+   wallet's batch signature. The root equals `merkle_root`.
+4. Check the authorship: rebuild the commitment statement
+   (`NPC Verify anchor batch` / `Batch: <batch_id>` /
+   `Merkle root: <root>` / `Chain: Base (8453)`) and verify the
+   signature recovers to the section's `signer_wallet`, which must
+   be the signer authorized at the batch's time (the rotation
+   history is public at `GET /v1/anchor/authority`).
+
+Anchoring is a public timestamp, never a verification: it proves
+the record existed in that exact form at the block's time, and it
+never changes the record's status. Before a record's batch lands,
+the section honestly says `not_anchored` or `anchor_pending`. With
+the lane off and no anchor data on record, the section is absent
+entirely.
+
+**Authority: two wallets, two jobs.** The OWNER wallet is fresh,
+created for this lane; its key lives only in the Lambda
+environment (`NPC_ANCHOR_PRIVATE_KEY`), and it submits and relays
+every anchor transaction. The onchain sender is therefore the
+owner wallet. The SIGNER wallet is Bayo's main NPC wallet (the
+legacy wallet, in his MetaMask since 2017); its key never comes
+near this service. Every batch carries the signer wallet's EIP-191
+signature over the batch commitment, obtained from Bayo through
+MetaMask and carried inside the anchor transaction itself, so the
+legacy wallet's authorship rides in every batch as a verified
+signature. The owner wallet is also the sole rotation authority:
+it alone can authorize, revoke, or rotate the signer, by an
+owner-signed rotation notice (below). A compromised signer is
+recoverable (the owner rotates it; its past batches stay provable
+against the public rotation history), and a compromised signer
+cannot install its own successor, because rotation takes the
+owner key it does not have. (If the sender itself must ever be
+the legacy address, the fallback is manual MetaMask submission
+per batch; that is a product decision, not built here.)
+
+### POST /v1/internal/anchor/run
+
+**Issuer role.** One anchoring pass: finalize an open batch; or
+submit a prepared batch that carries its signer signature; or
+prepare the next batch (every unanchored registration, up to
+`NPC_ANCHOR_BATCH_MAX`, default 500), which then stops at
+`awaiting_signature` with the exact commitment statement the
+signer signs. The batch and its signed transaction persist before
+any broadcast, so a crash recovers by reading the chain back. The
+summary answers honestly in every state: `anchored`,
+`submitted`, `awaiting_signature`, `unfunded` (the owner wallet
+cannot cover the fee yet; the prepared batch waits), `idle`,
+`failed` (records return to the pool), `disabled`,
+`not_configured`, `submit_error`, `chain_error`. The scheduled
+caller is whatever cron the operator points at this endpoint.
+
+### POST /v1/internal/anchor/sign
+
+**Issuer role.** Records the signer wallet's signature for a
+prepared batch. Body: `batch_id` and `signature` (the EIP-191
+personal signature over the commitment statement). The signature
+records only when it recovers to the currently authorized signer:
+400 `signer_not_authorized` for a genuine signature from any
+other wallet, 400 `invalid_signature` for a malformed one, 404
+`unknown_batch`, 400 `batch_locked` once the batch is submitted.
+On success the next run pass submits the batch.
+
+### GET /v1/internal/anchor/status
+
+**Issuer role.** Lane state, the owner wallet's address and
+balance, batch counts, records anchored and waiting, the open
+batch (with its commitment statement while it awaits a
+signature), and the authority state: `signer_configured`,
+`authorized_signer`, `rotations_recorded`.
+
+### POST /v1/internal/anchor/rotate-signer
+
+**Issuer role.** Rotates the authorized signer. Body:
+`to_signer_address` and an optional `note`. The endpoint builds a
+rotation notice (type `npc.anchor.signer_rotation`, version 1,
+`from_signer`, `to_signer`, `issued_at`, `note`), signs it with
+the OWNER key (EIP-191 over the notice's canonical NPC-JCS-v1
+bytes), verifies its own signature, and only then records it.
+Rotating to the current signer answers 400 `invalid_rotation`;
+with no owner key configured, 409 `owner_not_configured`.
+
+### GET /v1/anchor/authority
+
+**Public.** The authority statement: `owner_wallet`,
+`authorized_signer`, and `signer_rotations`, the complete list of
+owner-signed rotation notices. Public because the authority claim
+must be inspectable by the same people who verify anchor proofs.
+With the lane off it fails closed (404).
+
+**Approved next layer (not built): wallet claiming.** A
+registrant will be able to claim a record with their own wallet:
+the wallet signs a claim statement and the record gains a
+claimed-by attestation naming that wallet. Claiming changes
+nothing about the record's status or its anchor.
+
+## Unified accounts (Gate G1)
+
+One account per person, rooted at an email address, shared by the
+main site, this API's web surface, and the desktop app (design
+decided 2026-10-24). These endpoints authenticate with the
+account **session token** (`Authorization: Bearer npc_sess_...`),
+never with an API key: the two credential families are separate,
+and neither is accepted in the other's place. Every secret at
+rest (session tokens, email-link tokens, handoff secrets,
+recovery codes) is stored only as a SHA-256 hash.
+
+- `GET /auth/sign-in` — the browser sign-in page (HTML, unsigned:
+  a page is not a record). Runs the passkey ceremonies, the email
+  link request, and recovery code entry, and shows the account's
+  signed-in devices after a sign-in.
+- `POST /v1/auth/email/request` `{email, handoff_id?}` — creates
+  the account if needed and emails a one-time sign-in link
+  (15 minutes, single use; a fresh request retires earlier links).
+  The answer never reveals whether the account already existed.
+- `POST /v1/auth/email/redeem` `{token, surface?, device_label?}`
+  — trades the link for a device session. On an account that
+  already holds passkeys this is also the support-assisted
+  recovery path: control of the email is the proof, and the
+  redemption is written to the account's event log.
+- `POST /v1/auth/passkeys/register/begin` (session) and
+  `POST /v1/auth/passkeys/register/finish` (session) — WebAuthn
+  registration. The first passkey on an account also returns ten
+  one-time **recovery codes**, shown once and stored as hashes.
+- `POST /v1/auth/passkeys/authenticate/begin` `{email?}` and
+  `POST /v1/auth/passkeys/authenticate/finish` — WebAuthn
+  authentication (discoverable when no email is given). Verified
+  server-side: challenge, origin allowlist, RP hash, user
+  presence, signature (ES256, EdDSA, RS256), and signature-counter
+  monotonicity. Attestation formats accepted at registration:
+  `none` and `packed`.
+- `POST /v1/auth/recovery/redeem` `{email, code, surface?,
+  device_label?}` — trades one recovery code for a session. The
+  failure shape is identical for an unknown email and a wrong
+  code.
+- `GET /v1/auth/me` (session) — the account and the calling
+  session.
+- `GET /v1/auth/sessions` (session) — every live device session
+  on the account, the caller's own flagged `current`.
+- `POST /v1/auth/sessions/revoke` (session) `{session_id}` —
+  revoke any of the account's sessions from any surface.
+- `POST /v1/auth/sign-out` (session) — revokes the caller's own
+  session.
+- `POST /v1/auth/handoff` `{device_label?}` — the desktop app
+  opens a handoff and sends the user to the returned
+  `authorize_url` in their browser. `POST /v1/auth/handoff/poll`
+  `{handoff_id, secret}` reports `pending`, `ready`, `consumed`,
+  or `expired`; `POST /v1/auth/handoff/exchange` `{handoff_id,
+  secret}` trades a ready handoff, once, for the app's own
+  desktop device session. The secret never leaves the app; the
+  browser only ever sees the handoff id.
+
+Configuration is environment only: `NPC_AUTH_RP_ID`,
+`NPC_AUTH_RP_NAME`, `NPC_AUTH_ORIGINS`, `NPC_AUTH_SITE_BASE`,
+`NPC_AUTH_SESSION_TTL_DAYS`. The email link rides the mailer's
+own configuration; locally, `NPC_MAIL_STUB=1` (with
+`NPC_MAIL_STUB_FILE`) carries it end to end without SES.
 
 ## 4. Errors — fail closed
 

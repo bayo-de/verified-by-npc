@@ -78,6 +78,51 @@ EMAIL_DAILY_CAP = 10
 IP_DAILY_CAP = 50
 CAP_WINDOW = timedelta(hours=24)
 
+# Content-registration lanes (Bayo's directive, 2026-11-01): POST
+# /v1/register/content runs two lanes. The OPERATOR lane is NPC
+# itself: a request carrying a valid issuer-role API key skips the
+# submission caps entirely (unlimited for us). The key is the
+# credential; the unauthenticated creator_email field never grants
+# the bypass, and an absent or invalid key simply stays on the
+# public lane (the endpoint is public; a bad key is not an error
+# there). The PUBLIC lane is tiered by the locked pricing tiers:
+# the per-email cap below, per rolling CAP_WINDOW, and a per-IP
+# abuse floor of max(IP_DAILY_CAP, the tier's email cap), so a paid
+# tier is never throttled below its own allowance by the shared
+# floor. The "free" tier IS EMAIL_DAILY_CAP (registration_tier_cap
+# reads the constant live, so the two can never drift). Every other
+# lane (agent registration, verification requests, identity links,
+# social) keeps the flat caps through cap_exceeded() below.
+REGISTRATION_TIER_PAID_EMAIL_CAPS = {
+    "starter": 100,    # $25 tier
+    "growth": 500,     # $100 tier
+    "scale": 2500,     # $500 tier
+}
+REGISTRATION_TIERS = ("free", "starter", "growth", "scale")
+
+
+def registration_tier_cap(tier):
+    """Per-email content-registration cap for a pricing tier."""
+    if tier in REGISTRATION_TIER_PAID_EMAIL_CAPS:
+        return REGISTRATION_TIER_PAID_EMAIL_CAPS[tier]
+    return EMAIL_DAILY_CAP
+
+
+def registration_tier_for_email(store, email):
+    """The pricing tier governing a public registrant email.
+
+    Returns one of REGISTRATION_TIERS. Today this returns "free"
+    for every email, deliberately: paid state in the credits
+    system is keyed to redeem CODES, not to emails (the Verifier
+    Pass is accountless by design; the code is the credential),
+    and the $100/$500 tiers have no product or subscription
+    representation in the store at all, so there is no email ->
+    tier binding to read. This function is the single seam: when
+    an account/tier source lands, it resolves here and every cap
+    below follows. It never infers a tier from the email string.
+    """
+    return "free"
+
 # Retention (audit item D6, 2026-10-15): submitter emails are kept
 # server-side for the submission caps only. The stated retention is
 # 12 months: past that, the raw email is purged by the store-layer
@@ -931,6 +976,53 @@ def cap_exceeded(store, email, client_ip, now_iso):
     if client_ip and store.count_registrations_since(
             "ip", client_ip, since) >= IP_DAILY_CAP:
         return "ip"
+    return None
+
+
+def _cap_retry_after(store, dimension, value, since_iso, now):
+    """Seconds until the oldest counted registration in the window
+    ages out: the honest retry hint for a cap 429. Bounded to
+    [1, CAP_WINDOW]; falls back to the full window when the store
+    cannot name an oldest row (the cap count said the window is
+    full, so waiting out the window is the truthful bound)."""
+    oldest = store.oldest_registration_since(dimension, value,
+                                             since_iso)
+    if oldest is None:
+        return int(CAP_WINDOW.total_seconds())
+    oldest_dt = datetime.fromisoformat(oldest.replace("Z", "+00:00"))
+    remaining = (oldest_dt + CAP_WINDOW - now).total_seconds()
+    seconds = int(remaining)
+    if remaining > seconds:
+        seconds += 1
+    return max(1, min(seconds, int(CAP_WINDOW.total_seconds())))
+
+
+def content_cap_status(store, email, client_ip, now_iso, tier="free"):
+    """Public-lane cap check for POST /v1/register/content.
+
+    Returns None when the submission is within caps, else
+    {"dimension": "email"|"ip", "retry_after_seconds": int} with
+    the real wait until the oldest counted registration for the
+    dimension that capped ages out of the rolling window. The
+    per-email cap is the tier's; the per-IP floor is
+    max(IP_DAILY_CAP, the tier's email cap). The operator lane
+    never reaches this function (the server skips caps entirely
+    for a valid issuer key).
+    """
+    email_cap = registration_tier_cap(tier)
+    ip_cap = max(IP_DAILY_CAP, email_cap)
+    now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+    since = (now - CAP_WINDOW).isoformat(timespec="seconds")
+    if store.count_registrations_since("email", email, since) \
+            >= email_cap:
+        return {"dimension": "email",
+                "retry_after_seconds": _cap_retry_after(
+                    store, "email", email, since, now)}
+    if client_ip and store.count_registrations_since(
+            "ip", client_ip, since) >= ip_cap:
+        return {"dimension": "ip",
+                "retry_after_seconds": _cap_retry_after(
+                    store, "ip", client_ip, since, now)}
     return None
 
 

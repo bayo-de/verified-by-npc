@@ -165,6 +165,297 @@ paths:
         '503':
           $ref: '#/components/responses/DetectorUnavailable'
 
+  /credits/packs:
+    get:
+      operationId: creditPacks
+      summary: Check packs on sale for NPC Verify credits
+      description: |
+        Public. Pack sizes and prices are API configuration
+        (NPC_CREDITS_PACKS_JSON), with Bayo's decided launch offers
+        as the built-in defaults: the Verifier Pass (kind "access",
+        $25 a month: unlimited standard registry checks while the
+        subscription runs, plus a monthly grant of 1,000 whose 400
+        AI generation checks are the counted allowance),
+        100 checks for $9 (headline pack),
+        and 250 checks for $19 (upsell pack). Every entry is on
+        sale. checkout_available reports whether the Stripe rail is
+        configured on this deployment.
+      security: []
+      responses:
+        '200':
+          description: Pack list and checkout availability, signed
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditPacks'
+  /credits/checkout:
+    post:
+      operationId: creditCheckout
+      summary: Start a Stripe Checkout session for one pack
+      description: |
+        Public. Creates a pending purchase and returns the Stripe
+        Checkout URL. One-time packs run in payment mode; the
+        Verifier Pass (kind "access") runs in subscription mode and
+        bills monthly. The redeem code is minted only when Stripe
+        reports payment through the webhook; nothing is granted at
+        session creation. Answers 503 payments_not_configured while
+        the Stripe rail is unconfigured.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreditCheckoutRequest'
+      responses:
+        '201':
+          description: Checkout session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditCheckoutCreated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          description: Payments rail not configured
+  /credits/stripe-webhook:
+    post:
+      operationId: creditStripeWebhook
+      summary: Stripe webhook receiver (checkout and subscription events)
+      description: |
+        Authenticated by the Stripe-Signature header, verified with
+        HMAC-SHA256 over the exact raw request bytes against the
+        configured webhook secret; no NPC API key is involved. On
+        checkout.session.completed the purchase is marked paid and
+        its redeem code is minted exactly once (replays return the
+        original code) and emailed when an address is known and the
+        mailer is enabled. Every minted code, pack or Pass, also
+        receives a personal referral code (stored only as a hash).
+        When the purchase was carried in with a referral code, the
+        completion attributes the new code to that referral code's
+        owner: the buyer receives 10 bonus checks, the
+        referrer receives 10 bonus checks for the link
+        and 100 more for the buyer's first paid purchase, exactly
+        once per referred user (a replayed completion grants
+        nothing twice), with one referrer's referral bonuses
+        capped at 500 checks per calendar month. For a Verifier Pass purchase, activation
+        also opens the subscription and lands the first monthly
+        grant of checks. On invoice.paid a renewal grant lands on
+        the subscriber's code, keyed by the invoice id so a replay
+        grants exactly once, and only while the subscription is
+        active. On customer.subscription.deleted future grants stop;
+        granted checks stay spendable until their expiry.
+        checkout.session.expired closes a pending purchase. Other
+        event types are acknowledged and ignored.
+      security: []
+      responses:
+        '200':
+          description: Event received
+        '400':
+          description: Signature did not verify; nothing was minted
+        '503':
+          description: Payments rail not configured
+  /credits/checkout-status:
+    get:
+      operationId: creditCheckoutStatus
+      summary: Purchase status and one-time code delivery
+      description: |
+        Public, keyed by the unguessable Stripe session id. When
+        the purchase is paid, the first poll delivers the plaintext
+        redeem code and wipes the stored copy; later polls report
+        the delivery without the code.
+      security: []
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Purchase status; code included exactly once
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditCheckoutStatus'
+        '404':
+          description: Unknown session
+  /credits/redeem:
+    post:
+      operationId: creditRedeem
+      summary: Validate a redeem code and read its balance
+      description: |
+        Public; the code itself is the credential (100 bits of
+        entropy, stored server-side only as a SHA-256 hash). The
+        first presentation stamps the code as redeemed. Balances
+        come from the server ledger, never from the client.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreditCodeRequest'
+      responses:
+        '200':
+          description: Code balance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditBalance'
+        '404':
+          description: Code not found
+  /credits/balance:
+    post:
+      operationId: creditBalance
+      summary: Read a code's balance without changing anything
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreditCodeRequest'
+      responses:
+        '200':
+          description: Code balance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditBalance'
+        '404':
+          description: Code not found
+  /credits/consume:
+    post:
+      operationId: creditConsume
+      summary: Charge one credit for one new image
+      description: |
+        Public; the code is the credential. Called by the extension
+        only after a signature-verified registry answer about an
+        image, so a failed or unreachable check never reaches this
+        route and never consumes. The ledger keys charges by
+        (code, image_identity) with a uniqueness guarantee: a repeat
+        call for the same image answers duplicate=true and charges
+        nothing. The kind field selects what is being charged:
+        "standard" (the default) is a registry check; "ai" is an AI
+        generation check, which a Verifier Pass grant's AI
+        sub-allowance funds first, bonus grants (referral and
+        registration) fund after it up to their balances, and
+        the code's one-time pack balance funds last, one check
+        per AI check with no sub-cap beyond the pack size.
+        Pass grants are drawn oldest first and
+        expire at the end of the month after the grant month. At
+        zero balance the answer is 402 no_credits; when checks
+        remain but none can fund an AI check, the answer is 402
+        no_ai_credits. While a code's Verifier Pass subscription
+        is active, standard charges are covered by the Pass itself
+        (registry checks are unlimited for subscribers): the charge
+        is recorded and no pool is drawn. A per-code anti-scripting
+        backstop answers 429 rate_limited when a code's charged
+        consumes inside the trailing hour pass a few hundred;
+        duplicate answers never count toward it.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreditConsumeRequest'
+      responses:
+        '200':
+          description: Charged, or duplicate with no charge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditConsumeResult'
+        '402':
+          description: No credits remain on the code
+        '404':
+          description: Code not found
+        '429':
+          description: The code's charged consumes inside the trailing hour passed the anti-scripting backstop; nothing was charged
+  /credits/referral/lookup:
+    post:
+      operationId: creditReferralLookup
+      summary: Read a code's own referral code and referral record
+      description: |
+        Public; the redeem code is the credential. Every code
+        carries a personal referral code, a separate string stored
+        server-side only as a SHA-256 hash. The plaintext is
+        delivered exactly once, the way the redeem code is: the
+        first lookup returns it in referral_code (with
+        referral_code_included true) and wipes the stored copy;
+        later lookups return referral_code as null and report the
+        record instead: how many users this code has referred, the
+        referral bonus it earned inside the current calendar
+        month, and whether this code was itself referred.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreditCodeRequest'
+      responses:
+        '200':
+          description: Referral code (exactly once) and referral record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditReferralLookup'
+        '404':
+          description: Code not found
+  /credits/referral/link:
+    post:
+      operationId: creditReferralLink
+      summary: Attribute a code to a referral code and land both bonuses
+      description: |
+        Public; the redeem code is the credential. Attributes the
+        presented code to the owner of referral_code, once: a user
+        can be referred exactly once, and the referral row is the
+        idempotency record, so repeats answer already_referred and
+        grant nothing. On a link, the referee receives 10 bonus
+        standard checks and the referrer receives 10 bonus
+        standard checks for the link itself plus 100 more for the
+        referee's first paid purchase, the referrer's two bonuses
+        trimmed together so one referrer's referral bonuses never
+        pass 500 checks in a calendar month. A code exists only
+        because a paid purchase minted it, so linking attributes
+        that first purchase, the same moment a checkout-carried
+        referral code attributes at webhook completion. Bonus
+        checks are grants with no AI sub-allowance of their own;
+        an AI generation check may still spend a bonus grant's
+        whole remaining balance once any Pass sub-allowance is
+        drawn (Bayo, 2026-10-28: the monthly referral cap bounds
+        how much bonus balance can be earned, and he accepted AI
+        checks drawing on it inside that cap). Bonus grants
+        expire under the same one-month rollover rule as
+        Verifier Pass grants. Self-referral (the referral
+        code belongs to the presented code, or both codes carry
+        the same purchaser email) answers outcome self_referral
+        and records and grants nothing.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreditReferralLinkRequest'
+      responses:
+        '200':
+          description: Linked, already referred, or self-referral; the balance body rides along except on self-referral
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditReferralLinkResult'
+        '404':
+          description: Code not found, or referral code not found
+
   /products/{tag_id}:
     get:
       operationId: getProduct
@@ -752,6 +1043,40 @@ paths:
         here, returning the stored signed receipt; with the lane off
         a receipt ID answers exactly as it did before the lane
         existed. Unknown IDs fail closed.
+
+        While the anchoring lane is enabled (NPC_ANCHOR_ENABLED=1),
+        a registration record also carries a read-time "anchor"
+        section (the stored record itself is never edited). The
+        section reports the record's Base anchoring state:
+        "not_anchored", "anchor_pending" (in a batch that has not
+        landed), or "anchored" with the batch Merkle root, the
+        record's leaf hash and Merkle proof, the anchor transaction
+        hash, block number and timestamp, and a Basescan link. The
+        anchored state also publishes the authority layer: the
+        signer wallet's EIP-191 batch signature
+        ("batch_signature"), the signer it recovers to
+        ("signer_wallet"), and the owner wallet that submitted the
+        transaction ("owner_wallet"). Two wallets, two jobs: the
+        fresh owner wallet submits every anchor and alone can
+        rotate the signer; the signer wallet (Bayo's legacy NPC
+        wallet) signs every batch commitment in its own MetaMask,
+        and its key never touches this service.
+        Verification recipe: drop the "anchor" key, canonicalize
+        the remaining body (NPC-JCS-v1), SHA-256 it, and check the
+        digest equals "leaf_hash"; walk "proof" (SHA-256 over
+        sibling pairs, "position" naming the sibling's side) to
+        "merkle_root"; read the anchor transaction's input on
+        Basescan and check bytes 13..45 equal the root and bytes
+        45..110 are the batch signature; rebuild the commitment
+        statement ("NPC Verify anchor batch" / "Batch: <batch_id>"
+        / "Merkle root: <root>" / "Chain: Base (8453)") and check
+        the signature recovers to "signer_wallet", which must be
+        the signer authorized at the batch's time (the rotation
+        history is public at GET /v1/anchor/authority). Anchoring
+        is a public timestamp, never a verification: the record's
+        own status is unchanged by it. With the lane off and no
+        anchor data on record, the section is absent and the answer
+        is byte-identical to before the lane existed.
       security: []
       parameters:
         - name: id
@@ -1440,6 +1765,224 @@ paths:
         '429': { description: Lane attempt cap reached. }
         '503': { description: Lane not enabled, or the Spotify app not configured. }
 
+  /internal/anchor/run:
+    post:
+      operationId: anchorRun
+      summary: Run one onchain anchoring pass (issuer only)
+      description: |
+        INTERNAL: issuer role. One pass of the anchoring engine:
+        finalize an open batch if one is waiting on its receipt;
+        submit a prepared batch once it carries the signer
+        wallet's signature; otherwise collect every registration
+        not yet anchored (up to NPC_ANCHOR_BATCH_MAX, default 500)
+        into a new batch, compute one Merkle root over the
+        records' canonical hashes, and stop at "awaiting_signature"
+        with the exact commitment statement the signer signs in
+        MetaMask. A signed batch is submitted as one Base
+        transaction from the OWNER wallet (the fresh server
+        wallet) whose calldata carries the root AND the signer's
+        signature ("NPC-ANCHOR-V2" magic, the 32-byte root, the
+        65-byte signature, then the batch id), so the transaction
+        sender is the owner wallet while the legacy signer
+        wallet's authorship rides inside the batch. The batch and
+        the signed transaction are persisted before any broadcast,
+        so a crash recovers by reading the chain back: no record
+        is ever anchored twice and no batch is lost. The summary
+        answers honestly in every state: "anchored" (with tx
+        hash, block, root), "submitted" (broadcast, waiting),
+        "awaiting_signature", "unfunded" (the owner wallet cannot
+        cover the fee yet; the batch waits, nothing was
+        broadcast), "idle", "failed" (the transaction failed
+        onchain; its records return to the pool), "disabled",
+        "not_configured", "submit_error", or "chain_error". The
+        scheduled caller is whatever cron the operator points at
+        this endpoint; the runbook names the fleet scheduler.
+      responses:
+        '200':
+          description: The pass summary, signed
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Unauthorized'
+
+  /internal/anchor/sign:
+    post:
+      operationId: anchorSign
+      summary: Record the signer wallet's batch signature (issuer only)
+      description: |
+        INTERNAL: issuer role. The body carries "batch_id" and
+        "signature": the signer wallet's EIP-191 personal
+        signature over the batch commitment statement (see the run
+        endpoint's "awaiting_signature" summary for the exact
+        text). The signature is recorded ONLY when it recovers to
+        the currently authorized signer (the configured signer,
+        initially Bayo's legacy NPC wallet, or the destination of
+        the newest owner-signed rotation). A genuine signature
+        from any other wallet answers 400 signer_not_authorized; a
+        malformed one answers 400 invalid_signature; an unknown
+        batch answers 404 unknown_batch; a batch already submitted
+        answers 400 batch_locked. On success the next run pass
+        submits the batch from the owner wallet.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: The recorded signature summary, signed
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Unknown batch ID
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /internal/anchor/status:
+    get:
+      operationId: anchorStatus
+      summary: Anchoring lane state and authority state (issuer only)
+      description: |
+        INTERNAL: issuer role. Reports the lane (enabled,
+        configured), the owner wallet address and its balance when
+        the chain answers, batch counts by status, records
+        anchored and waiting, and the open batch if one is in
+        flight (with "awaiting_signature" and the commitment
+        statement when it waits for the signer). The authority
+        state rides along: "signer_configured" (NPC_ANCHOR_
+        SIGNER_ADDRESS or the built-in legacy default),
+        "authorized_signer" (after any owner rotations), and
+        "rotations_recorded".
+      responses:
+        '200':
+          description: The anchoring status, signed
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Unauthorized'
+
+  /internal/anchor/rotate-signer:
+    post:
+      operationId: anchorRotateSigner
+      summary: Rotate the batch signer, owner-signed (issuer only)
+      description: |
+        INTERNAL: issuer role. Rotates the authorized batch
+        signer. The rotation authority is the OWNER wallet: the
+        fresh wallet whose key lives only in this deployment's
+        Lambda environment (NPC_ANCHOR_PRIVATE_KEY). The endpoint
+        builds a rotation notice (type "npc.anchor.signer_
+        rotation", version 1, "from_signer", "to_signer",
+        "issued_at", optional "note") and signs it with the owner
+        key (EIP-191 over the notice's canonical NPC-JCS-v1
+        bytes), verifies its own signature, and only then records
+        it; the recorded notices are the inspectable rotation
+        history, served publicly at GET /v1/anchor/authority. The
+        signer wallet can never rotate itself: that takes the
+        owner key it does not have. The body carries
+        "to_signer_address" (and an optional "note"). Rotating to
+        the current signer answers 400 invalid_rotation; with no
+        owner key configured the endpoint answers 409
+        owner_not_configured and records nothing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: The recorded rotation, signed
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: No owner key configured on this deployment
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /anchor/authority:
+    get:
+      operationId: anchorAuthority
+      summary: The anchoring authority statement (public)
+      description: |
+        PUBLIC: no API key. The authority behind every anchor:
+        "owner_wallet" (the fresh wallet that submits every anchor
+        transaction and alone can rotate the signer),
+        "authorized_signer" (the wallet whose EIP-191 signature
+        every batch must carry; initially Bayo's legacy NPC
+        wallet), and "signer_rotations", the complete list of
+        owner-signed rotation notices. Public because the
+        authority claim must be inspectable by the same people who
+        verify anchor proofs. With the anchoring lane off the
+        answer fails closed (404), like any unknown resource.
+      security: []
+      responses:
+        '200':
+          description: The authority statement, signed
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Anchoring lane off (fail-closed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnknownVerdict'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1581,6 +2124,218 @@ components:
           type: string
           pattern: '^[0-9a-f]{64}$'
           description: SHA-256 hex of the normalized claim text
+
+    CreditPack:
+      type: object
+      required: [id, label, checks, price_cents, currency, kind, on_sale]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        checks:
+          type: integer
+        price_cents:
+          type: integer
+          description: Integer cents; money never travels as a float
+        currency:
+          type: string
+        kind:
+          type: string
+          enum: [pack, access]
+          description: '"pack" is a one-time grant. "access" is the Verifier Pass, a monthly subscription; for it, checks is the monthly grant size.'
+        ai_checks:
+          type: integer
+          description: Access kind only; how many of each monthly grant may be spent on AI generation checks
+        registry_unlimited:
+          type: boolean
+          description: Access kind only; true while the subscription runs, standard registry checks are unlimited and draw no pool
+        interval:
+          type: string
+          description: Access kind only; the billing interval ("month")
+        on_sale:
+          type: boolean
+
+    CreditPacks:
+      type: object
+      required: [packs, packs_source, checkout_available]
+      properties:
+        packs:
+          type: array
+          items:
+            $ref: '#/components/schemas/CreditPack'
+        packs_source:
+          type: string
+          enum: [default, environment]
+        checkout_available:
+          type: boolean
+
+    CreditCheckoutRequest:
+      type: object
+      required: [pack_id]
+      properties:
+        pack_id:
+          type: string
+        email:
+          type: string
+          description: Optional; used for the code receipt email
+        referral_code:
+          type: string
+          description: Optional; another user's referral code. Only its hash is stored on the purchase; when the payment completes, the new code is attributed to its owner and both referral bonuses land exactly once
+
+    CreditCheckoutCreated:
+      type: object
+      required: [session_id, checkout_url, pack_id]
+      properties:
+        session_id:
+          type: string
+        checkout_url:
+          type: string
+        pack_id:
+          type: string
+
+    CreditCheckoutStatus:
+      type: object
+      required: [status, pack_id]
+      properties:
+        status:
+          type: string
+          enum: [pending, paid, expired]
+        pack_id:
+          type: string
+        checks:
+          type: integer
+        code:
+          type: string
+          description: Present exactly once, on the first poll after payment
+        delivered_with_this_response:
+          type: boolean
+
+    CreditCodeRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          description: The redeem code as shown to the buyer; separators and case are normalized server-side
+
+    CreditBalance:
+      type: object
+      required: [pack_id, status, credits_total, credits_used, balance]
+      properties:
+        pack_id:
+          type: string
+        status:
+          type: string
+          enum: [active, exhausted, revoked]
+        credits_total:
+          type: integer
+          description: The code row's own one-time counters (pack codes); Pass codes hold their balance in grants instead
+        credits_used:
+          type: integer
+        grant_balance:
+          type: integer
+          description: Spendable checks held in live Verifier Pass grants (0 for pack codes)
+        ai_balance:
+          type: integer
+          description: The part of the balance an AI generation check may spend (live Pass grants' AI sub-allowances plus bonus grants' remaining balances plus the code's own one-time pack balance)
+        balance:
+          type: integer
+          description: Total spendable balance; the code counters plus the live grant balance
+        subscription_status:
+          type: string
+          nullable: true
+          description: '"active" or "canceled" for a Verifier Pass code; null for a pack code'
+        registry_unlimited:
+          type: boolean
+          description: True while a Verifier Pass subscription is active; standard registry checks are then covered by the Pass and draw no pool, and balance is the finite amount that stands if the subscription ends
+
+    CreditConsumeRequest:
+      type: object
+      required: [code, image_identity]
+      properties:
+        code:
+          type: string
+        image_identity:
+          type: string
+          description: 'The extension image identity: "sha256:<hex>" of the image bytes, or "url-sha256:<hex>" of its address when bytes could not be read'
+        claim_hash:
+          type: string
+          description: Optional 64-hex claim hash the check resolved
+        kind:
+          type: string
+          enum: [standard, ai]
+          default: standard
+          description: '"standard" is a registry check. "ai" is an AI generation check, funded only by a Verifier Pass grant''s AI sub-allowance.'
+
+    CreditConsumeResult:
+      allOf:
+        - $ref: '#/components/schemas/CreditBalance'
+        - type: object
+          required: [charged, duplicate]
+          properties:
+            charged:
+              type: boolean
+            duplicate:
+              type: boolean
+            error:
+              type: string
+              description: Present on the 402 answer as no_credits, or as no_ai_credits when checks remain but none can fund an AI generation check; present on the 429 answer as rate_limited when the anti-scripting backstop trips
+
+    CreditReferralLookup:
+      type: object
+      required: [referral_code_included, referred_count,
+                 referral_bonus_this_month, referred_by]
+      properties:
+        referral_code:
+          type: string
+          nullable: true
+          description: The code owner's personal referral code, present exactly once (on the first lookup); null after that one-time delivery
+        referral_code_included:
+          type: boolean
+          description: True when this response carries the referral code (the one-time delivery)
+        referred_count:
+          type: integer
+          description: Users this code has referred so far
+        referral_bonus_this_month:
+          type: integer
+          description: Bonus checks this code earned as a referrer inside the current calendar month (capped at 500 a month)
+        referred_by:
+          type: boolean
+          description: Whether this code was itself referred
+
+    CreditReferralLinkRequest:
+      type: object
+      required: [code, referral_code]
+      properties:
+        code:
+          type: string
+          description: The referee's redeem code; separators and case are normalized server-side
+        referral_code:
+          type: string
+          description: The referrer's personal referral code; separators and case are normalized server-side
+
+    CreditReferralLinkResult:
+      allOf:
+        - type: object
+          required: [outcome, granted]
+          properties:
+            outcome:
+              type: string
+              enum: [linked, already_referred, self_referral]
+            granted:
+              type: boolean
+              description: True only on a fresh link, when the bonuses landed with this call
+            referee_bonus_checks:
+              type: integer
+              description: Present on a fresh link; the bonus checks the referee received (10)
+            referrer_link_bonus_checks:
+              type: integer
+              description: Present on a fresh link; the bonus checks the referrer received for the link itself (10, or less at the monthly cap, possibly 0)
+            referrer_bonus_checks:
+              type: integer
+              description: Present on a fresh link; the bonus checks the referrer received for the referee's first paid purchase (100, or less at the monthly cap, possibly 0)
+        - $ref: '#/components/schemas/CreditBalance'
 
     AiCheckRequest:
       type: object
