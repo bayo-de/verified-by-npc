@@ -120,6 +120,14 @@ label.small{font-size:13px;color:var(--muted);display:block;margin:14px 0 6px}
 .npc-chat-form button{padding:10px 16px;font-size:14.5px}
 .npc-keep-record{border-top:1px solid var(--line);margin-top:18px;padding-top:4px}
 .npc-keep-record button{padding:6px 14px;font-size:13.5px}
+.npc-drop{border:1.5px dashed var(--line);border-radius:12px;padding:26px 20px;text-align:center;
+  background:var(--card);margin:14px 0;cursor:pointer}
+.npc-drop.drag{border-color:var(--ink)}
+.npc-drop p{margin:4px 0;color:var(--muted);font-size:15px}
+.npc-drop .npc-drop-main{color:var(--ink);font-weight:600;font-size:16px}
+.npc-hashline{font-size:14px;color:var(--muted);margin:10px 0;word-break:break-all}
+.npc-hashline .mono{color:var(--ink)}
+progress.npc-progress{width:100%;max-width:560px;height:10px;margin:6px 0 2px;accent-color:var(--ink)}
 """
 
 
@@ -145,10 +153,14 @@ PUBLIC_API_BASE = "https://api.npclabs.xyz"
 CHAT_WIDGET_ENABLED = True
 
 # Verify yours page script. Plain browser JavaScript, no dependencies.
-# Rules it lives by: it never fakes a submission or a result. If the
-# verification service does not answer, the page says so plainly and
-# the forms are disabled. Results render only from a real API answer,
-# built with textContent so record data is never markup.
+# Rules it lives by: it never fakes a submission or a result. The
+# health probe below is advisory only: it paints the service status
+# line and never disables or blocks the forms, because a slow or
+# blocked probe does not mean the service is down. Every submission
+# goes to the API itself, and only the API's own answer (or the
+# failed request itself) decides what the page reports. Results
+# render only from a real API answer, built with textContent so
+# record data is never markup.
 VERIFY_JS = """
 (function () {
   var root = document.getElementById("npc-verify");
@@ -161,16 +173,21 @@ VERIFY_JS = """
   var errorText = document.getElementById("npc-register-error-text");
   var forms = [document.getElementById("npc-content-form"),
                document.getElementById("npc-agent-form")];
-  function setDown() {
+  function setUnreachable() {
+    // Advisory only. The status check did not get an answer, so the
+    // banner says that, and nothing else changes: the forms stay
+    // enabled and a submission still goes to the API, whose own
+    // answer decides the outcome.
     if (downBox) downBox.hidden = false;
     if (statusLine) statusLine.textContent =
-      "Registration is paused: the verification service is not " +
-      "answering yet.";
-    forms.forEach(function (f) {
-      if (!f) return;
-      var btns = f.querySelectorAll("button");
-      for (var i = 0; i < btns.length; i++) btns[i].disabled = true;
-    });
+      "The verification service did not answer the status check. " +
+      "Registration is still open: submit a form and the service " +
+      "answers the submission itself.";
+  }
+  function setReachable() {
+    if (downBox) downBox.hidden = true;
+    if (statusLine) statusLine.textContent =
+      "Registration is open. Your record is issued on the spot.";
   }
   function showError(msg) {
     if (errorText) errorText.textContent = msg;
@@ -322,6 +339,71 @@ VERIFY_JS = """
     frag.appendChild(dl);
     return frag;
   }
+  function anchorBlock(anchor) {
+    if (!anchor || typeof anchor !== "object") return null;
+    var frag = document.createDocumentFragment();
+    frag.appendChild(el("h3", "Onchain anchor"));
+    if (anchor.status === "anchored") {
+      frag.appendChild(el("p",
+        "Anchored on Base. The hash of this record sits in a " +
+        "batch whose root was written to the Base blockchain in " +
+        "block " + anchor.block_number + ". Anyone can hash " +
+        "this record, walk its proof to the batch root, and find " +
+        "that root in the anchor transaction. Anchoring proves " +
+        "the record existed in this exact form at that time. It " +
+        "is not verification, and it does not change the " +
+        "record's status."));
+      var dl = document.createElement("dl");
+      dl.className = "kv";
+      function arow(k, v, mono) {
+        if (v === null || v === undefined || v === "") return;
+        dl.appendChild(el("dt", k));
+        var dd = el("dd", String(v));
+        if (mono) dd.className = "mono";
+        dl.appendChild(dd);
+      }
+      arow("Batch root", anchor.merkle_root, true);
+      arow("Transaction", anchor.tx_hash, true);
+      arow("Block", anchor.block_number);
+      arow("Anchored at", anchor.block_timestamp);
+      arow("Signed by (signer wallet)", anchor.signer_wallet, true);
+      arow("Submitted by (owner wallet)",
+           anchor.owner_wallet, true);
+      frag.appendChild(dl);
+      if (anchor.explorer_url) {
+        var link = el("a",
+          "View the anchor transaction on Basescan");
+        link.href = anchor.explorer_url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        var p = el("p");
+        p.appendChild(link);
+        frag.appendChild(p);
+      }
+      if (anchor.owner_wallet) {
+        frag.appendChild(el("p",
+          "Every batch carries the signer wallet's signature. " +
+          "The owner wallet submits the batch to Base, and it is " +
+          "the only wallet that can change who signs. A " +
+          "replacement signer only counts when the owner wallet " +
+          "signs a rotation notice for it."));
+      }
+    } else if (anchor.status === "anchor_pending") {
+      frag.appendChild(el("p",
+        "This record is in a batch that has not landed on Base " +
+        "yet. When the batch lands, this section will show the " +
+        "anchor transaction."));
+    } else {
+      frag.appendChild(el("p",
+        "This record is not anchored on Base yet. Registrations " +
+        "are anchored in batches; when this record's batch " +
+        "lands, this section will show the anchor transaction. " +
+        "Anchoring is a public timestamp for the record. It is " +
+        "not verification, and it does not change the record's " +
+        "status."));
+    }
+    return frag;
+  }
   function showResult(rec) {
     resultBox.innerHTML = "";
     resultBox.appendChild(el("h3", "Registered."));
@@ -350,6 +432,8 @@ VERIFY_JS = """
     if (pending) resultBox.appendChild(pending);
     var kya = kyaBlock(rec.kya);
     if (kya) resultBox.appendChild(kya);
+    var anchorBlk = anchorBlock(rec.anchor);
+    if (anchorBlk) resultBox.appendChild(anchorBlk);
     if (window.npcRequestVerificationBox && rec.record_id) {
       resultBox.appendChild(
         window.npcRequestVerificationBox(rec.record_id, base));
@@ -386,9 +470,13 @@ VERIFY_JS = """
           "nothing was registered. Please try again.");
       }
     }).catch(function () {
-      setDown();
-      showError("The verification service is not answering yet. " +
-        "Your registration was not sent.");
+      // A genuine failed submission: this request itself got no
+      // answer, so this registration did not go through. The error
+      // is the API path's own outcome, and the forms stay enabled
+      // so the visitor can try again.
+      showError("The verification service did not answer, so that " +
+        "registration did not go through and nothing was " +
+        "registered. Please try again.");
     });
   }
   function wire(form, path, fields, optional) {
@@ -414,13 +502,260 @@ VERIFY_JS = """
   fetch(base + "/v1/health", ctrl ? {signal: ctrl.signal} : {})
     .then(function (r) {
       if (timer) clearTimeout(timer);
-      if (!r.ok) { setDown(); return; }
-      if (statusLine) statusLine.textContent =
-        "Registration is open. Your record is issued on the spot.";
+      if (!r.ok) { setUnreachable(); return; }
+      setReachable();
     }).catch(function () {
       if (timer) clearTimeout(timer);
-      setDown();
+      setUnreachable();
     });
+})();
+"""
+
+# The .npc credential module (spec npc/1.0) lives in its own file,
+# npc_credential.js, next to this one: the same code the page uses
+# here is what batch tooling requires under Node to mint .npc files
+# (the album rollout assets are the first batch). The site ships no
+# external scripts (see the CSP in netlify.toml), so the module is
+# inlined into the Verify yours page at render time, exactly like
+# the script constants above.
+def _load_sibling_js(name):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        name)
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+NPC_CREDENTIAL_JS = _load_sibling_js("npc_credential.js")
+
+# Register a file: the file-flow wiring for the Verify yours page.
+# The visitor picks or drops a file; the browser works out the
+# file's SHA-256 fingerprint here on the device, in slices, so a
+# file of any size hashes at a small, steady memory footprint. The
+# file itself is never uploaded: only the fingerprint, the title,
+# the kind, and the creator's name and email go to the API, which
+# answers with the signed record. The Download .npc button then
+# builds the credential file with the shared npc_credential.js
+# module. Same honesty rules as VERIFY_JS: nothing is faked, results
+# render only from a real API answer, and record data is written
+# with textContent, never as markup.
+FILE_REGISTER_JS = """
+(function () {
+  var root = document.getElementById("npc-file-register");
+  if (!root || !window.fetch || !window.NPCCredential) return;
+  var base = (root.getAttribute("data-api-base") || "")
+    .replace(/\\/+$/, "");
+  var drop = document.getElementById("npc-file-drop");
+  var input = document.getElementById("npc-file-input");
+  var form = document.getElementById("npc-file-form");
+  var hashLine = document.getElementById("npc-file-hashline");
+  var progress = document.getElementById("npc-file-progress");
+  var submitBtn = document.getElementById("npc-file-submit");
+  var errorBox = document.getElementById("npc-file-error");
+  var errorText = document.getElementById("npc-file-error-text");
+  var resultBox = document.getElementById("npc-file-result");
+  var NPC = window.NPCCredential;
+  var state = {file: null, hash: null, run: 0, busy: false};
+  var CHUNK = 8 * 1024 * 1024;
+  function el(tag, text) {
+    var n = document.createElement(tag);
+    if (text) n.textContent = text;
+    return n;
+  }
+  function showError(msg) {
+    if (errorText) errorText.textContent = msg;
+    if (errorBox) errorBox.hidden = false;
+  }
+  function hideError() { if (errorBox) errorBox.hidden = true; }
+  function setHashLine(text, hash) {
+    hashLine.innerHTML = "";
+    hashLine.appendChild(document.createTextNode(text));
+    if (hash) {
+      var span = el("span", "sha256:" + hash);
+      span.className = "mono";
+      hashLine.appendChild(span);
+    }
+  }
+  function titleFromName(name) {
+    return String(name || "").replace(/\\.[^.]*$/, "").trim();
+  }
+  function pickFile(file) {
+    if (!file) return;
+    state.file = file;
+    state.hash = null;
+    state.run += 1;
+    var run = state.run;
+    hideError();
+    if (resultBox) resultBox.hidden = true;
+    var titleInput = form.elements.title;
+    if (!titleInput.value.trim()) {
+      titleInput.value = titleFromName(file.name);
+    }
+    var kindSelect = form.elements.kind;
+    kindSelect.value = NPC.inferKind(file.name, file.type || "");
+    submitBtn.disabled = true;
+    progress.hidden = false;
+    progress.value = 0;
+    setHashLine("Working out the fingerprint of " + file.name +
+                " on your device. ");
+    var hasher = new NPC.Sha256();
+    var offset = 0;
+    function step() {
+      if (run !== state.run) return;  // a newer file replaced this one
+      if (offset >= file.size) {
+        state.hash = hasher.digestHex();
+        progress.hidden = true;
+        setHashLine("Fingerprint ready: ", state.hash);
+        submitBtn.disabled = false;
+        return;
+      }
+      var slice = file.slice(offset, offset + CHUNK);
+      slice.arrayBuffer().then(function (buf) {
+        if (run !== state.run) return;
+        hasher.update(new Uint8Array(buf));
+        offset += buf.byteLength;
+        progress.value = file.size ? offset / file.size : 1;
+        step();
+      }, function () {
+        if (run !== state.run) return;
+        progress.hidden = true;
+        setHashLine("");
+        showError("That file could not be read, so nothing was " +
+          "registered. Please pick the file again.");
+      });
+    }
+    step();
+  }
+  if (drop && input) {
+    drop.addEventListener("click", function () { input.click(); });
+    drop.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        input.click();
+      }
+    });
+    ["dragenter", "dragover"].forEach(function (name) {
+      drop.addEventListener(name, function (ev) {
+        ev.preventDefault();
+        drop.classList.add("drag");
+      });
+    });
+    ["dragleave", "drop"].forEach(function (name) {
+      drop.addEventListener(name, function (ev) {
+        ev.preventDefault();
+        drop.classList.remove("drag");
+      });
+    });
+    drop.addEventListener("drop", function (ev) {
+      var files = ev.dataTransfer && ev.dataTransfer.files;
+      if (files && files.length) pickFile(files[0]);
+    });
+    input.addEventListener("change", function () {
+      if (input.files && input.files.length) pickFile(input.files[0]);
+    });
+  }
+  function downloadNpc(rec) {
+    var recordUrl = window.location.origin + "/search?id=" +
+      encodeURIComponent(rec.record_id);
+    var env = NPC.buildCredential({
+      record: rec,
+      recordUrl: recordUrl,
+      contentSha256: state.hash
+    });
+    var blob = new Blob([NPC.serialize(env)],
+                        {type: "application/json"});
+    var url = URL.createObjectURL(blob);
+    var a = el("a");
+    a.href = url;
+    a.download = NPC.credentialFilename(rec.title, state.hash);
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+  }
+  function showResult(rec) {
+    resultBox.innerHTML = "";
+    resultBox.appendChild(el("h3", "Registered."));
+    var dl = document.createElement("dl");
+    dl.className = "kv";
+    function row(k, v, mono) {
+      if (!v) return;
+      dl.appendChild(el("dt", k));
+      var dd = el("dd", v);
+      if (mono) dd.className = "mono";
+      dl.appendChild(dd);
+    }
+    row("Your NPC ID", rec.record_id, true);
+    row("Status", "Registered, checks pending");
+    row("What", rec.title || "");
+    row("Registered", rec.registered_at || "");
+    resultBox.appendChild(dl);
+    resultBox.appendChild(el("p",
+      "Registration is not verification. Your record is signed by " +
+      "NPC, and anyone can look it up by its ID."));
+    var dlRow = el("p");
+    var dlBtn = el("button", "Download .npc");
+    dlBtn.type = "button";
+    dlBtn.addEventListener("click", function () { downloadNpc(rec); });
+    dlRow.appendChild(dlBtn);
+    dlRow.appendChild(el("span",
+      " Your credential file: the signed record in a file you " +
+      "can keep, share, and check anywhere, against the " +
+      "fingerprint of the file itself."));
+    resultBox.appendChild(dlRow);
+    var link = el("a", "See this record in Search");
+    link.href = "/search?id=" + encodeURIComponent(rec.record_id);
+    var p = el("p");
+    p.appendChild(link);
+    resultBox.appendChild(p);
+    resultBox.hidden = false;
+    resultBox.scrollIntoView();
+  }
+  if (form) {
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      if (!state.file || !state.hash || state.busy) return;
+      hideError();
+      if (resultBox) resultBox.hidden = true;
+      state.busy = true;
+      submitBtn.disabled = true;
+      var payload = {
+        title: form.elements.title.value.trim(),
+        kind: form.elements.kind.value,
+        locator: "sha256:" + state.hash,
+        creator_name: form.elements.creator_name.value.trim(),
+        creator_email: form.elements.creator_email.value.trim()
+      };
+      fetch(base + "/v1/register/content", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      }).then(function (r) {
+        return r.json().then(function (body) {
+          return {ok: r.ok, status: r.status, body: body};
+        });
+      }).then(function (res) {
+        state.busy = false;
+        submitBtn.disabled = false;
+        if (res.ok && res.body && res.body.record_id) {
+          showResult(res.body);
+        } else if (res.status === 429) {
+          showError("Too many registrations from this email or " +
+            "address for now. Please wait, then try again.");
+        } else if (res.body && res.body.detail) {
+          showError(res.body.detail);
+        } else {
+          showError("That registration did not go through, and " +
+            "nothing was registered. Please try again.");
+        }
+      }).catch(function () {
+        state.busy = false;
+        submitBtn.disabled = false;
+        showError("The verification service did not answer, so " +
+          "that registration did not go through and nothing was " +
+          "registered. Please try again.");
+      });
+    });
+  }
 })();
 """
 
@@ -525,6 +860,71 @@ LIVE_LOOKUP_JS = """
     frag.appendChild(dl);
     return frag;
   }
+  function anchorBlock(anchor) {
+    if (!anchor || typeof anchor !== "object") return null;
+    var frag = document.createDocumentFragment();
+    frag.appendChild(el("h3", "Onchain anchor"));
+    if (anchor.status === "anchored") {
+      frag.appendChild(el("p",
+        "Anchored on Base. The hash of this record sits in a " +
+        "batch whose root was written to the Base blockchain in " +
+        "block " + anchor.block_number + ". Anyone can hash " +
+        "this record, walk its proof to the batch root, and find " +
+        "that root in the anchor transaction. Anchoring proves " +
+        "the record existed in this exact form at that time. It " +
+        "is not verification, and it does not change the " +
+        "record's status."));
+      var dl = document.createElement("dl");
+      dl.className = "kv";
+      function arow(k, v, mono) {
+        if (v === null || v === undefined || v === "") return;
+        dl.appendChild(el("dt", k));
+        var dd = el("dd", String(v));
+        if (mono) dd.className = "mono";
+        dl.appendChild(dd);
+      }
+      arow("Batch root", anchor.merkle_root, true);
+      arow("Transaction", anchor.tx_hash, true);
+      arow("Block", anchor.block_number);
+      arow("Anchored at", anchor.block_timestamp);
+      arow("Signed by (signer wallet)", anchor.signer_wallet, true);
+      arow("Submitted by (owner wallet)",
+           anchor.owner_wallet, true);
+      frag.appendChild(dl);
+      if (anchor.explorer_url) {
+        var link = el("a",
+          "View the anchor transaction on Basescan");
+        link.href = anchor.explorer_url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        var p = el("p");
+        p.appendChild(link);
+        frag.appendChild(p);
+      }
+      if (anchor.owner_wallet) {
+        frag.appendChild(el("p",
+          "Every batch carries the signer wallet's signature. " +
+          "The owner wallet submits the batch to Base, and it is " +
+          "the only wallet that can change who signs. A " +
+          "replacement signer only counts when the owner wallet " +
+          "signs a rotation notice for it."));
+      }
+    } else if (anchor.status === "anchor_pending") {
+      frag.appendChild(el("p",
+        "This record is in a batch that has not landed on Base " +
+        "yet. When the batch lands, this section will show the " +
+        "anchor transaction."));
+    } else {
+      frag.appendChild(el("p",
+        "This record is not anchored on Base yet. Registrations " +
+        "are anchored in batches; when this record's batch " +
+        "lands, this section will show the anchor transaction. " +
+        "Anchoring is a public timestamp for the record. It is " +
+        "not verification, and it does not change the record's " +
+        "status."));
+    }
+    return frag;
+  }
   var notice = document.getElementById("npc-unknown-notice");
   var head = document.getElementById("npc-unknown-head");
   var pending = document.getElementById("npc-lookup-pending");
@@ -589,6 +989,8 @@ LIVE_LOOKUP_JS = """
       if (notRan) card.appendChild(notRan);
       var kya = kyaBlock(rec.kya);
       if (kya) card.appendChild(kya);
+      var anchorBlk = anchorBlock(rec.anchor);
+      if (anchorBlk) card.appendChild(anchorBlk);
       marker.appendChild(card);
       marker.hidden = false;
       if (window.npcIdentityPanel) {
@@ -1327,7 +1729,7 @@ def page(title, body, api_url):
 <header class="top"><div class="wrap top-in">
 <a class="brand" href="/">Verified by NPC</a>
 <nav>
-<a href="/records">Records</a><a href="/search">Search</a><a href="/plugins">Plugins</a><a href="/api">API</a><a href="/verify">Verify yours</a><a href="/help">How it works</a>%s
+<a href="/records">Records</a><a href="/search">Search</a><a href="/plugins">Plugins</a><a href="/api">API</a><a href="/verify">Verify yours</a><a href="https://chromewebstore.google.com/detail/npc-verify/obmponafhkmmopoicfoonaaokmmlhboc" target="_blank" rel="noopener noreferrer">Extension</a><a href="/help">How it works</a>%s
 </nav>
 </div></header>
 <main class="wrap">
@@ -1546,7 +1948,7 @@ def home_view():
 <input type="email" name="email" required aria-label="Email address" style="flex:1;min-width:200px;padding:11px 14px;font-size:15px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)">
 <button type="submit" style="background:#ec662b">Join the waitlist</button>
 </form>
-<p class="examples">The public API is live, and live checking is open. The records shown here are samples. The NPC Verify extension is still to come; the waitlist is the way to hear when it lands.</p>
+<p class="examples">The public API is live, and live checking is open. The records shown here are samples. The NPC Verify extension is live in the <a href="https://chromewebstore.google.com/detail/npc-verify/obmponafhkmmopoicfoonaaokmmlhboc">Chrome Web Store</a>; the waitlist is for the Verified Agent Library, the Verified Agent Builder, and new releases.</p>
 
 <p class="examples">Everything shown is a sample record. Nothing here is a real product, credential, or person.</p>
 """
@@ -1860,7 +2262,25 @@ def privacy_view(last_updated):
     changes first. One section is newer than the staged draft: the
     "Talking with Biblo" section below, added 2026-10-15 with the
     site chat it describes (biblo-chat spec sections 2 and 8), in
-    the same change as the widget itself.
+    the same change as the widget itself. Two additions are newer
+    still, added 2026-10-28 for v1.1 and v1.1.1: "The optional AI
+    generation check" section (from the v1.1 privacy practices
+    draft, with its unfinished bracketed retention sentence omitted)
+    and the local check history sentence in "What stays on your
+    device" (the v1.1.1 Past checks history stored on device).
+    2026-10-28: the policy gains a second half covering this
+    website (Bayo's direction that the policy apply to the site as
+    well as the extension): visiting and searching, looking up a
+    record, registering a work or an agent (including exactly how
+    the registrant email is held: server-side only, never in the
+    signed record, raw address deleted after 12 months, a SHA-256
+    hash kept for the submission caps), and the waitlist. In the
+    same change the "Talking with Biblo" section is REMOVED: the
+    chat is not live (exports ship --no-chat, and the 2026-10-28
+    grounded rerun against the deployed endpoint again returned
+    the resting reply on every case), and the policy does not
+    describe a chat visitors cannot use. The section returns,
+    with the bundle built chat-on, when a grounded rerun passes.
     """
     return """
 <p class="kicker">NPC Verify</p>
@@ -1877,13 +2297,37 @@ def privacy_view(last_updated):
 <h2>What stays on your device</h2>
 <p>Image forensics (reading the file's embedded metadata) happen entirely on your device. The image bytes are read into memory for the check and are never transmitted, stored, or shared.</p>
 <p>The extension stores two things in your browser's local extension storage: a counter of how many free checks you have run, and, only if you or your developer set them, an API address and key override. NPC Labs cannot see either.</p>
+<p>The extension also keeps a history of checks on your own device (image hashes, verdicts, dates, and the addresses of checked images), stored locally and never sent to NPC Labs.</p>
+
+<h2>The optional AI generation check</h2>
+<p>The results offer a separate check, "Check this image for AI generation." It runs only when you press it, never on its own.</p>
+<p>When you press it, the extension sends the image to the NPC verification API, and the API passes the image to Sightengine, an outside detection service, which returns a score for how likely the image is to have been generated by AI. The extension shows that score, with its number, as a signal, not proof.</p>
+<p>NPC Labs does not keep a copy of the image. Sightengine's handling of images submitted for checking is governed by Sightengine's own privacy terms.</p>
+<p>If you never press the button, no image is ever sent anywhere.</p>
 
 <h2>What the extension does not do</h2>
 <p>No accounts. No analytics. No advertising. No tracking across sites. No sale or sharing of data with third parties. No remote code: everything the extension runs ships inside the extension.</p>
 <p>Two optional links in the results, Google Lens and TinEye, open those services in a new tab with the image address, only when you click them. Their privacy policies apply there.</p>
 
-<h2>Talking with Biblo on this site</h2>
-<p>This site offers Biblo, an AI assistant that answers questions about Verified by NPC from NPC Labs' public pages and published articles. What you type into the chat is sent to NPC's chat service so it can answer you. Conversations are kept for 90 days and may be read by the NPC team to improve these answers. Please do not share private details in the chat. The chat needs no account, and it cannot look records up or change them: Search is where a record speaks.</p>
+<h2>This website</h2>
+<p>The first half of this policy covers the extension. This half covers this website, verify.npclabs.xyz, and the registry behind it.</p>
+
+<h2>Visiting and searching</h2>
+<p>This site is a set of public pages. Reading them needs no account. The site sets no cookies, and it runs no analytics and no advertising trackers.</p>
+<p>Search, record lookups, and the registration forms run in your browser and talk to the NPC verification API (api.npclabs.xyz). The API's logs are operational: timestamps, request paths, and response codes. That is the same logging the extension half describes.</p>
+
+<h2>Looking up a record</h2>
+<p>Records are public by design. Anyone can look a record up by its NPC ID, in Search on this site or through the public API, with no account. What a lookup returns is the signed record itself: what was registered, when it was registered, which checks have run, which are still pending, and NPC's signature over it.</p>
+
+<h2>Registering a work or an agent</h2>
+<p>To register a work, you send its title, its kind, where it lives (a web address or a content hash), your name as its creator, and your email address. To register an agent, you send the agent's name, your name as its owner, your email address, and, if you want them on the record, a homepage and a description.</p>
+<p>What you register becomes a signed public record: the title or the agent's name, the locator, the creator or owner name, the time of registration, and the checks, all under NPC's signature. It stays on the public record, and anyone can look it up by its NPC ID.</p>
+<p>Your email address never becomes part of the record. It is kept on NPC's servers only, together with the network address the submission came from, so NPC can keep registrations to a fair daily limit per person and per network. The raw email address is deleted after 12 months. A SHA-256 hash of the address is kept after that, so the limits still work. The hash cannot be turned back into the address.</p>
+<p>A registration is a record, not a verification. Every registration stands at "registered, checks pending" until its checks have run and held up, and registration alone never carries the verification mark.</p>
+
+<h2>The waitlist</h2>
+<p>The home page carries a "First to know" form. It asks for an email address and nothing else. The form is handled by Netlify, the service that hosts this site. Joining puts you on the list for news when the NPC Verify extension, the Verified Agent Library, the Verified Agent Builder, and new releases land.</p>
+<p>No waitlist email has been sent yet. When the first one goes out, every waitlist email will carry a one-click unsubscribe link and our postal address: 452 Fulton Street, Elizabeth, NJ 07206.</p>
 
 <h2>Contact</h2>
 <p>Questions about this policy: <a href="mailto:hello@npclabs.xyz">hello@npclabs.xyz</a>.</p>
@@ -2146,13 +2590,45 @@ def verify_view(api_base=PUBLIC_API_BASE):
 <p class="lede">Registration is how verification starts. Register a piece of your work, or an agent you run, and NPC issues a signed record with its own NPC ID on the spot, at the status registered, checks pending. Registration is not verification, and no verification mark comes with it.</p>
 <p id="npc-service-status">Registration is free, and every registration is issued as a signed NPC record with its own ID, on the spot.</p>
 <div class="notice" id="npc-service-down" hidden>
-<h3>The verification service is not answering yet</h3>
-<p>Registrations are paused right now. Nothing you type is sent or saved while the service is down. <a href="/">Join the waitlist on the home page</a> to hear when registration opens.</p>
+<h3>The verification service did not answer the status check</h3>
+<p>Registration is still open. Submit a form and the service answers the submission itself. If the service truly is down, that submission will not go through, nothing will be registered, and the page will say so plainly.</p>
 </div>
 <noscript><div class="notice"><h3>Registration needs JavaScript</h3>
 <p>With JavaScript off, the forms cannot reach the verification service. You can still <a href="/">join the waitlist</a>, or write to <a href="mailto:hello@npclabs.xyz">hello@npclabs.xyz</a>.</p></div></noscript>
 <div class="notice" id="npc-register-error" hidden><h3>Not registered</h3><p id="npc-register-error-text"></p></div>
 <div class="card" id="npc-register-result" hidden></div>
+
+<h2>Register a file</h2>
+<p>Start with the file itself. Pick a file from your device, and your browser works out its fingerprint: the SHA-256 hash that identifies its exact contents. The file never leaves your device. Only the fingerprint and a few details travel, and NPC signs a record of them on the spot. When your record comes back, download your .npc credential file: the signed record in a file you keep, ready to show anyone.</p>
+<div id="npc-file-register" data-api-base="%s">
+<div class="npc-drop" id="npc-file-drop" role="button" tabindex="0" aria-label="Choose a file to register">
+<p class="npc-drop-main">Drop a file here, or click to choose one</p>
+<p>Your file stays on your device. Only its fingerprint is sent.</p>
+</div>
+<input type="file" id="npc-file-input" hidden>
+<p class="npc-hashline" id="npc-file-hashline"></p>
+<progress class="npc-progress" id="npc-file-progress" max="1" value="0" hidden></progress>
+<div class="notice" id="npc-file-error" hidden><h3>Not registered</h3><p id="npc-file-error-text"></p></div>
+<div class="card" id="npc-file-result" hidden></div>
+<form class="reg" id="npc-file-form">
+<label class="small" for="npc-f-title">Title</label>
+<input type="text" id="npc-f-title" name="title" required maxlength="200">
+<label class="small" for="npc-f-kind">Kind</label>
+<select id="npc-f-kind" name="kind">
+<option value="image">Image</option>
+<option value="audio">Audio</option>
+<option value="video">Video</option>
+<option value="text">Document</option>
+<option value="other">Other</option>
+</select>
+<label class="small" for="npc-f-name">Your name</label>
+<input type="text" id="npc-f-name" name="creator_name" required maxlength="128">
+<label class="small" for="npc-f-email">Your email</label>
+<input type="email" id="npc-f-email" name="creator_email" required maxlength="254">
+<button type="submit" id="npc-file-submit" disabled>Register this file</button>
+</form>
+<p class="examples">Your email ties the registration to you and keeps submissions fair. It is never published in the record. Registration is the signed starting record, not verification. Verification is a separate step with its own checks, and no verification mark comes with registration.</p>
+</div>
 
 <h2>Register a piece of work</h2>
 <p>Give the work a title, its kind, and where it can be found: a web address, or its content hash if you already have one. For a file at a web address, the first checks can run as you register: a read of any Content Credentials in the file with cryptographic validation when a manifest is present, the AI image check on images, and the container facts on audio and video. What ran, and what has not run yet, is written into the record itself.</p>
@@ -2198,7 +2674,10 @@ def verify_view(api_base=PUBLIC_API_BASE):
 </div>
 <script>%s</script>
 <script>%s</script>
-""" % (esc(api_base), VERIFY_JS, REQUEST_VERIFY_JS)
+<script>%s</script>
+<script>%s</script>
+""" % (esc(api_base), esc(api_base), VERIFY_JS, NPC_CREDENTIAL_JS,
+       FILE_REGISTER_JS, REQUEST_VERIFY_JS)
 
 
 def key_entries(keys_doc):

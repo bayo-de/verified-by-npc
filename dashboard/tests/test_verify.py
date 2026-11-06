@@ -10,11 +10,19 @@ report (headless Chromium), not faked here.
 """
 import http.client
 import json
+import unittest
 
 try:
     from tests.helpers import DashTestCase
 except ImportError:  # pragma: no cover - direct invocation
     from helpers import DashTestCase
+
+try:
+    from tests import helpers  # noqa: F401  (puts the package on path)
+except ImportError:  # pragma: no cover - direct invocation
+    import helpers  # noqa: F401
+
+from dashboard import views  # noqa: E402
 
 
 def _api_post(port, path, body):
@@ -67,13 +75,19 @@ class VerifyPageTest(DashTestCase):
     def test_verify_page_degradation_contract(self):
         status, body = self.get("/verify")
         self.assertEqual(status, 200)
-        # The plain down-state ships in the page, hidden until the
-        # script's health check fails: the exact words a visitor sees
-        # when the verification service is not answering.
-        self.assertIn("The verification service is not answering yet",
-                      body)
-        self.assertIn("Nothing you type is sent or saved", body)
-        self.assertIn('href="/"', body)  # the waitlist path
+        # The advisory unreachable banner ships in the page, hidden
+        # until the script's health check fails or times out: the
+        # exact words a visitor sees when the status check gets no
+        # answer. It is information only. It does not pause or
+        # refuse a registration, and the forms stay submittable.
+        self.assertIn(
+            "The verification service did not answer the status check",
+            body)
+        self.assertIn("Registration is still open", body)
+        self.assertIn("that submission will not go through", body)
+        self.assertNotIn("Registrations are paused", body)
+        self.assertNotIn("Registration is paused", body)
+        self.assertNotIn("Nothing you type is sent or saved", body)
         # The no-JavaScript fallback is equally plain.
         self.assertIn("Registration needs JavaScript", body)
         # Nothing on the page fakes an issued ID or a sent state.
@@ -84,6 +98,72 @@ class VerifyPageTest(DashTestCase):
             status, body = self.get(path)
             self.assertEqual(status, 200, path)
             self.assertIn('href="/verify"', body, path)
+
+
+class HealthGateAdvisoryTest(unittest.TestCase):
+    """The health probe is advisory only (fix, 2026-10-28).
+
+    Before the fix, a failed or slow probe called setDown(), which
+    disabled every submit button and painted "Registration is
+    paused" over a live service: a false pause that closed intake
+    whenever the probe did not paint healthy in time. These tests
+    pin the corrected contract on VERIFY_JS itself, which is the
+    script the page ships: there is no separate JS harness in this
+    tree, and the rest of the suite pins browser scripts the same
+    way (see test_kya_display, test_restage_drop).
+    """
+
+    def test_no_blocking_down_state_remains(self):
+        js = views.VERIFY_JS
+        self.assertNotIn("setDown", js)
+        self.assertNotIn("paused", js)
+        # nothing in the register script disables a form control
+        self.assertNotIn("disabled = true", js)
+        self.assertNotIn("disabled=true", js)
+
+    def test_probe_failure_or_timeout_only_updates_the_banner(self):
+        js = views.VERIFY_JS
+        # the probe still runs, with its abort budget, against the
+        # health endpoint
+        self.assertIn('fetch(base + "/v1/health"', js)
+        self.assertIn("ctrl.abort()", js)
+        # both probe outcomes are advisory paints, never a refusal
+        self.assertIn("function setUnreachable()", js)
+        self.assertIn("function setReachable()", js)
+        self.assertIn("if (!r.ok) { setUnreachable(); return; }", js)
+        # the timeout/abort path lands on the same advisory paint
+        probe = js.split('fetch(base + "/v1/health"', 1)[1]
+        self.assertIn("setUnreachable();", probe)
+        self.assertIn("Registration is still open", js)
+
+    def test_submission_proceeds_regardless_of_the_probe(self):
+        js = views.VERIFY_JS
+        # both forms are wired to their API endpoints, and submit
+        # posts the payload to the API itself
+        self.assertIn('wire(forms[0], "/v1/register/content"', js)
+        self.assertIn('wire(forms[1], "/v1/register/agent"', js)
+        self.assertIn("fetch(base + path", js)
+        self.assertIn('method: "POST"', js)
+        # the submit handler never consults the probe result: the
+        # wiring section carries no health state and no gate
+        submit = js.split("function submit(", 1)[1].split(
+            "function wire(", 1)[0]
+        self.assertNotIn("setUnreachable", submit)
+        self.assertNotIn("health", submit)
+
+    def test_failed_submission_reports_the_api_paths_own_error(self):
+        js = views.VERIFY_JS
+        # a request that itself gets no answer reports that this
+        # registration did not go through, in the error box, and
+        # does not disable anything or repaint a pause
+        submit = js.split("function submit(", 1)[1].split(
+            "function wire(", 1)[0]
+        self.assertIn("did not go through and nothing was", submit)
+        self.assertIn("showError(", submit)
+        self.assertNotIn("disabled", submit)
+        # API answers still surface honestly: its detail, its 429
+        self.assertIn("res.body.detail", js)
+        self.assertIn("res.status === 429", js)
 
 
 class LiveResolutionTest(DashTestCase):
