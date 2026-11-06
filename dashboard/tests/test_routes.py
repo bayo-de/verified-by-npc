@@ -31,6 +31,9 @@ class RoutesTest(DashTestCase):
             '<a href="/records">Records</a><a href="/search">Search</a>'
             '<a href="/plugins">Plugins</a><a href="/api">API</a>'
             '<a href="/verify">Verify yours</a>'
+            '<a href="https://chromewebstore.google.com/detail/'
+            'npc-verify/obmponafhkmmopoicfoonaaokmmlhboc" '
+            'target="_blank" rel="noopener noreferrer">Extension</a>'
             '<a href="/help">How it works</a>',
             body)
         for old in ("/archive", "/credentials", "/products", "/keys"):
@@ -149,6 +152,18 @@ class RoutesTest(DashTestCase):
         self.assertIn("Records · Archive", body)
         self.assertIn("Company history, on chain.", body)
         self.assertIn('href="/search?id=tag_archive_seeker_hat_1"', body)
+
+    def test_get_verified_redirects_to_verify_yours(self):
+        # The Chrome extension's creator invite pointed at
+        # /get-verified before the registration page was named Verify
+        # yours. The old address permanently redirects to the one
+        # registration page instead of 404ing.
+        status, headers, _body = self.get_with_headers("/get-verified")
+        self.assertEqual(status, 301)
+        self.assertEqual(headers.get("Location"), "/verify")
+        status, body = self.get("/verify")
+        self.assertEqual(status, 200)
+        self.assertIn("Start verification of your own work.", body)
 
     def test_old_top_level_pages_and_claim_post_are_gone(self):
         for path in ("/credentials", "/products", "/keys"):

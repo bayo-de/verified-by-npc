@@ -91,6 +91,9 @@ class HtmlSanityTest(DashTestCase):
                 '<a href="/records">Records</a><a href="/search">Search</a>'
                 '<a href="/plugins">Plugins</a><a href="/api">API</a>'
                 '<a href="/verify">Verify yours</a>'
+                '<a href="https://chromewebstore.google.com/detail/'
+                'npc-verify/obmponafhkmmopoicfoonaaokmmlhboc" '
+                'target="_blank" rel="noopener noreferrer">Extension</a>'
                 '<a href="/help">How it works</a>', nav, path)
             for old in ("/archive", "/credentials", "/products", "/keys"):
                 self.assertNotIn('href="%s">' % old, nav, path)

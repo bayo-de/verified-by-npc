@@ -133,8 +133,13 @@ class StaticExportTest(unittest.TestCase):
 
     # -- completeness ---------------------------------------------------
     def test_all_expected_pages_written(self):
+        # get-checks/index.html is not an app-rendered page: the
+        # exporter copies dashboard/credits-page/index.html verbatim
+        # (it talks to the API directly), so it rides the written
+        # list beside _redirects/_headers rather than EXPECTED_PAGES.
         self.assertEqual(sorted(self.written),
-                         sorted(EXPECTED_PAGES + ["_redirects", "_headers"]
+                         sorted(EXPECTED_PAGES + ["_redirects", "_headers",
+                                                  "get-checks/index.html"]
                                 + export_static.ASSET_FILES))
 
     def test_headers_file_carries_the_security_headers(self):
@@ -320,9 +325,11 @@ class StaticExportTest(unittest.TestCase):
                   if line.startswith("#")]
         self.assertTrue(any("forced" in line for line in header),
                         "header must state the rules are forced")
+        # Scoped to the Search rules: the file also carries the
+        # /get-verified alias rules (301!), pinned separately below.
         lines = [line for line in redirects.splitlines()
-                 if line and not line.startswith("#")]
-        self.assertTrue(lines, "no redirect rules generated")
+                 if line.startswith("/search")]
+        self.assertTrue(lines, "no search redirect rules generated")
         for line in lines:
             self.assertTrue(line.endswith(" 200!"),
                             "rule is not forced: %s" % line)
@@ -347,6 +354,17 @@ class StaticExportTest(unittest.TestCase):
                           % (subject_id, subject_id), unslashed)
             self.assertIn("/search/ id=%s /search/%s/ 200!"
                           % (subject_id, subject_id), slashed)
+
+    def test_get_verified_redirect_rules(self):
+        # /get-verified is the address the Chrome extension's creator
+        # invite carried before the registration page was named Verify
+        # yours. The export must send it permanently to /verify, in
+        # both path forms, forced like every other rule in the file.
+        redirects = self._read("_redirects")
+        lines = [line for line in redirects.splitlines()
+                 if line and not line.startswith("#")]
+        self.assertIn("/get-verified /verify 301!", lines)
+        self.assertIn("/get-verified/ /verify 301!", lines)
 
     # -- privacy page -------------------------------------------------------
     def test_privacy_page_carries_the_policy_not_fixture_labels(self):
