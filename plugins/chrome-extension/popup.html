@@ -36,6 +36,7 @@
       <div id="thumbs" class="thumbs"></div>
       <button id="check-btn" class="cta">Check this image</button>
       <p class="fineprint">We check the registry, the file itself, and say plainly what we found.</p>
+      <button class="ghost-btn wide history-open" type="button">Past checks</button>
     </section>
 
     <!-- state: checking -->
@@ -78,6 +79,15 @@
       </div>
 
       <button id="again-btn" class="ghost-btn wide">Check another image</button>
+      <button class="ghost-btn wide history-open" type="button">Past checks</button>
+    </section>
+
+    <!-- state: past checks -->
+    <section id="view-history" class="view hidden">
+      <p class="verdict-word small-word">Past checks</p>
+      <p class="quiet">Checking an image you already checked shows its earlier result and uses no free check.</p>
+      <div id="history-list" class="history-list"></div>
+      <button id="history-back" class="ghost-btn wide" type="button">Back</button>
     </section>
   </main>
 
