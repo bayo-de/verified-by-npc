@@ -12,7 +12,7 @@
 const NPC_CONFIG_DEFAULTS = {
   apiBase: "https://api.npclabs.xyz/v1",
   apiKey: "npc_demo_HNL8-qoMjLTVvDCYog1scIZm4JgrganOI2RRFoTFI-E",
-  getVerifiedUrl: "https://verify.npclabs.xyz/get-verified",
+  getVerifiedUrl: "https://verify.npclabs.xyz/verify",
   fullReportUrl: "https://verify.npclabs.xyz",
   freeChecksTotal: 10
 };

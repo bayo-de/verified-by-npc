@@ -21,6 +21,7 @@ async function activeTab() {
 let IMAGES = [];
 let SELECTED = 0;
 let TAB_ID = null;
+let AI_CONTEXT = null; // image + tab of the verdict currently on screen
 
 async function init() {
   show("view-loading");
@@ -95,6 +96,7 @@ async function updateChecksLine() {
 
 async function runCheck() {
   show("view-checking");
+  AI_CONTEXT = { image: IMAGES[SELECTED], tabId: TAB_ID };
   let result;
   try {
     result = await chrome.runtime.sendMessage({ type: "NPC_CHECK", image: IMAGES[SELECTED], tabId: TAB_ID });
@@ -117,6 +119,52 @@ async function runCheck() {
   }
   renderVerdict(result);
   updateChecksLine();
+}
+
+/* The AI generation check button in the AI judgment layer. Sends the
+ * image from the verdict on screen to the background worker, which
+ * asks the NPC API. Nothing about this runs until it is pressed. */
+async function runAiCheckFromPopup() {
+  const btn = $("ai-check-btn");
+  const out = $("ai-check-result");
+  if (!btn || !out || !AI_CONTEXT) return;
+  btn.disabled = true;
+  btn.textContent = "Checking...";
+  out.innerHTML = "";
+  let r;
+  try {
+    r = await chrome.runtime.sendMessage(
+      { type: "NPC_AI_CHECK", image: AI_CONTEXT.image, tabId: AI_CONTEXT.tabId });
+  } catch (e) {
+    r = { status: "error" };
+  }
+  btn.disabled = false;
+  btn.textContent = "Check this image for AI generation";
+  renderAiResult(r || { status: "error" }, out);
+}
+
+function renderAiResult(r, out) {
+  if (r.status === "ok") {
+    const p = r.percent;
+    let lead;
+    if (p >= 75) lead = "Signals strongly suggest AI generation.";
+    else if (p >= 40) lead = "The signals are mixed, and this read does not settle the question.";
+    else lead = "No AI-generation signals found.";
+    out.innerHTML = "<p><span class='k'>" + esc(lead) + "</span> AI generation analysis scored this image "
+      + esc(p) + " out of 100 for AI generation.</p>"
+      + "<p>The score is one detection service's read of the image itself, stated with its number. It is a signal, not proof.</p>"
+      + "<p>Answer signed by NPC. Signature verified against the published keys.</p>";
+  } else if (r.status === "signature_failed") {
+    out.innerHTML = "<p>The API answered, but the answer's NPC signature did not verify against the published keys, so this result is not shown.</p>";
+  } else if (r.status === "not_configured") {
+    out.innerHTML = "<p>This check was not run. This copy of the extension has no API key set. See the README to connect one.</p>";
+  } else if (r.status === "unauthorized") {
+    out.innerHTML = "<p>The API rejected the configured key, so this check was not run.</p>";
+  } else if (r.status === "unavailable") {
+    out.innerHTML = "<p>The detection service did not complete the check, so there is no result to show. NPC does not guess.</p>";
+  } else {
+    out.innerHTML = "<p>The AI generation check could not be completed, so there is no result to show. NPC does not guess.</p>";
+  }
 }
 
 function setLayer(which, stateText, stateClass) {
@@ -217,6 +265,22 @@ function renderVerdict(r) {
     } else {
       fh += "<p>No known generator markers found. Absence of a marker proves nothing either way.</p>";
     }
+    if (f.credentials && f.credentials.present) {
+      let cs = "Content Credentials are attached.";
+      if (f.credentials.generator) {
+        cs += " The credential says this image was made with " + esc(f.credentials.generator);
+        cs += f.credentials.digitalSourceType
+          ? " and labels it " + esc(f.credentials.digitalSourceType) + "." : ".";
+      } else if (f.credentials.digitalSourceType) {
+        cs += " The credential labels this image " + esc(f.credentials.digitalSourceType) + ".";
+      }
+      cs += " NPC has not cryptographically checked the credential in this version.";
+      fh += "<p>" + cs + "</p>";
+    }
+    if (f.iptcSourceType) {
+      fh += "<p><span class='k'>Source type tag:</span> " + esc(f.iptcSourceType)
+        + ". This tag is written into the file by software and can be edited, so treat it as a claim by the file, not proof.</p>";
+    }
   }
   const lens = "https://lens.google.com/uploadbyurl?url=" + encodeURIComponent(f.src || "");
   const tineye = "https://tineye.com/search?url=" + encodeURIComponent(f.src || "");
@@ -225,9 +289,20 @@ function renderVerdict(r) {
     + "<a href='" + tineye + "' target='_blank' rel='noopener'>TinEye</a></p>";
   $("body-for").innerHTML = fh;
 
-  // Layer 3: AI judgment (stubbed, honestly)
-  setLayer("ai", "coming soon", "miss");
-  $("body-ai").innerHTML = "<p>" + esc((r.ai && r.ai.note) || "Not available in this version.") + "</p>";
+  // Layer 3: AI judgment. The request control, its explanation, and
+  // its result all live in this layer. Explicit user action only,
+  // never automatic, and the disclosure sits next to the button.
+  setLayer("ai", "on request", "miss");
+  $("body-ai").innerHTML =
+    "<p><span class='k'>AI generation check.</span> The checks above read what the file declares about itself. This one looks at the image itself.</p>"
+    + "<p>" + esc((r.ai && r.ai.note) || "The AI generation check runs only when you ask for it. It sends the image through the NPC API to an outside detection service, and states the score it returns. Nothing runs automatically.") + "</p>"
+    + "<div class='ai-check'>"
+    + "<button id='ai-check-btn' class='ghost-btn' type='button'>Check this image for AI generation</button>"
+    + "<p class='fineprint'>This check sends the image to an outside detection service.</p>"
+    + "<div id='ai-check-result'></div>"
+    + "</div>";
+  const aiBtn = $("ai-check-btn");
+  if (aiBtn) aiBtn.addEventListener("click", runAiCheckFromPopup);
 
   // Nudge
   const nudge = $("nudge");
@@ -250,7 +325,59 @@ function renderVerdict(r) {
   show("view-verdict");
 }
 
+/* Past checks: the worker keeps this browser's own check history in
+ * local storage. The view lists each checked image with its verdict
+ * and when it was checked. Checking an image already listed returns
+ * its earlier result and uses no free check. */
+async function openHistory() {
+  show("view-history");
+  const list = $("history-list");
+  list.innerHTML = "<p class='quiet'>Loading…</p>";
+  let entries = [];
+  try {
+    const r = await chrome.runtime.sendMessage({ type: "NPC_HISTORY" });
+    entries = (r && r.entries) || [];
+  } catch (e) {
+    entries = [];
+  }
+  if (!entries.length) {
+    list.innerHTML = "<p class='quiet'>No checks yet. Images you check will be listed here.</p>";
+    return;
+  }
+  list.innerHTML = entries.map(e => {
+    let where = "";
+    try { where = new URL(e.src).hostname; } catch (err) { where = ""; }
+    const short = String(e.id || "").replace(/^(sha256|url-sha256):/, "").slice(0, 12);
+    const thumb = e.src
+      ? "<img class='hist-thumb' src='" + esc(e.src) + "' alt=''>"
+      : "";
+    return "<div class='hist-row'>"
+      + thumb
+      + "<div class='hist-text'>"
+      + "<p class='hist-verdict'>" + esc(e.verdictWord || "Checked") + "</p>"
+      + "<p class='hist-meta'>" + esc(String(e.checkedAt || "").slice(0, 10))
+      + (where ? " · " + esc(where) : "")
+      + (short ? " · image " + esc(short) + "…" : "")
+      + "</p></div></div>";
+  }).join("");
+  /* A thumbnail that cannot load (hotlink protection, a dead address)
+   * is dropped, leaving the plain text row. The error listener is
+   * attached here rather than inline: the popup's CSP, like every
+   * MV3 extension page, forbids inline handlers. */
+  for (const img of list.querySelectorAll(".hist-thumb")) {
+    if (img.complete && img.naturalWidth === 0) img.remove();
+    else img.addEventListener("error", () => img.remove());
+  }
+}
+
 $("check-btn").addEventListener("click", runCheck);
 $("again-btn").addEventListener("click", () => { renderPicker(); show("view-pick"); });
+for (const b of document.querySelectorAll(".history-open")) {
+  b.addEventListener("click", openHistory);
+}
+$("history-back").addEventListener("click", () => {
+  if (IMAGES.length) { renderPicker(); show("view-pick"); }
+  else show("view-empty");
+});
 
 document.addEventListener("DOMContentLoaded", init);

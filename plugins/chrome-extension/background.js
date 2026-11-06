@@ -12,8 +12,14 @@
  *             Bytes are fetched in the page's own context when possible
  *             (the page already loaded the image), falling back to a
  *             direct fetch where the host allows it.
- *   Layer 3 (AI judgment): stubbed. The hosted Fleet backend adds a
- *             probabilistic read here later. This scaffold never guesses.
+ *   Layer 3 (AI judgment): on request only, from the AI judgment
+ *             section of the panel. The worker sends the image to the
+ *             verification API,
+ *             which asks Sightengine from the server side (no
+ *             detection credentials ever ship in client code) and
+ *             returns the score inside its signed response, verified
+ *             here like every other answer. Never automatic, and a
+ *             failed or unverifiable check shows no result.
  *
  * Verdicts are only ever: "verified", "no_record", "not_checked",
  * "api_unreachable". We never claim more than we checked.
@@ -28,13 +34,70 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     );
     return true; // async response
   }
+  if (msg.type === "NPC_AI_CHECK") {
+    runAiCheck(msg.image, msg.tabId).then(sendResponse).catch(err =>
+      sendResponse({ status: "error", detail: String(err && err.message || err) })
+    );
+    return true; // async response
+  }
   if (msg.type === "NPC_CHECKS_USED") {
     chrome.storage.local.get(["npc_checks_used"]).then(s =>
       sendResponse({ used: s.npc_checks_used || 0 })
     );
     return true;
   }
+  if (msg.type === "NPC_HISTORY") {
+    npcLoadHistory().then(entries =>
+      sendResponse({ entries: entries.map(npcHistorySummary) })
+    );
+    return true;
+  }
 });
+
+/* ------------------------------------------------------------------ */
+/* Check history + free-check dedupe                                    */
+/* ------------------------------------------------------------------ */
+
+/* Completed checks are remembered locally, keyed by the image's
+ * identity: the SHA-256 of its bytes when the bytes could be read,
+ * the SHA-256 of its address when they could not. Checking the same
+ * image again returns the remembered result and does not consume
+ * another free check. Only signature-verified registry outcomes are
+ * remembered (a record matched, or a signed no-record answer): an
+ * error or an unreachable API is never cached, so a retry always
+ * runs the real check. History lives only in this browser's local
+ * storage; nothing about it leaves the device. */
+const NPC_HISTORY_KEY = "npc_check_history";
+const NPC_HISTORY_MAX = 20;
+
+async function npcLoadHistory() {
+  const s = await chrome.storage.local.get([NPC_HISTORY_KEY]);
+  return Array.isArray(s[NPC_HISTORY_KEY]) ? s[NPC_HISTORY_KEY] : [];
+}
+
+function npcHistorySummary(entry) {
+  return {
+    id: entry.id,
+    src: entry.src,
+    verdictWord: entry.verdictWord,
+    checkedAt: entry.checkedAt
+  };
+}
+
+async function npcRememberCheck(identity, result) {
+  const entries = await npcLoadHistory();
+  const kept = entries.filter(e => e.id !== identity);
+  kept.unshift({
+    id: identity,
+    src: result.image && result.image.src,
+    verdictWord: result.verdictWord,
+    checkedAt: result.checkedAt,
+    result
+  });
+  await chrome.storage.local.set({
+    [NPC_HISTORY_KEY]: kept.slice(0, NPC_HISTORY_MAX)
+  });
+}
 
 /* ------------------------------------------------------------------ */
 /* NPC-JCS-v1 canonical JSON + Ed25519 response-signature verification */
@@ -226,13 +289,118 @@ async function runForensics(image, tabId) {
         const bin = atob(b64);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        return npcAnalyzeImageBytes(bytes, image.src, image.w, image.h);
+        const report = npcAnalyzeImageBytes(bytes, image.src, image.w, image.h);
+        report.contentHash = await npcContentHashHex(bytes);
+        return report;
       }
     } catch (e) {
       // Restricted page or injection refused: fall through to direct fetch.
     }
   }
   return npcAnalyzeImage(image.src, image.w, image.h);
+}
+
+/* ------------------------------------------------------------------ */
+/* Layer 3: AI generation check (explicit user action only)             */
+/* ------------------------------------------------------------------ */
+
+/* Largest image sent as bytes; bigger files go by URL instead. The
+ * API caps decoded bytes at 750 KB (base64 stays under its body cap). */
+const NPC_AI_MAX_BYTES = 750 * 1000;
+
+function npcBytesToBase64(bytes) {
+  let bin = "";
+  const CHUNK = 32768;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+/* The image bytes for the check: page context first (same path the
+ * forensics layer uses), then a direct fetch. Null when neither works;
+ * the caller falls back to sending the image URL. */
+async function npcFetchImageBytesForCheck(image, tabId) {
+  if (tabId) {
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: npcPageFetchImageBase64,
+        args: [image.src]
+      });
+      const b64 = results && results[0] && results[0].result;
+      if (b64) {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return bytes;
+      }
+    } catch (e) {
+      // Restricted page or injection refused: fall through to direct fetch.
+    }
+  }
+  return npcFetchImageBytes(image.src);
+}
+
+/* Runs only when the user presses the button in the AI judgment
+ * section. The image goes to the NPC verification API, never to the detection
+ * service from here: the API holds the Sightengine credentials and
+ * answers inside its signed envelope, verified before any result is
+ * shown. Every failure returns an honest status, never a guess. */
+async function runAiCheck(image, tabId) {
+  const cfg = await npcGetConfig();
+  if (!cfg.apiKey) return { status: "not_configured" };
+  const bytes = await npcFetchImageBytesForCheck(image, tabId);
+  let payload;
+  if (bytes && bytes.length <= NPC_AI_MAX_BYTES) {
+    payload = { image_base64: npcBytesToBase64(bytes) };
+  } else {
+    // Bytes unreadable here, or too large to send: the API passes
+    // the image URL to the detection service instead.
+    payload = { image_url: image.src };
+  }
+  let res;
+  try {
+    res = await fetch(cfg.apiBase + "/images/ai-check", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + cfg.apiKey
+      },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    return { status: "unreachable" };
+  }
+  if (res.status === 401 || res.status === 403) {
+    return { status: "unauthorized" };
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    return { status: "error", detail: "bad_response" };
+  }
+  if (res.status !== 200) {
+    if (data && data.error === "detector_unavailable") {
+      return { status: "unavailable" };
+    }
+    return { status: "error", detail: "http_" + res.status };
+  }
+  const sigState = await npcVerifyResponseSignature(
+    cfg.apiBase, data,
+    res.headers.get("X-NPC-Signature"), res.headers.get("X-NPC-Key-ID"));
+  if (sigState !== "valid") {
+    return { status: "signature_failed", detail: sigState };
+  }
+  return {
+    status: "ok",
+    sigVerified: true,
+    percent: data.ai_generated_percent,
+    provider: data.provider,
+    model: data.model,
+    checkedAt: data.checked_at
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -244,6 +412,36 @@ async function runCheck(image, tabId) {
   const started = Date.now();
 
   const forensics = await runForensics(image, tabId);
+
+  /* Dedupe: the same image checked before returns its remembered
+   * result. No registry call is made and no free check is consumed.
+   * The identity is the hash of the image bytes when they could be
+   * read, and the hash of the image address when they could not. */
+  let identity = null;
+  if (forensics && forensics.contentHash) {
+    identity = "sha256:" + forensics.contentHash;
+  } else if (image && image.src) {
+    try {
+      identity = "url-sha256:" + (await npcSha256Hex(image.src));
+    } catch (e) {
+      identity = null;
+    }
+  }
+  if (identity) {
+    const prior = (await npcLoadHistory()).find(e => e.id === identity);
+    if (prior && prior.result) {
+      const cached = JSON.parse(JSON.stringify(prior.result));
+      cached.image = image;
+      cached.fromHistory = true;
+      const store = await chrome.storage.local.get(["npc_checks_used"]);
+      cached.checksUsed = store.npc_checks_used || 0;
+      cached.verdictSub = cached.verdictSub
+        + " You checked this image on " + String(cached.checkedAt || "").slice(0, 10)
+        + ". Showing that result again did not use a free check.";
+      return cached;
+    }
+  }
+
   const provenance = await checkProvenance(image.src, cfg);
 
   let verdict, verdictWord, verdictSub, showMark = false;
@@ -292,7 +490,7 @@ async function runCheck(image, tabId) {
   const used = (store.npc_checks_used || 0) + 1;
   await chrome.storage.local.set({ npc_checks_used: used });
 
-  return {
+  const result = {
     image,
     verdict,
     verdictWord,
@@ -301,8 +499,8 @@ async function runCheck(image, tabId) {
     provenance,
     forensics,
     ai: {
-      status: "unavailable",
-      note: "The hosted Fleet backend will add a probabilistic read here, with its confidence stated. This version does not guess."
+      status: "on_request",
+      note: "The AI generation check runs only when you ask for it. It sends the image through the NPC API to an outside detection service, and states the score it returns. Nothing runs automatically."
     },
     nudge: verdict === "no_record",
     nudgeUrl: cfg.getVerifiedUrl,
@@ -310,6 +508,20 @@ async function runCheck(image, tabId) {
     checksUsed: used,
     checksTotal: cfg.freeChecksTotal,
     elapsedMs: Date.now() - started,
-    checkedAt: new Date().toISOString()
+    checkedAt: new Date().toISOString(),
+    fromHistory: false
   };
+
+  /* Remember the result for the history view and for dedupe, but
+   * only when the registry answer was signature-verified (a match,
+   * or a signed no-record). Errors are never remembered: a retry
+   * must be free to reach a different answer. */
+  if (identity && (pv === "matched" || pv === "unknown")) {
+    try {
+      await npcRememberCheck(identity, JSON.parse(JSON.stringify(result)));
+    } catch (e) {
+      // History is a convenience; a storage failure never fails a check.
+    }
+  }
+  return result;
 }

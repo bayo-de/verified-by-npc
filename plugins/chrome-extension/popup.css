@@ -163,6 +163,23 @@ body {
 .layer-body a { color: var(--accent); text-decoration: none; }
 .layer-body a:hover { text-decoration: underline; }
 
+/* AI generation check (inside the AI judgment layer) */
+.ai-check { margin-top: 11px; border-top: 1px solid var(--line); padding-top: 10px; }
+.ai-check .fineprint { margin-top: 6px; }
+.ai-check #ai-check-result p:first-child { margin-top: 9px; }
+
+/* past checks */
+.small-word { font-size: 22px; margin: 6px 0 6px; }
+.history-list { margin-top: 12px; }
+.hist-row { border-top: 1px solid var(--line); padding: 9px 2px; display: flex; gap: 10px; align-items: flex-start; }
+.hist-thumb {
+  width: 44px; height: 44px; flex: none; object-fit: cover;
+  border-radius: 7px; border: 1px solid var(--line); background: var(--well);
+}
+.hist-text { flex: 1; min-width: 0; }
+.hist-verdict { font-weight: 600; font-size: 13.5px; }
+.hist-meta { color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
 /* nudge */
 .nudge {
   margin-top: 14px;

@@ -1,6 +1,7 @@
 # NPC Verify: Chrome extension
 
-**Status:** v1.0.0, Web Store submission candidate (not yet submitted).
+**Status:** v1.1.1, staged 2026-10-28 (fixes from the live v1.1.0
+test; not yet submitted). v1.1.0 is the version live in the Web Store.
 **Category (BETA):** Trust infrastructure / provenance.
 
 NPC Verify checks whether an image on the web is registered with NPC
@@ -25,11 +26,22 @@ Labs, and says plainly what it found and what it did not check.
    PNG text chunks, matched against known generator markers. Findings
    are reported; conclusions are not drawn. Bytes never leave the
    device for this layer.
-3. **AI judgment.** Not in this version. The panel says so rather
-   than guessing.
+3. **AI judgment (on request).** The third layer holds the AI
+   generation check: its control, explanation, and result live in
+   that layer. It runs only when the user presses the button. The
+   image goes through the NPC API to Sightengine, an outside
+   detection service, and the score it returns is stated with its
+   number, inside the API's signed answer, verified like every
+   other answer. Nothing runs automatically.
 
 The free tier counts checks locally (10 free checks) and, on a
 no-record result, offers an invite link the user can send the creator.
+A check of an image already checked returns the earlier result and
+uses no free check: completed checks are remembered locally, keyed
+by the SHA-256 of the image bytes (or of its address when the bytes
+could not be read), and the popup's Past checks view lists them.
+Only signature-verified registry outcomes are remembered, so an
+error is never cached and a retry always runs the real check.
 
 ## Design
 
@@ -45,7 +57,9 @@ is the largest thing in the panel.
   the active tab's images and, during a check, read the selected
   image's bytes in the page context. No standing content script; the
   collector is injected on demand only.
-- `storage`: the local free-check counter and optional developer
+- `storage`: the local free-check counter, the local history of
+  completed checks (this browser only; it powers the Past checks
+  view and the repeat-check dedupe), and optional developer
   overrides for the API base and key.
 - Host permission for `https://api.npclabs.xyz/*` only: the
   verification API.
