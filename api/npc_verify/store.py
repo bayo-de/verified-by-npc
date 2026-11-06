@@ -19,8 +19,11 @@ The registrations table (public verification-start) is append-only too.
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
+
+from . import credits as credits_module
 
 
 def registration_email_hash(email):
@@ -33,6 +36,50 @@ def registration_email_hash(email):
     """
     return hashlib.sha256(
         (email or "").strip().lower().encode("utf-8")).hexdigest()
+
+
+_CONTENT_HASH_LOCATOR_RE = re.compile(
+    r"^(?:sha256:)?([0-9a-fA-F]{32,128})$")
+
+
+def registration_claim_hashes(record):
+    """The claim hashes a content registration answers to.
+
+    A registration carries no claim_hash column (that is attestation
+    vocabulary); it is findable by the hashes its own fields imply:
+
+    - the SHA-256 of its locator, when the locator is a URL. This is
+      the lookup the browser extension performs: it hashes the web
+      address of the image it is checking.
+    - the SHA-256 of the content bytes, recorded at intake in the
+      content_fetch check entry when the locator yielded the work
+      itself; or the hash the creator supplied when the locator IS
+      a content hash (the extension's forensics layer hashes the
+      bytes it read).
+
+    Returns a set of lowercase hex strings. Agent registrations and
+    malformed records answer to nothing.
+    """
+    hashes = set()
+    if not isinstance(record, dict) or record.get("kind") != "content":
+        return hashes
+    locator = record.get("locator")
+    if isinstance(locator, str):
+        loc = locator.strip()
+        if loc.startswith("https://") or loc.startswith("http://"):
+            hashes.add(hashlib.sha256(
+                loc.encode("utf-8")).hexdigest())
+        else:
+            m = _CONTENT_HASH_LOCATOR_RE.match(loc)
+            if m:
+                hashes.add(m.group(1).lower())
+    for entry in record.get("checks_run") or []:
+        if isinstance(entry, dict) \
+                and entry.get("check") == "content_fetch":
+            sha = entry.get("sha256")
+            if isinstance(sha, str) and sha.strip():
+                hashes.add(sha.strip().lower())
+    return hashes
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS attestations (
@@ -399,6 +446,238 @@ CREATE INDEX IF NOT EXISTS idx_soatt_email
   ON social_attempts (email_hash, created_at);
 CREATE INDEX IF NOT EXISTS idx_soatt_ip
   ON social_attempts (client_ip, created_at);
+
+-- Paid check credits (npc_verify.credits, 2026-10-28). Codes are
+-- stored only as SHA-256 hashes; the plaintext lives in the
+-- purchase row until the buyer collects it, then it is wiped.
+-- A charge row exists per (code, image) pair ever charged, and
+-- the UNIQUE constraint makes a second charge for the same image
+-- structurally impossible: a re-check can never consume twice.
+CREATE TABLE IF NOT EXISTS credit_codes (
+  code_hash         TEXT PRIMARY KEY,
+  pack_id           TEXT NOT NULL,
+  credits_total     INTEGER NOT NULL,
+  credits_used      INTEGER NOT NULL DEFAULT 0,
+  status            TEXT NOT NULL DEFAULT 'active',
+  stripe_session_id TEXT UNIQUE,
+  buyer_email       TEXT,
+  created_at        TEXT NOT NULL,
+  redeemed_at       TEXT,
+  last_used_at      TEXT
+);
+CREATE TABLE IF NOT EXISTS credit_charges (
+  id             TEXT PRIMARY KEY,
+  code_hash      TEXT NOT NULL,
+  image_identity TEXT NOT NULL,
+  claim_hash     TEXT,
+  kind           TEXT NOT NULL DEFAULT 'standard',
+  funded_by      TEXT NOT NULL DEFAULT '',
+  created_at     TEXT NOT NULL,
+  UNIQUE (code_hash, image_identity)
+);
+CREATE INDEX IF NOT EXISTS idx_ccharge_code
+  ON credit_charges (code_hash, created_at);
+CREATE TABLE IF NOT EXISTS credit_purchases (
+  session_id     TEXT PRIMARY KEY,
+  pack_id        TEXT NOT NULL,
+  code_hash      TEXT,
+  code_plaintext TEXT,
+  status         TEXT NOT NULL DEFAULT 'pending',
+  buyer_email    TEXT,
+  code_delivered INTEGER NOT NULL DEFAULT 0,
+  referral_hash  TEXT,
+  created_at     TEXT NOT NULL,
+  completed_at   TEXT
+);
+-- Verifier Pass (switched on 2026-10-28). A Pass code's balance
+-- lives in grants, not in the code row's counters: each grant is
+-- one month's allowance (amount checks, at most ai_cap of them
+-- spendable on AI generation checks), spendable until expires_at
+-- (the end of the month after the grant month: one rollover).
+-- A subscription row ties the Stripe subscription to its code and
+-- carries the monthly figures renewals grant by.
+CREATE TABLE IF NOT EXISTS credit_grants (
+  grant_id   TEXT PRIMARY KEY,
+  code_hash  TEXT NOT NULL,
+  amount     INTEGER NOT NULL,
+  used       INTEGER NOT NULL DEFAULT 0,
+  ai_cap     INTEGER NOT NULL DEFAULT 0,
+  ai_used    INTEGER NOT NULL DEFAULT 0,
+  source     TEXT NOT NULL DEFAULT 'pass',
+  granted_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cgrant_code
+  ON credit_grants (code_hash, granted_at);
+CREATE TABLE IF NOT EXISTS credit_subscriptions (
+  subscription_id TEXT PRIMARY KEY,
+  code_hash       TEXT NOT NULL UNIQUE,
+  pack_id         TEXT NOT NULL,
+  customer_id     TEXT,
+  buyer_email     TEXT,
+  monthly_checks  INTEGER NOT NULL,
+  ai_checks       INTEGER NOT NULL DEFAULT 0,
+  status          TEXT NOT NULL DEFAULT 'active',
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
+-- Referrals (Bayo, 2026-10-28). Every code carries a personal
+-- referral code: a separate string, stored only as its SHA-256
+-- hash, with the plaintext resting in the row until its one-time
+-- delivery, exactly like a redeem code in its purchase row. A
+-- referral row records one attribution, referee code to referrer
+-- code; the referee code is the primary key, so a user can be
+-- referred exactly once and the bonuses can land exactly once.
+CREATE TABLE IF NOT EXISTS credit_referral_codes (
+  referral_hash  TEXT PRIMARY KEY,
+  code_hash      TEXT NOT NULL UNIQUE,
+  code_plaintext TEXT,
+  delivered      INTEGER NOT NULL DEFAULT 0,
+  created_at     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS credit_referrals (
+  referee_code_hash     TEXT PRIMARY KEY,
+  referrer_code_hash    TEXT NOT NULL,
+  referral_hash         TEXT NOT NULL,
+  referee_grant_id      TEXT,
+  referrer_grant_id     TEXT,
+  referrer_link_grant_id TEXT,
+  referrer_bonus        INTEGER NOT NULL DEFAULT 0,
+  referrer_link_bonus   INTEGER NOT NULL DEFAULT 0,
+  linked_at             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cref_referrer
+  ON credit_referrals (referrer_code_hash, linked_at);
+
+-- Onchain anchoring (npc_verify.anchor): one row per batch of
+-- registrations whose Merkle root is written to Base, and one row
+-- per record carrying its leaf hash and Merkle proof. The batch row
+-- is written before anything is broadcast (root, record IDs,
+-- leaves, and then the signed transaction and its hash), so a crash
+-- anywhere recovers from these rows plus the chain itself. Batch
+-- rows change status over their life (prepared -> submitted ->
+-- confirmed / failed); record rows are inserted once and released
+-- (flagged, never deleted) only when their batch fails onchain,
+-- which returns the record to the unanchored pool. No submitter email or IP ever lands here:
+-- leaves hash the signed public record only.
+CREATE TABLE IF NOT EXISTS anchor_batches (
+  batch_id        TEXT PRIMARY KEY,
+  merkle_root     TEXT NOT NULL,
+  batch_sig       TEXT,
+  record_ids      TEXT NOT NULL,
+  leaves          TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'prepared',
+  nonce           INTEGER,
+  tx_hash         TEXT,
+  raw_tx          TEXT,
+  block_number    INTEGER,
+  block_timestamp TEXT,
+  error           TEXT,
+  created_at      TEXT NOT NULL,
+  submitted_at    TEXT,
+  confirmed_at    TEXT
+);
+CREATE TABLE IF NOT EXISTS record_anchors (
+  record_id TEXT PRIMARY KEY,
+  batch_id  TEXT NOT NULL,
+  leaf_hash TEXT NOT NULL,
+  proof     TEXT NOT NULL,
+  released  INTEGER NOT NULL DEFAULT 0
+);
+-- Rotation notices (npc_verify.anchor): owner-signed statements
+-- that move anchor authority from one anchor wallet to the next.
+-- A notice lands here only after its signature verifies against
+-- the configured owner address; the rows are the public rotation
+-- history the status endpoint reports from.
+CREATE TABLE IF NOT EXISTS anchor_rotations (
+  notice_id TEXT PRIMARY KEY,
+  notice    TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+-- Unified accounts (npc_verify.accounts, Gate G1). One account per
+-- person, rooted at an email address. Every secret at rest is a
+-- hash: session tokens, email-link tokens, handoff secrets, and
+-- recovery codes are stored only as SHA-256 digests, and the
+-- plaintext is returned exactly once at creation. Passkey public
+-- keys are stored as base64url COSE encodings (public material).
+CREATE TABLE IF NOT EXISTS accounts (
+  account_id TEXT PRIMARY KEY,
+  email      TEXT NOT NULL UNIQUE,
+  email_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_credentials (
+  credential_id   TEXT PRIMARY KEY,
+  account_id      TEXT NOT NULL,
+  public_key_cose TEXT NOT NULL,
+  alg             INTEGER NOT NULL,
+  sign_count      INTEGER NOT NULL DEFAULT 0,
+  aaguid          TEXT NOT NULL DEFAULT '',
+  transports      TEXT NOT NULL DEFAULT '',
+  label           TEXT NOT NULL DEFAULT '',
+  created_at      TEXT NOT NULL,
+  last_used_at    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_acct_cred_account
+  ON account_credentials (account_id);
+CREATE TABLE IF NOT EXISTS account_challenges (
+  challenge_id TEXT PRIMARY KEY,
+  account_id   TEXT NOT NULL DEFAULT '',
+  kind         TEXT NOT NULL,
+  challenge    TEXT NOT NULL,
+  created_at   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  consumed_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS account_email_tokens (
+  token_hash  TEXT PRIMARY KEY,
+  account_id  TEXT NOT NULL,
+  handoff_id  TEXT NOT NULL DEFAULT '',
+  created_at  TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  consumed_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS account_recovery_codes (
+  account_id  TEXT NOT NULL,
+  code_hash   TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  consumed_at TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (account_id, code_hash)
+);
+CREATE TABLE IF NOT EXISTS account_sessions (
+  session_id   TEXT PRIMARY KEY,
+  account_id   TEXT NOT NULL,
+  token_hash   TEXT NOT NULL UNIQUE,
+  surface      TEXT NOT NULL DEFAULT 'web',
+  device_label TEXT NOT NULL DEFAULT '',
+  created_at   TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  revoked_at   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_acct_sess_account
+  ON account_sessions (account_id);
+CREATE TABLE IF NOT EXISTS account_handoffs (
+  handoff_id   TEXT PRIMARY KEY,
+  secret_hash  TEXT NOT NULL,
+  device_label TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'pending',
+  account_id   TEXT NOT NULL DEFAULT '',
+  created_at   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  completed_at TEXT NOT NULL DEFAULT '',
+  consumed_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS account_events (
+  event_id   TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  detail     TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_acct_events_account
+  ON account_events (account_id, created_at);
 """
 
 
@@ -423,6 +702,7 @@ class Store:
             self.db.executescript(SCHEMA)
             self._migrate_api_keys()
             self._migrate_registrations()
+            self._migrate_credits()
             self.db.commit()
 
     @property
@@ -466,6 +746,59 @@ class Store:
             self.db.execute(
                 "UPDATE registrations SET email_hash=? WHERE record_id=?",
                 (registration_email_hash(r["email"]), r["record_id"]))
+
+    def _migrate_credits(self):
+        """kind column on credit_charges (added with the Verifier
+        Pass, 2026-10-28): charges record whether they were a
+        standard registry check or an AI generation check. source
+        column on credit_grants and referral_hash on
+        credit_purchases (added with referrals, 2026-10-28):
+        grants record what landed them (a Pass month, or a
+        referral bonus), and a purchase records the referral code
+        it was carried in with, as a hash. funded_by on
+        credit_charges and the referrer_link_* columns on
+        credit_referrals (added with the unlimited Pass and the
+        two-sided referral reward, later on 2026-10-28): a charge
+        covered by an active Verifier Pass is marked 'pass', and a
+        referral records the referrer's at-link bonus beside the
+        first-purchase bonus."""
+        cols = {r["name"]
+                for r in self.db.execute(
+                    "PRAGMA table_info(credit_charges)")}
+        if "kind" not in cols:
+            self.db.execute(
+                "ALTER TABLE credit_charges ADD COLUMN kind"
+                " TEXT NOT NULL DEFAULT 'standard'")
+        if "funded_by" not in cols:
+            self.db.execute(
+                "ALTER TABLE credit_charges ADD COLUMN funded_by"
+                " TEXT NOT NULL DEFAULT ''")
+        cols = {r["name"]
+                for r in self.db.execute(
+                    "PRAGMA table_info(credit_grants)")}
+        if "source" not in cols:
+            self.db.execute(
+                "ALTER TABLE credit_grants ADD COLUMN source"
+                " TEXT NOT NULL DEFAULT 'pass'")
+        cols = {r["name"]
+                for r in self.db.execute(
+                    "PRAGMA table_info(credit_purchases)")}
+        if "referral_hash" not in cols:
+            self.db.execute(
+                "ALTER TABLE credit_purchases"
+                " ADD COLUMN referral_hash TEXT")
+        cols = {r["name"]
+                for r in self.db.execute(
+                    "PRAGMA table_info(credit_referrals)")}
+        if "referrer_link_grant_id" not in cols:
+            self.db.execute(
+                "ALTER TABLE credit_referrals"
+                " ADD COLUMN referrer_link_grant_id TEXT")
+        if "referrer_link_bonus" not in cols:
+            self.db.execute(
+                "ALTER TABLE credit_referrals"
+                " ADD COLUMN referrer_link_bonus"
+                " INTEGER NOT NULL DEFAULT 0")
 
     def close(self):
         with self._lock:
@@ -770,6 +1103,28 @@ class Store:
                 return record
         return None
 
+    def registrations_by_claim_hash(self, claim_hash):
+        """Content registrations findable by this claim hash, newest
+        first. The registration-layer counterpart of
+        attestations_by_claim_hash: a registration answers to the
+        hash of its locator address and to the content hash recorded
+        at intake (see registration_claim_hashes). Records are the
+        parsed signed dicts, exactly as get_registration returns
+        them; the caller presents the match as a registration, never
+        as an attestation."""
+        rows = self._fetchall(
+            "SELECT record_json FROM registrations"
+            " WHERE kind='content' ORDER BY created_at DESC")
+        out = []
+        for row in rows:
+            try:
+                record = json.loads(row["record_json"])
+            except (ValueError, TypeError):
+                continue
+            if claim_hash in registration_claim_hashes(record):
+                out.append(record)
+        return out
+
     def count_registrations_since(self, dimension, value, since_iso):
         """Count registrations in a rolling window, for the caps.
 
@@ -791,6 +1146,26 @@ class Store:
                 " WHERE client_ip=? AND created_at>=?",
                 (value, since_iso))
         return row["n"] if row else 0
+
+    def oldest_registration_since(self, dimension, value, since_iso):
+        """Oldest created_at among registrations in a rolling
+        window, or None when the window holds none for the value.
+        The cap companion of count_registrations_since: a capped
+        caller can be told when the oldest counted submission ages
+        out. Same dimension discipline (a fixed literal chosen by
+        the caller; the email dimension matches by hash, so purged
+        rows still count)."""
+        if dimension == "email":
+            row = self._fetchone(
+                "SELECT MIN(created_at) AS t FROM registrations"
+                " WHERE email_hash=? AND created_at>=?",
+                (registration_email_hash(value), since_iso))
+        else:
+            row = self._fetchone(
+                "SELECT MIN(created_at) AS t FROM registrations"
+                " WHERE client_ip=? AND created_at>=?",
+                (value, since_iso))
+        return row["t"] if row else None
 
     def purge_registration_emails(self, cutoff_iso) -> int:
         """Retention sweep (audit D6): blank the raw email on every
@@ -1409,6 +1784,1138 @@ class Store:
             "SELECT DISTINCT thread_id FROM chat_turns WHERE"
             " substr(created_at, 1, 10)=? ORDER BY thread_id", (day,))
         return [r["thread_id"] for r in rows]
+
+    # -- paid check credits (npc_verify.credits) ---------------------------
+    # The ledger is the source of truth for balances. Composite
+    # read-check-write sequences run under the store lock, like the
+    # DynamoDB backend, so a consume is atomic: the charge row and
+    # the counter move together or not at all.
+
+    def create_credit_purchase(self, session_id, pack_id, buyer_email,
+                               now, referral_hash=None):
+        self._write(
+            "INSERT OR IGNORE INTO credit_purchases (session_id,"
+            " pack_id, status, buyer_email, created_at, referral_hash)"
+            " VALUES (?,?, 'pending', ?, ?, ?)",
+            (session_id, pack_id, buyer_email, now, referral_hash))
+
+    def get_credit_purchase(self, session_id):
+        return self._fetchone(
+            "SELECT * FROM credit_purchases WHERE session_id=?",
+            (session_id,))
+
+    def complete_credit_purchase(self, session_id, code_hash,
+                                 code_plaintext, pack, buyer_email, now):
+        """Mark a purchase paid and mint its code, exactly once.
+
+        Returns the code row. A replayed completion (a duplicate
+        webhook) returns the originally minted code row unchanged:
+        one paid session can never mint two codes.
+        """
+        with self._lock:
+            purchase = _one(self.db.execute(
+                "SELECT * FROM credit_purchases WHERE session_id=?",
+                (session_id,)))
+            if purchase is None:
+                return None
+            if purchase["status"] == "paid" \
+                    and purchase["code_hash"]:
+                return _one(self.db.execute(
+                    "SELECT * FROM credit_codes WHERE code_hash=?",
+                    (purchase["code_hash"],)))
+            self.db.execute(
+                "INSERT INTO credit_codes (code_hash, pack_id,"
+                " credits_total, credits_used, status,"
+                " stripe_session_id, buyer_email, created_at)"
+                " VALUES (?,?,?,0,'active',?,?,?)",
+                (code_hash, pack["id"], pack["checks"], session_id,
+                 buyer_email, now))
+            self.db.execute(
+                "UPDATE credit_purchases SET status='paid',"
+                " code_hash=?, code_plaintext=?, buyer_email=?,"
+                " completed_at=? WHERE session_id=?",
+                (code_hash, code_plaintext, buyer_email, now,
+                 session_id))
+            self.db.commit()
+            return _one(self.db.execute(
+                "SELECT * FROM credit_codes WHERE code_hash=?",
+                (code_hash,)))
+
+    def expire_credit_purchase(self, session_id, now):
+        self._write(
+            "UPDATE credit_purchases SET status='expired'"
+            " WHERE session_id=? AND status='pending'",
+            (session_id,))
+
+    def take_credit_code_delivery(self, session_id):
+        """Hand the plaintext code to the buyer's browser, once.
+
+        Returns (code_plaintext, purchase_row) on first delivery,
+        (None, purchase_row) when the code was already delivered
+        (the plaintext is wiped at delivery), and (None, None) for
+        an unknown or unpaid session.
+        """
+        with self._lock:
+            purchase = _one(self.db.execute(
+                "SELECT * FROM credit_purchases WHERE session_id=?",
+                (session_id,)))
+            if purchase is None or purchase["status"] != "paid":
+                return None, purchase
+            if purchase["code_delivered"] or \
+                    not purchase["code_plaintext"]:
+                return None, purchase
+            code = purchase["code_plaintext"]
+            self.db.execute(
+                "UPDATE credit_purchases SET code_delivered=1,"
+                " code_plaintext=NULL WHERE session_id=?",
+                (session_id,))
+            self.db.commit()
+            purchase = _one(self.db.execute(
+                "SELECT * FROM credit_purchases WHERE session_id=?",
+                (session_id,)))
+            return code, purchase
+
+    # -- Verifier Pass: subscriptions and monthly grants ---------------
+    # A Pass code's counters stay at zero; its spendable balance is
+    # the sum over its live grants. The helpers below compute that
+    # view, and every public read of a code row carries it.
+
+    def _credit_grants(self, code_hash):
+        """All grants on a code, oldest first."""
+        return self._fetchall(
+            "SELECT * FROM credit_grants WHERE code_hash=?"
+            " ORDER BY granted_at, grant_id", (code_hash,))
+
+    def _augment_credit_row(self, row, now):
+        """Attach the grant view to a raw credit_codes row: the
+        spendable grant balance and AI balance at `now` (grants past
+        their expiry count for nothing), the live grants with their
+        remaining amounts, and the Pass subscription status when the
+        code belongs to one. The AI balance is the Pass grants' AI
+        room plus the bonus grants' balances plus the code row's
+        own pack counters, which fund AI checks out of their whole
+        remainder (credits.pack_grant_view); Pass codes carry zero
+        counters, so nothing is added for them."""
+        if row is None:
+            return None
+        out = dict(row)
+        grant_balance = 0
+        ai_balance = 0
+        live = []
+        if now is not None:
+            ai_balance += credits_module.grant_ai_room(
+                credits_module.pack_grant_view(out))
+            for g in self._credit_grants(row["code_hash"]):
+                if g["expires_at"] <= now:
+                    continue
+                remaining = g["amount"] - g["used"]
+                ai_remaining = credits_module.grant_ai_room(g)
+                grant_balance += remaining
+                ai_balance += ai_remaining
+                entry = dict(g)
+                entry["remaining"] = remaining
+                entry["ai_remaining"] = ai_remaining
+                live.append(entry)
+        out["grant_balance"] = grant_balance
+        out["ai_balance"] = ai_balance
+        out["grants"] = live
+        sub = self._fetchone(
+            "SELECT * FROM credit_subscriptions WHERE code_hash=?",
+            (row["code_hash"],))
+        out["subscription_status"] = sub["status"] if sub else None
+        return out
+
+    def activate_pass_subscription(self, session_id, code_hash,
+                                   code_plaintext, pack, buyer_email,
+                                   subscription_id, customer_id,
+                                   grant_id, now, expires_at):
+        """Mark a Pass purchase paid, mint its code, open the
+        subscription, and land the first monthly grant, exactly
+        once. Returns the (augmented) code row. A replayed
+        activation returns the originally minted code row and
+        grants nothing twice."""
+        with self._lock:
+            purchase = _one(self.db.execute(
+                "SELECT * FROM credit_purchases WHERE session_id=?",
+                (session_id,)))
+            if purchase is None:
+                return None
+            if purchase["status"] == "paid" \
+                    and purchase["code_hash"]:
+                return self._augment_credit_row(_one(self.db.execute(
+                    "SELECT * FROM credit_codes WHERE code_hash=?",
+                    (purchase["code_hash"],))), now)
+            self.db.execute(
+                "INSERT INTO credit_codes (code_hash, pack_id,"
+                " credits_total, credits_used, status,"
+                " stripe_session_id, buyer_email, created_at)"
+                " VALUES (?,?,0,0,'active',?,?,?)",
+                (code_hash, pack["id"], session_id, buyer_email, now))
+            self.db.execute(
+                "INSERT INTO credit_subscriptions (subscription_id,"
+                " code_hash, pack_id, customer_id, buyer_email,"
+                " monthly_checks, ai_checks, status, created_at,"
+                " updated_at) VALUES (?,?,?,?,?,?,?,'active',?,?)",
+                (subscription_id, code_hash, pack["id"], customer_id,
+                 buyer_email, pack["checks"],
+                 pack.get("ai_checks", 0), now, now))
+            self.db.execute(
+                "INSERT INTO credit_grants (grant_id, code_hash,"
+                " amount, used, ai_cap, ai_used, granted_at,"
+                " expires_at) VALUES (?,?,?,0,?,0,?,?)",
+                (grant_id, code_hash, pack["checks"],
+                 pack.get("ai_checks", 0), now, expires_at))
+            self.db.execute(
+                "UPDATE credit_purchases SET status='paid',"
+                " code_hash=?, code_plaintext=?, buyer_email=?,"
+                " completed_at=? WHERE session_id=?",
+                (code_hash, code_plaintext, buyer_email, now,
+                 session_id))
+            self.db.commit()
+            return self._augment_credit_row(_one(self.db.execute(
+                "SELECT * FROM credit_codes WHERE code_hash=?",
+                (code_hash,))), now)
+
+    def get_subscription(self, subscription_id):
+        return self._fetchone(
+            "SELECT * FROM credit_subscriptions"
+            " WHERE subscription_id=?", (subscription_id,))
+
+    def grant_subscription_allowance(self, subscription_id, grant_id,
+                                     now, expires_at):
+        """Land one renewal grant for a subscription, keyed by the
+        Stripe invoice id, so a replayed invoice.paid grants once.
+        Outcomes: "granted", "duplicate" (this grant id already
+        landed), "inactive" (the subscription is canceled, so
+        renewals have stopped), "not_found"."""
+        with self._lock:
+            sub = _one(self.db.execute(
+                "SELECT * FROM credit_subscriptions"
+                " WHERE subscription_id=?", (subscription_id,)))
+            if sub is None:
+                return {"outcome": "not_found", "grant": None}
+            existing = _one(self.db.execute(
+                "SELECT * FROM credit_grants WHERE grant_id=?",
+                (grant_id,)))
+            if existing is not None:
+                return {"outcome": "duplicate", "grant": existing}
+            if sub["status"] != "active":
+                return {"outcome": "inactive", "grant": None}
+            self.db.execute(
+                "INSERT INTO credit_grants (grant_id, code_hash,"
+                " amount, used, ai_cap, ai_used, granted_at,"
+                " expires_at) VALUES (?,?,?,0,?,0,?,?)",
+                (grant_id, sub["code_hash"], sub["monthly_checks"],
+                 sub["ai_checks"], now, expires_at))
+            self.db.commit()
+            grant = _one(self.db.execute(
+                "SELECT * FROM credit_grants WHERE grant_id=?",
+                (grant_id,)))
+            return {"outcome": "granted", "grant": grant}
+
+    def cancel_subscription(self, subscription_id, now):
+        """Stop a subscription's future grants. Already-granted
+        checks are untouched and live until their expiry."""
+        with self._lock:
+            sub = _one(self.db.execute(
+                "SELECT * FROM credit_subscriptions"
+                " WHERE subscription_id=?", (subscription_id,)))
+            if sub is None:
+                return None
+            if sub["status"] != "canceled":
+                self.db.execute(
+                    "UPDATE credit_subscriptions SET status='canceled',"
+                    " updated_at=? WHERE subscription_id=?",
+                    (now, subscription_id))
+                self.db.commit()
+                sub = _one(self.db.execute(
+                    "SELECT * FROM credit_subscriptions"
+                    " WHERE subscription_id=?", (subscription_id,)))
+            return sub
+
+    # -- referrals (npc_verify.credits, Bayo 2026-10-28) ---------------
+    # A referral code is a second string per redeem code, under the
+    # same discipline: the server keeps only its SHA-256 hash as the
+    # lookup key, and the plaintext rests in the referral row until
+    # its one-time delivery. Attribution and both bonuses land in
+    # one locked sequence (attribute_referral), and the referral
+    # row itself is the idempotency record: its primary key is the
+    # referee code, so a user is referred exactly once and no
+    # replay, retry, or second link can grant twice.
+
+    def ensure_referral_code(self, code_hash, referral_hash,
+                             code_plaintext, now):
+        """Record a code's personal referral code, first one wins.
+        Returns the referral row for the code (an existing row is
+        returned unchanged, so a replayed mint records nothing
+        new)."""
+        with self._lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO credit_referral_codes"
+                " (referral_hash, code_hash, code_plaintext,"
+                " delivered, created_at) VALUES (?,?,?,0,?)",
+                (referral_hash, code_hash, code_plaintext, now))
+            self.db.commit()
+            return _one(self.db.execute(
+                "SELECT * FROM credit_referral_codes"
+                " WHERE code_hash=?", (code_hash,)))
+
+    def get_referral_code_for(self, code_hash):
+        """The referral row owned by a redeem code, or None."""
+        return self._fetchone(
+            "SELECT * FROM credit_referral_codes WHERE code_hash=?",
+            (code_hash,))
+
+    def get_referral_owner(self, referral_hash):
+        """The referral row a referral code hash names, or None."""
+        return self._fetchone(
+            "SELECT * FROM credit_referral_codes"
+            " WHERE referral_hash=?", (referral_hash,))
+
+    def take_referral_code_delivery(self, code_hash):
+        """Hand a code's referral plaintext to its owner, once.
+
+        Returns (plaintext, referral_row) on first delivery,
+        (None, referral_row) when the plaintext was already
+        delivered (it is wiped at delivery), and (None, None) when
+        the code has no referral row. Mirrors
+        take_credit_code_delivery."""
+        with self._lock:
+            row = _one(self.db.execute(
+                "SELECT * FROM credit_referral_codes"
+                " WHERE code_hash=?", (code_hash,)))
+            if row is None:
+                return None, None
+            if row["delivered"] or not row["code_plaintext"]:
+                return None, row
+            plain = row["code_plaintext"]
+            self.db.execute(
+                "UPDATE credit_referral_codes SET delivered=1,"
+                " code_plaintext=NULL WHERE code_hash=?",
+                (code_hash,))
+            self.db.commit()
+            row = _one(self.db.execute(
+                "SELECT * FROM credit_referral_codes"
+                " WHERE code_hash=?", (code_hash,)))
+            return plain, row
+
+    def get_referral(self, referee_code_hash):
+        """The referral row attributing a code, or None."""
+        return self._fetchone(
+            "SELECT * FROM credit_referrals"
+            " WHERE referee_code_hash=?", (referee_code_hash,))
+
+    def _referral_month_total(self, referrer_code_hash, month):
+        """Bonus checks already granted to a referrer as referral
+        bonuses inside one calendar month (an ISO "YYYY-MM"
+        prefix), counting the at-link and first-purchase bonuses
+        together. The monthly cap is measured against this sum."""
+        row = self._fetchone(
+            "SELECT COALESCE(SUM(amount), 0) AS total"
+            " FROM credit_grants WHERE code_hash=?"
+            " AND source IN ('referral_referrer', 'referral_link')"
+            " AND substr(granted_at, 1, 7)=?",
+            (referrer_code_hash, month))
+        return row["total"] or 0
+
+    def referral_stats(self, code_hash, now):
+        """Referral view for one code: how many users it has
+        referred, the bonus it earned inside the current calendar
+        month, and whether the code itself was referred."""
+        count = self._fetchone(
+            "SELECT COUNT(*) AS n FROM credit_referrals"
+            " WHERE referrer_code_hash=?", (code_hash,))
+        return {
+            "referred_count": count["n"] if count else 0,
+            "referral_bonus_this_month":
+                self._referral_month_total(code_hash, now[:7]),
+            "referred_by":
+                self.get_referral(code_hash) is not None,
+        }
+
+    def attribute_referral(self, referee_code_hash, referral_hash,
+                           referee_grant_id, referrer_grant_id, now,
+                           expires_at, referee_bonus, referrer_bonus,
+                           monthly_cap, referrer_link_bonus=0,
+                           referrer_link_grant_id=None):
+        """Attribute a referee code to a referral code's owner and
+        land the bonuses, atomically and exactly once.
+
+        Outcomes: "linked", "already_referred" (the referee was
+        attributed before; nothing moves), "self_referral" (the
+        referral code belongs to the referee code itself, or both
+        codes carry the same purchaser email; nothing is recorded
+        and nothing is granted), "referral_not_found",
+        "not_found" (the referee code is unknown), "revoked".
+
+        On "linked" the referral row is written, the referee
+        receives `referee_bonus` checks as a grant, and
+        the referrer receives two grants: `referrer_link_bonus`
+        for the link itself (source "referral_link") and
+        `referrer_bonus` for the referee's first paid purchase
+        (source "referral_referrer"). Both referrer grants are
+        trimmed in that order so the referrer's referral bonuses
+        inside the calendar month of `now` never pass
+        `monthly_cap` in total (a grant trimmed to 0 is not
+        written, and the shortfall is not owed later). Bonus
+        grants carry ai_cap 0 in storage, but a bonus check is
+        not standard-only: an AI generation check may spend a
+        bonus grant's whole remaining balance, drawn after any
+        Pass grant's AI sub-allowance (credits.BONUS_GRANT_SOURCES
+        and credits.grant_ai_room govern that draw). They expire
+        at `expires_at`, which the caller computes with
+        credits.grant_expiry: the same one-month rollover rule as
+        Pass grants.
+
+        First-purchase semantics: a code exists only because a
+        paid purchase minted it, so attribution, whether it
+        arrives with the purchase at checkout or later through the
+        link route, attributes that first purchase, and the
+        referral row guarantees both referrer bonuses fire for it
+        exactly once."""
+        with self._lock:
+            referee = _one(self.db.execute(
+                "SELECT * FROM credit_codes WHERE code_hash=?",
+                (referee_code_hash,)))
+            if referee is None:
+                return {"outcome": "not_found", "referral": None,
+                        "referee_bonus": 0, "referrer_bonus": 0,
+                        "referrer_link_bonus": 0}
+            if referee["status"] == "revoked":
+                return {"outcome": "revoked", "referral": None,
+                        "referee_bonus": 0, "referrer_bonus": 0,
+                        "referrer_link_bonus": 0}
+            owner = _one(self.db.execute(
+                "SELECT * FROM credit_referral_codes"
+                " WHERE referral_hash=?", (referral_hash,)))
+            if owner is None:
+                return {"outcome": "referral_not_found",
+                        "referral": None, "referee_bonus": 0,
+                        "referrer_bonus": 0, "referrer_link_bonus": 0}
+            referrer_hash = owner["code_hash"]
+            referrer = _one(self.db.execute(
+                "SELECT * FROM credit_codes WHERE code_hash=?",
+                (referrer_hash,)))
+            referee_email = (referee["buyer_email"] or "").strip() \
+                .casefold()
+            referrer_email = ""
+            if referrer is not None:
+                referrer_email = (referrer["buyer_email"] or "") \
+                    .strip().casefold()
+            if referrer_hash == referee_code_hash or (
+                    referee_email and referee_email == referrer_email):
+                return {"outcome": "self_referral", "referral": None,
+                        "referee_bonus": 0, "referrer_bonus": 0,
+                        "referrer_link_bonus": 0}
+            existing = _one(self.db.execute(
+                "SELECT * FROM credit_referrals"
+                " WHERE referee_code_hash=?", (referee_code_hash,)))
+            if existing is not None:
+                return {"outcome": "already_referred",
+                        "referral": existing, "referee_bonus": 0,
+                        "referrer_bonus":
+                            existing["referrer_bonus"],
+                        "referrer_link_bonus":
+                            existing["referrer_link_bonus"]}
+            month_total = self._referral_month_total(
+                referrer_hash, now[:7])
+            link_amount = max(0, min(referrer_link_bonus,
+                                     monthly_cap - month_total))
+            amount = max(0, min(
+                referrer_bonus,
+                monthly_cap - month_total - link_amount))
+            self.db.execute(
+                "INSERT INTO credit_referrals (referee_code_hash,"
+                " referrer_code_hash, referral_hash,"
+                " referee_grant_id, referrer_grant_id,"
+                " referrer_link_grant_id, referrer_bonus,"
+                " referrer_link_bonus, linked_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (referee_code_hash, referrer_hash, referral_hash,
+                 referee_grant_id,
+                 referrer_grant_id if amount > 0 else None,
+                 referrer_link_grant_id if link_amount > 0 else None,
+                 amount, link_amount, now))
+            self.db.execute(
+                "INSERT INTO credit_grants (grant_id, code_hash,"
+                " amount, used, ai_cap, ai_used, source, granted_at,"
+                " expires_at) VALUES (?,?,?,0,0,0,"
+                " 'referral_referee',?,?)",
+                (referee_grant_id, referee_code_hash, referee_bonus,
+                 now, expires_at))
+            if link_amount > 0:
+                self.db.execute(
+                    "INSERT INTO credit_grants (grant_id, code_hash,"
+                    " amount, used, ai_cap, ai_used, source,"
+                    " granted_at, expires_at) VALUES (?,?,?,0,0,0,"
+                    " 'referral_link',?,?)",
+                    (referrer_link_grant_id, referrer_hash,
+                     link_amount, now, expires_at))
+            if amount > 0:
+                self.db.execute(
+                    "INSERT INTO credit_grants (grant_id, code_hash,"
+                    " amount, used, ai_cap, ai_used, source,"
+                    " granted_at, expires_at) VALUES (?,?,?,0,0,0,"
+                    " 'referral_referrer',?,?)",
+                    (referrer_grant_id, referrer_hash, amount, now,
+                     expires_at))
+            self.db.commit()
+            row = _one(self.db.execute(
+                "SELECT * FROM credit_referrals"
+                " WHERE referee_code_hash=?", (referee_code_hash,)))
+            return {"outcome": "linked", "referral": row,
+                    "referee_bonus": referee_bonus,
+                    "referrer_bonus": amount,
+                    "referrer_link_bonus": link_amount}
+
+    def get_credit_code(self, code_hash, now=None):
+        row = self._fetchone(
+            "SELECT * FROM credit_codes WHERE code_hash=?", (code_hash,))
+        return self._augment_credit_row(row, now)
+
+    def redeem_credit_code(self, code_hash, now):
+        """First presentation of a code stamps redeemed_at. Returns
+        the code row, or None for an unknown code."""
+        with self._lock:
+            row = _one(self.db.execute(
+                "SELECT * FROM credit_codes WHERE code_hash=?",
+                (code_hash,)))
+            if row is None:
+                return None
+            if not row["redeemed_at"]:
+                self.db.execute(
+                    "UPDATE credit_codes SET redeemed_at=?"
+                    " WHERE code_hash=?", (now, code_hash))
+                self.db.commit()
+                row = _one(self.db.execute(
+                    "SELECT * FROM credit_codes WHERE code_hash=?",
+                    (code_hash,)))
+            return self._augment_credit_row(row, now)
+
+    def consume_credit(self, code_hash, image_identity, claim_hash,
+                       charge_id, now, kind="standard",
+                       hourly_limit=None):
+        """Charge one credit for one new image, atomically.
+
+        Outcomes: "charged" (a new charge row, counter moved),
+        "duplicate" (this image was already charged to this code;
+        nothing moves), "no_credits" (nothing spendable remains),
+        "no_ai_credits" (checks remain but none of them can fund
+        an AI generation check: every Pass grant's AI
+        sub-allowance is spent, no bonus balance stands, and the
+        pack counters are empty, while some grant remainder that
+        only funds standard checks is left), "rate_limited"
+        (the code's charged consumes inside the trailing hour
+        reached the anti-scripting backstop; nothing moves),
+        "revoked", "not_found". The UNIQUE(code_hash,
+        image_identity) row is the guard: even a raced second
+        insert cannot land.
+
+        Pack codes spend from the code row's own counters, exactly
+        as before. A code with grants spends oldest live grant
+        first; an AI charge also draws that grant's AI
+        sub-allowance. While the code's Verifier Pass subscription
+        is active, a standard charge is covered by the Pass itself
+        (registry checks are unlimited for subscribers): the charge
+        row lands marked funded_by 'pass', so usage stays
+        countable, and no counter or grant moves. Cancellation
+        ends that coverage at once, and the finite pools are
+        drawn again. A Pass code's status never flips to
+        exhausted: the subscription renews it.
+
+        An AI charge draws, in order, the oldest live Pass grant
+        with AI sub-allowance left, then bonus grants oldest
+        first, then the code's pack counters; a bonus grant funds
+        an AI check from its whole remaining balance, the same
+        pool its standard checks spend, and a pack balance funds
+        one from its whole remainder too (credits.grant_ai_room).
+        A charge drawn from a bonus grant lands with funded_by
+        "bonus" and one drawn from the pack counters with
+        funded_by "pack", so the ledger can say exactly how many
+        AI checks each source paid for.
+        """
+        with self._lock:
+            row = _one(self.db.execute(
+                "SELECT * FROM credit_codes WHERE code_hash=?",
+                (code_hash,)))
+            if row is None:
+                return {"outcome": "not_found", "code": None}
+            if row["status"] == "revoked":
+                return {"outcome": "revoked",
+                        "code": self._augment_credit_row(row, now)}
+            prior = _one(self.db.execute(
+                "SELECT id FROM credit_charges WHERE code_hash=?"
+                " AND image_identity=?", (code_hash, image_identity)))
+            if prior is not None:
+                return {"outcome": "duplicate",
+                        "code": self._augment_credit_row(row, now)}
+            if hourly_limit is None:
+                hourly_limit = credits_module.CONSUME_HOURLY_LIMIT
+            if hourly_limit:
+                recent = self._fetchone(
+                    "SELECT COUNT(*) AS n FROM credit_charges"
+                    " WHERE code_hash=? AND created_at>=?",
+                    (code_hash, credits_module.hour_ago(now)))
+                if recent is not None \
+                        and recent["n"] >= hourly_limit:
+                    return {"outcome": "rate_limited",
+                            "code": self._augment_credit_row(row, now)}
+            if kind == "standard":
+                sub = self._fetchone(
+                    "SELECT * FROM credit_subscriptions"
+                    " WHERE code_hash=?", (code_hash,))
+                if sub is not None and sub["status"] == "active":
+                    return self._consume_covered_by_pass(
+                        row, image_identity, claim_hash, charge_id,
+                        now)
+            grants = self._credit_grants(code_hash)
+            if grants:
+                return self._consume_with_grants(
+                    row, grants, image_identity, claim_hash, charge_id,
+                    now, kind)
+            if row["credits_used"] >= row["credits_total"]:
+                return {"outcome": "no_credits",
+                        "code": self._augment_credit_row(row, now)}
+            # The code's own pack counters fund this charge; an AI
+            # charge drawn from them is marked funded_by "pack".
+            funded_by = "pack" if kind == "ai" else ""
+            try:
+                self.db.execute(
+                    "INSERT INTO credit_charges (id, code_hash,"
+                    " image_identity, claim_hash, kind, funded_by,"
+                    " created_at) VALUES (?,?,?,?,?,?,?)",
+                    (charge_id, code_hash, image_identity, claim_hash,
+                     kind, funded_by, now))
+            except Exception:
+                self.db.rollback()
+                return {"outcome": "duplicate",
+                        "code": self._augment_credit_row(row, now)}
+            used = row["credits_used"] + 1
+            status = "exhausted" if used >= row["credits_total"] \
+                else row["status"]
+            self.db.execute(
+                "UPDATE credit_codes SET credits_used=?, status=?,"
+                " last_used_at=? WHERE code_hash=?",
+                (used, status, now, code_hash))
+            self.db.commit()
+            row = _one(self.db.execute(
+                "SELECT * FROM credit_codes WHERE code_hash=?",
+                (code_hash,)))
+            return {"outcome": "charged",
+                    "code": self._augment_credit_row(row, now)}
+
+    def _consume_covered_by_pass(self, row, image_identity,
+                                 claim_hash, charge_id, now):
+        """The Pass-covered path of consume_credit, called under
+        the store lock with the duplicate check already done and
+        the subscription known active: record the charge marked
+        funded_by 'pass' and move nothing else. The charge row is
+        the usage record (and feeds the hourly backstop count);
+        the code's last_used_at is the only field that moves."""
+        code_hash = row["code_hash"]
+        try:
+            self.db.execute(
+                "INSERT INTO credit_charges (id, code_hash,"
+                " image_identity, claim_hash, kind, funded_by,"
+                " created_at) VALUES (?,?,?,?,'standard','pass',?)",
+                (charge_id, code_hash, image_identity, claim_hash,
+                 now))
+        except Exception:
+            self.db.rollback()
+            return {"outcome": "duplicate",
+                    "code": self._augment_credit_row(row, now)}
+        self.db.execute(
+            "UPDATE credit_codes SET last_used_at=?"
+            " WHERE code_hash=?", (now, code_hash))
+        self.db.commit()
+        row = _one(self.db.execute(
+            "SELECT * FROM credit_codes WHERE code_hash=?",
+            (code_hash,)))
+        return {"outcome": "charged",
+                "code": self._augment_credit_row(row, now)}
+
+    def _consume_with_grants(self, row, grants, image_identity,
+                             claim_hash, charge_id, now, kind):
+        """The grant path of consume_credit, called under the store
+        lock with the duplicate check already done. Draws the oldest
+        live grant first; grants past expiry are invisible. AI
+        charges follow the draw order instead: Pass grants' AI
+        sub-allowances first (oldest first), then bonus grants
+        (oldest first), each bonus draw spending the grant's shared
+        pool and landing marked funded_by "bonus", then the code's
+        pack counters, landing marked funded_by "pack"."""
+        code_hash = row["code_hash"]
+        live = [g for g in grants if g["expires_at"] > now]
+        grant_remaining = sum(g["amount"] - g["used"] for g in live)
+        legacy_remaining = row["credits_total"] - row["credits_used"]
+        target = None
+        if kind == "ai":
+            for g in live:
+                if g["source"] not in \
+                        credits_module.BONUS_GRANT_SOURCES \
+                        and credits_module.grant_ai_room(g) > 0:
+                    target = g
+                    break
+            if target is None:
+                for g in live:
+                    if g["source"] in \
+                            credits_module.BONUS_GRANT_SOURCES \
+                            and credits_module.grant_ai_room(g) > 0:
+                        target = g
+                        break
+            if target is None and credits_module.grant_ai_room(
+                    credits_module.pack_grant_view(row)) <= 0:
+                outcome = "no_credits" \
+                    if grant_remaining + legacy_remaining <= 0 \
+                    else "no_ai_credits"
+                return {"outcome": outcome,
+                        "code": self._augment_credit_row(row, now)}
+        else:
+            if grant_remaining + legacy_remaining <= 0:
+                return {"outcome": "no_credits",
+                        "code": self._augment_credit_row(row, now)}
+            for g in live:
+                if g["amount"] - g["used"] > 0:
+                    target = g
+                    break
+        funded_by = ""
+        if kind == "ai" and target is not None \
+                and target["source"] in \
+                credits_module.BONUS_GRANT_SOURCES:
+            funded_by = "bonus"
+        elif kind == "ai" and target is None:
+            # No grant could fund this AI charge, so it falls to
+            # the code's pack counters (their room was checked
+            # above); the spend itself happens in the counters
+            # branch below.
+            funded_by = "pack"
+        try:
+            self.db.execute(
+                "INSERT INTO credit_charges (id, code_hash,"
+                " image_identity, claim_hash, kind, funded_by,"
+                " created_at) VALUES (?,?,?,?,?,?,?)",
+                (charge_id, code_hash, image_identity, claim_hash,
+                 kind, funded_by, now))
+        except Exception:
+            self.db.rollback()
+            return {"outcome": "duplicate",
+                    "code": self._augment_credit_row(row, now)}
+        if target is not None:
+            self.db.execute(
+                "UPDATE credit_grants SET used=?, ai_used=?"
+                " WHERE grant_id=?",
+                (target["used"] + 1,
+                 target["ai_used"] + (1 if kind == "ai" else 0),
+                 target["grant_id"]))
+            self.db.execute(
+                "UPDATE credit_codes SET last_used_at=?"
+                " WHERE code_hash=?", (now, code_hash))
+        else:
+            # No live grant can fund this charge, but the code row
+            # still holds counters (a hand-minted hybrid): spend
+            # from them, without flipping a Pass code to exhausted.
+            used = row["credits_used"] + 1
+            sub = self._fetchone(
+                "SELECT * FROM credit_subscriptions"
+                " WHERE code_hash=?", (code_hash,))
+            status = row["status"]
+            if used >= row["credits_total"] and not (
+                    sub and sub["status"] == "active"):
+                status = "exhausted"
+            self.db.execute(
+                "UPDATE credit_codes SET credits_used=?, status=?,"
+                " last_used_at=? WHERE code_hash=?",
+                (used, status, now, code_hash))
+        self.db.commit()
+        row = _one(self.db.execute(
+            "SELECT * FROM credit_codes WHERE code_hash=?",
+            (code_hash,)))
+        return {"outcome": "charged",
+                "code": self._augment_credit_row(row, now)}
+
+    # -- onchain anchoring (npc_verify.anchor) -------------------------
+    # The store half of the anchor engine. JSON columns carry the
+    # batch's record IDs, the aligned leaf hashes, and each record's
+    # Merkle proof, so the batch row plus the record rows are the
+    # complete state the engine recovers from after a crash.
+
+    _ANCHOR_BATCH_FIELDS = (
+        "merkle_root", "batch_sig", "status", "nonce", "tx_hash",
+        "raw_tx", "block_number", "block_timestamp", "error",
+        "submitted_at", "confirmed_at")
+
+    @staticmethod
+    def _anchor_batch_out(row):
+        if row is None:
+            return None
+        out = dict(row)
+        out["record_ids"] = json.loads(out["record_ids"])
+        out["leaves"] = json.loads(out["leaves"])
+        return out
+
+    def create_anchor_batch(self, batch) -> None:
+        self._write(
+            "INSERT INTO anchor_batches (batch_id, merkle_root,"
+            " batch_sig, record_ids, leaves, status, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (batch["batch_id"], batch["merkle_root"],
+             batch.get("batch_sig"),
+             json.dumps(batch["record_ids"]),
+             json.dumps(batch["leaves"]), batch["status"],
+             batch["created_at"]))
+
+    def get_anchor_batch(self, batch_id):
+        return self._anchor_batch_out(self._fetchone(
+            "SELECT * FROM anchor_batches WHERE batch_id=?",
+            (batch_id,)))
+
+    def open_anchor_batch(self):
+        """The oldest batch still in flight (prepared or submitted),
+        or None. The engine works one batch at a time so a stuck
+        batch is always the next thing it looks at."""
+        return self._anchor_batch_out(self._fetchone(
+            "SELECT * FROM anchor_batches"
+            " WHERE status IN ('prepared','submitted')"
+            " ORDER BY created_at ASC, batch_id ASC LIMIT 1"))
+
+    def update_anchor_batch(self, batch_id, fields) -> None:
+        """Update the mutable fields of a batch row. Field names are
+        checked against the fixed list above; values are always
+        bound parameters."""
+        cols = [k for k in fields if k in self._ANCHOR_BATCH_FIELDS]
+        if not cols:
+            return
+        sql = ("UPDATE anchor_batches SET "
+               + ", ".join("%s=?" % k for k in cols)
+               + " WHERE batch_id=?")
+        self._write(sql, tuple(fields[k] for k in cols) + (batch_id,))
+
+    def release_anchor_batch(self, batch_id) -> None:
+        """Flag a failed batch's record rows released so its
+        records return to the unanchored pool. Rows are flagged,
+        never deleted, and the batch row itself stays, marked
+        failed by the caller, as the record of the attempt."""
+        self._write(
+            "UPDATE record_anchors SET released=1 WHERE batch_id=?",
+            (batch_id,))
+
+    def count_anchor_batches(self):
+        rows = self._fetchall(
+            "SELECT status, COUNT(*) AS n FROM anchor_batches"
+            " GROUP BY status")
+        return {r["status"]: r["n"] for r in rows}
+
+    def add_record_anchor(self, row) -> None:
+        self._write(
+            "INSERT OR REPLACE INTO record_anchors"
+            " (record_id, batch_id, leaf_hash, proof)"
+            " VALUES (?,?,?,?)",
+            (row["record_id"], row["batch_id"], row["leaf_hash"],
+             json.dumps(row["proof"])))
+
+    def get_record_anchor(self, record_id):
+        row = self._fetchone(
+            "SELECT * FROM record_anchors WHERE record_id=?"
+            " AND released=0",
+            (record_id,))
+        if row is None:
+            return None
+        out = dict(row)
+        out.pop("released", None)
+        out["proof"] = json.loads(out["proof"])
+        return out
+
+    def unanchored_registrations(self, limit):
+        """Registration records in no anchor batch, oldest first
+        (registration time, then record ID, so batch composition is
+        deterministic). Returns the parsed signed records."""
+        rows = self._fetchall(
+            "SELECT r.record_json FROM registrations r"
+            " LEFT JOIN record_anchors a"
+            " ON a.record_id = r.record_id AND a.released = 0"
+            " WHERE a.record_id IS NULL"
+            " ORDER BY r.created_at ASC, r.record_id ASC LIMIT ?",
+            (limit,))
+        out = []
+        for row in rows:
+            try:
+                record = json.loads(row["record_json"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(record, dict):
+                out.append(record)
+        return out
+
+    def count_anchored_records(self) -> int:
+        row = self._fetchone(
+            "SELECT COUNT(*) AS n FROM record_anchors a"
+            " JOIN anchor_batches b ON b.batch_id = a.batch_id"
+            " WHERE b.status='confirmed'")
+        return row["n"] if row else 0
+
+    def add_anchor_rotation(self, notice_id, notice, created_at) \
+            -> bool:
+        """Record a verified rotation notice. Returns False when
+        the notice is already on record (recording is idempotent:
+        the same notice is the same rotation)."""
+        existing = self._fetchone(
+            "SELECT notice_id FROM anchor_rotations"
+            " WHERE notice_id=?", (notice_id,))
+        if existing is not None:
+            return False
+        self._write(
+            "INSERT INTO anchor_rotations (notice_id, notice,"
+            " created_at) VALUES (?,?,?)",
+            (notice_id, json.dumps(notice), created_at))
+        return True
+
+    def list_anchor_rotations(self):
+        """Every recorded rotation notice, oldest first: the
+        rotation history the authority answer is computed from."""
+        rows = self._fetchall(
+            "SELECT notice FROM anchor_rotations"
+            " ORDER BY created_at ASC, notice_id ASC")
+        return [json.loads(r["notice"]) for r in rows]
+
+    # -- unified accounts (Gate G1, npc_verify.accounts) ----------------
+    # Every secret column holds a SHA-256 hash, never a plaintext:
+    # session tokens, email-link tokens, handoff secrets, recovery
+    # codes. Consume methods are guarded updates, so a replay fails
+    # closed exactly like the identity-link challenges above.
+
+    def add_account(self, row) -> bool:
+        """Put-if-absent on the account id; the email is unique."""
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO accounts"
+                " (account_id, email, email_hash, created_at,"
+                " updated_at) VALUES (?,?,?,?,?)",
+                (row["account_id"], row["email"],
+                 row.get("email_hash", ""), row["created_at"],
+                 row["updated_at"]))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_account(self, account_id):
+        return self._fetchone(
+            "SELECT * FROM accounts WHERE account_id=?",
+            (account_id,))
+
+    def get_account_by_email(self, email):
+        return self._fetchone(
+            "SELECT * FROM accounts WHERE email=?", (email,))
+
+    def add_account_credential(self, row) -> bool:
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO account_credentials"
+                " (credential_id, account_id, public_key_cose, alg,"
+                " sign_count, aaguid, transports, label, created_at,"
+                " last_used_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (row["credential_id"], row["account_id"],
+                 row["public_key_cose"], row["alg"],
+                 row.get("sign_count", 0), row.get("aaguid", ""),
+                 row.get("transports", ""), row.get("label", ""),
+                 row["created_at"], row.get("last_used_at", "")))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_account_credential(self, credential_id):
+        return self._fetchone(
+            "SELECT * FROM account_credentials"
+            " WHERE credential_id=?", (credential_id,))
+
+    def list_account_credentials(self, account_id):
+        return self._fetchall(
+            "SELECT * FROM account_credentials WHERE account_id=?"
+            " ORDER BY created_at ASC", (account_id,))
+
+    def update_credential_use(self, credential_id, sign_count,
+                              last_used_at) -> bool:
+        return self._write(
+            "UPDATE account_credentials SET sign_count=?,"
+            " last_used_at=? WHERE credential_id=?",
+            (sign_count, last_used_at, credential_id)) > 0
+
+    def add_account_challenge(self, row) -> bool:
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO account_challenges"
+                " (challenge_id, account_id, kind, challenge,"
+                " created_at, expires_at) VALUES (?,?,?,?,?,?)",
+                (row["challenge_id"], row.get("account_id", ""),
+                 row["kind"], row["challenge"], row["created_at"],
+                 row["expires_at"]))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_account_challenge(self, challenge_id):
+        return self._fetchone(
+            "SELECT * FROM account_challenges WHERE challenge_id=?",
+            (challenge_id,))
+
+    def consume_account_challenge(self, challenge_id,
+                                  consumed_at) -> bool:
+        return self._write(
+            "UPDATE account_challenges SET consumed_at=?"
+            " WHERE challenge_id=? AND consumed_at=''",
+            (consumed_at, challenge_id)) > 0
+
+    def add_email_token(self, row) -> bool:
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO account_email_tokens"
+                " (token_hash, account_id, handoff_id, created_at,"
+                " expires_at) VALUES (?,?,?,?,?)",
+                (row["token_hash"], row["account_id"],
+                 row.get("handoff_id", ""), row["created_at"],
+                 row["expires_at"]))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_email_token(self, token_hash):
+        return self._fetchone(
+            "SELECT * FROM account_email_tokens WHERE token_hash=?",
+            (token_hash,))
+
+    def consume_email_token(self, token_hash, consumed_at) -> bool:
+        return self._write(
+            "UPDATE account_email_tokens SET consumed_at=?"
+            " WHERE token_hash=? AND consumed_at=''",
+            (consumed_at, token_hash)) > 0
+
+    def invalidate_email_tokens(self, account_id, consumed_at) -> int:
+        """Retire every still-unused email link for the account, so
+        only the freshest link can ever be redeemed."""
+        return self._write(
+            "UPDATE account_email_tokens SET consumed_at=?"
+            " WHERE account_id=? AND consumed_at=''",
+            (consumed_at, account_id))
+
+    def add_recovery_codes(self, rows) -> None:
+        with self._lock:
+            for row in rows:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO account_recovery_codes"
+                    " (account_id, code_hash, created_at)"
+                    " VALUES (?,?,?)",
+                    (row["account_id"], row["code_hash"],
+                     row["created_at"]))
+            self.db.commit()
+
+    def find_recovery_code(self, account_id, code_hash):
+        return self._fetchone(
+            "SELECT * FROM account_recovery_codes"
+            " WHERE account_id=? AND code_hash=?",
+            (account_id, code_hash))
+
+    def consume_recovery_code(self, account_id, code_hash,
+                              consumed_at) -> bool:
+        return self._write(
+            "UPDATE account_recovery_codes SET consumed_at=?"
+            " WHERE account_id=? AND code_hash=? AND consumed_at=''",
+            (consumed_at, account_id, code_hash)) > 0
+
+    def count_recovery_codes(self, account_id):
+        total = self._fetchone(
+            "SELECT COUNT(*) AS n FROM account_recovery_codes"
+            " WHERE account_id=?", (account_id,))
+        unused = self._fetchone(
+            "SELECT COUNT(*) AS n FROM account_recovery_codes"
+            " WHERE account_id=? AND consumed_at=''",
+            (account_id,))
+        return (total["n"] if total else 0,
+                unused["n"] if unused else 0)
+
+    def add_account_session(self, row) -> bool:
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO account_sessions"
+                " (session_id, account_id, token_hash, surface,"
+                " device_label, created_at, last_seen_at, expires_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (row["session_id"], row["account_id"],
+                 row["token_hash"], row.get("surface", "web"),
+                 row.get("device_label", ""), row["created_at"],
+                 row["last_seen_at"], row["expires_at"]))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_account_session(self, session_id):
+        return self._fetchone(
+            "SELECT * FROM account_sessions WHERE session_id=?",
+            (session_id,))
+
+    def find_account_session_by_token(self, token_hash):
+        return self._fetchone(
+            "SELECT * FROM account_sessions WHERE token_hash=?",
+            (token_hash,))
+
+    def list_account_sessions(self, account_id):
+        return self._fetchall(
+            "SELECT * FROM account_sessions WHERE account_id=?"
+            " ORDER BY created_at ASC", (account_id,))
+
+    def touch_account_session(self, session_id, last_seen_at) -> bool:
+        return self._write(
+            "UPDATE account_sessions SET last_seen_at=?"
+            " WHERE session_id=?",
+            (last_seen_at, session_id)) > 0
+
+    def revoke_account_session(self, session_id, revoked_at) -> bool:
+        return self._write(
+            "UPDATE account_sessions SET revoked_at=?"
+            " WHERE session_id=? AND revoked_at=''",
+            (revoked_at, session_id)) > 0
+
+    def add_account_handoff(self, row) -> bool:
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO account_handoffs"
+                " (handoff_id, secret_hash, device_label, status,"
+                " created_at, expires_at) VALUES (?,?,?,?,?,?)",
+                (row["handoff_id"], row["secret_hash"],
+                 row.get("device_label", ""), row.get("status",
+                 "pending"), row["created_at"], row["expires_at"]))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_account_handoff(self, handoff_id):
+        return self._fetchone(
+            "SELECT * FROM account_handoffs WHERE handoff_id=?",
+            (handoff_id,))
+
+    def complete_account_handoff(self, handoff_id, account_id,
+                                 completed_at) -> bool:
+        """Move a pending handoff to ready, bound to the account
+        the browser just signed in. False when it was not pending."""
+        return self._write(
+            "UPDATE account_handoffs SET status='ready',"
+            " account_id=?, completed_at=?"
+            " WHERE handoff_id=? AND status='pending'",
+            (account_id, completed_at, handoff_id)) > 0
+
+    def consume_account_handoff(self, handoff_id, consumed_at) -> bool:
+        return self._write(
+            "UPDATE account_handoffs SET status='consumed',"
+            " consumed_at=? WHERE handoff_id=? AND status='ready'",
+            (consumed_at, handoff_id)) > 0
+
+    def add_account_event(self, row) -> None:
+        with self._lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO account_events"
+                " (event_id, account_id, kind, detail, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (row["event_id"], row["account_id"], row["kind"],
+                 row.get("detail", "{}"), row["created_at"]))
+            self.db.commit()
+
+    def list_account_events(self, account_id, limit=50):
+        return self._fetchall(
+            "SELECT * FROM account_events WHERE account_id=?"
+            " ORDER BY created_at DESC, event_id DESC LIMIT ?",
+            (account_id, int(limit)))
 
 
 def make_store(path: str):
