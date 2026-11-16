@@ -1,0 +1,22 @@
+Hello,
+
+Your Verifier Pass is active. Welcome aboard.
+
+Your code is:
+
+$code
+
+Paste it into the NPC Verify extension and your checks are ready. The Pass puts $checks checks on your code every month, and $ai_checks of them each month can run AI generation checks. Checks you do not use roll into the next month once, then they expire. Checking an image you have already checked never uses another check, and a check that cannot complete never uses one either.
+
+Keep this code somewhere safe. Anyone who has the code can spend its checks, so treat it like a gift card.
+
+The Verifier Pass is the entry tier of the NPC desktop app. The app is still being built. When it launches, Pass members start in this tier from day one and keep this price.
+
+You can see your balance at any time from the extension:
+
+$checks_link
+
+NPC Labs
+A for profit company for public good and AI blockchain research lab.
+
+You are receiving this email because this address was given at checkout. We use it only for messages about this subscription, never for marketing.

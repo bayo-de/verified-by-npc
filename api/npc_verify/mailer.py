@@ -35,6 +35,7 @@ Design rules, in line with the rest of the codebase:
   quietly doing nothing.
 """
 import html
+import json
 import logging
 import os
 import string
@@ -54,6 +55,9 @@ SUBJECTS = {
     "registration_agent": "Your agent is on record with NPC",
     "verification_request": "We received your verification request",
     "status_update": "An update on your NPC record",
+    "credit_code": "Your NPC Verify checks code",
+    "verifier_pass": "Your NPC Verify Verifier Pass",
+    "sign_in": "Your NPC sign-in link",
 }
 
 
@@ -96,6 +100,37 @@ class DisabledMailer:
 
     def send(self, to, subject, text, html_body):
         return False
+
+
+class StubMailer:
+    """The local and test mailer (NPC_MAIL_STUB=1): sends go to an
+    in-memory outbox instead of a wire, so flows that depend on
+    email (the one-time sign-in link above all) can be exercised
+    end to end on a developer machine without SES. When
+    NPC_MAIL_STUB_FILE names a path, every message is also appended
+    there as one JSON line, which is how a local script reads the
+    sign-in link a run just produced. Never configured in
+    production: mailer_from_env only builds this when the stub
+    switch is set explicitly."""
+
+    enabled = True
+
+    def __init__(self, outbox_file=None):
+        self.outbox = []
+        self.outbox_file = outbox_file
+
+    def send(self, to, subject, text, html_body):
+        message = {"to": to, "subject": subject, "text": text,
+                   "html": html_body}
+        self.outbox.append(message)
+        if self.outbox_file:
+            try:
+                with open(self.outbox_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(message) + "\n")
+            except Exception:
+                log.exception("stub mailer could not write its "
+                              "outbox file; continuing")
+        return True
 
 
 class SesMailer:
@@ -162,6 +197,10 @@ def mailer_from_env(env=None):
     then us-east-2, the API's region).
     """
     env = os.environ if env is None else env
+    if (env.get("NPC_MAIL_STUB") or "").strip() == "1":
+        return StubMailer(
+            outbox_file=(env.get("NPC_MAIL_STUB_FILE") or "").strip()
+            or None)
     if (env.get("NPC_MAIL_ENABLED") or "").strip() != "1":
         return DisabledMailer()
     return SesMailer(
@@ -261,6 +300,76 @@ def send_status_update(mailer, record, email, status_label, detail):
     except Exception:
         log.exception("status-update email failed for %s; "
                       "continuing", record.get("record_id"))
+        return False
+
+
+def send_credit_code(mailer, email, code, pack):
+    """Purchase trigger: a check pack was paid for. Carries the
+    redeem code itself, the pack size, and the purchase page link.
+    Sent once, when the payment first completes; a replayed payment
+    notification does not re-send (the caller passes only fresh
+    completions). Fails soft like every send here."""
+    if mailer is None or not getattr(mailer, "enabled", False) \
+            or not email:
+        return False
+    try:
+        values = {
+            "code": code,
+            "checks": str(pack["checks"]),
+            "pack_label": pack["label"],
+            "checks_link": _site_base().rstrip("/") + "/get-checks",
+        }
+        return mailer.send(email, SUBJECTS["credit_code"],
+                           _render("credit_code", "txt", values),
+                           _render("credit_code", "html", values))
+    except Exception:
+        log.exception("credit code email failed; continuing")
+        return False
+
+
+def send_verifier_pass(mailer, email, code, pack):
+    """Subscription trigger: a Verifier Pass was activated. Carries
+    the subscriber's code, the monthly figures, and the purchase
+    page link. Sent once, at activation; renewals do not re-send
+    (the caller passes only fresh activations). Fails soft like
+    every send here."""
+    if mailer is None or not getattr(mailer, "enabled", False) \
+            or not email:
+        return False
+    try:
+        values = {
+            "code": code,
+            "checks": str(pack["checks"]),
+            "ai_checks": str(pack.get("ai_checks", 0)),
+            "checks_link": _site_base().rstrip("/") + "/get-checks",
+        }
+        return mailer.send(email, SUBJECTS["verifier_pass"],
+                           _render("verifier_pass", "txt", values),
+                           _render("verifier_pass", "html", values))
+    except Exception:
+        log.exception("verifier pass email failed; continuing")
+        return False
+
+
+def send_sign_in_link(mailer, email, link, expires_minutes):
+    """Account trigger (Gate G1): a one-time sign-in link for the
+    unified NPC account. The link carries the whole secret, so the
+    copy says plainly that it works once and expires. Sent when the
+    link is requested; redemption never re-sends. Fails soft like
+    every send here."""
+    if mailer is None or not getattr(mailer, "enabled", False) \
+            or not email:
+        return False
+    try:
+        values = {
+            "sign_in_link": link,
+            "expires_minutes": str(expires_minutes),
+        }
+        return mailer.send(email, SUBJECTS["sign_in"],
+                           _render("sign_in", "txt", values),
+                           _render("sign_in", "html", values))
+    except Exception:
+        log.exception("sign-in link email failed; continuing")
         return False
 
 

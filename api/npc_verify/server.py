@@ -8,10 +8,19 @@ public keys so responses verify offline.
 Endpoints:
   GET  /v1/health                        (no auth)
   GET  /v1/keys                          (no auth)
-  GET  /v1/credentials/{id}              (verifier+)
+  GET  /v1/credentials/{id}              (PUBLIC; typed-table body for
+                                           a credential ID, or a typed
+                                           body built from a same-kind
+                                           registration for a record ID)
   POST /v1/claims/verify                  (verifier+)
-  GET  /v1/products/{tag_id}             (verifier+)
-  GET  /v1/agents/{agent_id}/attestation  (verifier+)
+  GET  /v1/products/{tag_id}             (PUBLIC; typed-table body for
+                                           a product tag ID, or a typed
+                                           body built from a same-kind
+                                           registration for a record ID)
+  GET  /v1/agents/{agent_id}/attestation  (PUBLIC; typed-table body for
+                                           an agent ID, or a typed body
+                                           built from a same-kind
+                                           registration for a record ID)
   POST /v1/attestations                   (issuer only)
   POST /v1/images/ai-check                (verifier+; Sightengine-backed,
                                            signed like every response)
@@ -24,6 +33,22 @@ Endpoints:
   POST /v1/pact/grants/{id}:revoke        (issuer only; signed append-only
                                            revocation record)
   GET  /v1/pact/grants/{id}/status        (verifier+; signed status record)
+  POST /v1/monitoring/subjects            (issuer only; enroll or update
+                                           a continuous-monitoring subject)
+  GET  /v1/monitoring/subjects            (verifier+; monitored subjects
+                                           with their live due state)
+  GET  /v1/monitoring/due                 (verifier+; due computation:
+                                           subjects due for re-audit now)
+  POST /v1/monitoring/run                 (issuer only; one scheduler
+                                           pass over every subject;
+                                           publishes signed monitoring
+                                           event records)
+  POST /v1/monitoring/compare             (verifier+; ratchet/drift
+                                           comparison of two audit results)
+  POST /v1/monitoring/crosscheck          (issuer only; attach an external
+                                           cross-check verdict to a
+                                           subject; a material disagreement
+                                           is itself recorded)
   POST /v1/register/content               (PUBLIC; registers a piece of
                                            content and starts verification:
                                            a signed registration record,
@@ -85,6 +110,7 @@ import re
 import secrets
 import sqlite3
 import threading
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -98,12 +124,19 @@ from .detector import (DetectorError, DetectorNotConfigured,
 from .keys import KeyRegistry
 from .models import Attestation, utcnow_iso
 from . import chat as chat_module
+from . import credits as credits_module
+from . import anchor as anchor_module
 from . import linking as linking_module
 from . import mailer as mailer_module
+from . import accounts as accounts_module
+from . import signin_page as signin_page_module
 from . import social as social_module
 from . import kya as kya_module
 from . import pact
 from . import registry
+from . import monitoring as monitoring_module
+from .monitoring_pact import make_pact_audit_runner
+from .monitoring_registry import make_registry_audit_runner
 from .seed import ANCHOR_CHAIN
 from .store import Store, make_store  # noqa: F401  (Store re-exported)
 from .store import registration_email_hash as _email_hash_of
@@ -132,18 +165,24 @@ MAX_BODY = 1024 * 1024  # 1 MiB
 # 750 KB of image keeps the JSON body under MAX_BODY.
 MAX_IMAGE_BYTES = 750 * 1000
 MAX_IMAGE_URL = 2048
-CHAIN_STATUS = {"network": "none", "anchoring": "disabled",
+CHAIN_STATUS = {"network": "base", "anchoring": "live",
                 "mode": "local-first",
-                "note": "Phase 1 records anchor hashes locally; "
-                        "no chain writes until the mainnet gate clears."}
+                "note": "Records anchor to Base in signed Merkle "
+                        "batches (NPC-ANCHOR-V2). Batch two anchored "
+                        "2026-11-09 at Base block 55250723."}
 
 
 class Request:
-    def __init__(self, method, path, headers, body, query=None):
+    def __init__(self, method, path, headers, body, query=None,
+                 raw_body=b""):
         self.method = method
         self.path = path
         self.headers = headers  # lowercased keys
         self.body = body  # parsed JSON dict, or None
+        # The exact request bytes, before JSON parsing. The Stripe
+        # webhook verifies its signature over these bytes; nothing
+        # else reads them.
+        self.raw_body = raw_body
         self.query = query or {}  # first value per query parameter
         self.key = None  # set by auth wrapper
         # TCP peer (or gateway-reported source IP), injected by the
@@ -217,7 +256,16 @@ def _product_body(row):
 
 
 def _agent_body(store, row):
-    att = store.get_attestation(row["attestation_id"])
+    # A row with no attestation_id has no linked attestation to
+    # fetch (registration-derived rows never carry one). Asking the
+    # store anyway is not a harmless miss on the DynamoDB backend:
+    # boto3 serializes a None key as {"NULL": true} and DynamoDB
+    # rejects a null key attribute with a ValidationException,
+    # which the dispatch catch-all turns into a 400. The SQLite and
+    # fake-table transports silently return no row, which is why
+    # only production saw it (v6.5 fallback, fixed in v6.5.1).
+    att = store.get_attestation(row["attestation_id"]) \
+        if row["attestation_id"] else None
     anchor = None
     if att is not None:
         anchor = {"chain": att["anchor_chain"], "tx": att["anchor_tx"],
@@ -259,6 +307,105 @@ def _agent_body(store, row):
     return body
 
 
+def _registration_field(record, *names, default=None):
+    """The first present, non-null field among ``names``."""
+    for name in names:
+        if name in record and record[name] is not None:
+            return record[name]
+    return default
+
+
+def _registration_json_field(record, *names, default):
+    value = _registration_field(record, *names, default=default)
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def _credential_body_from_registration(record):
+    """Build the credential response shape from a credential record.
+
+    Registrations are signed registry records, not typed-table rows.
+    Their field names are mapped into the credential body only when
+    the registration's kind is credential; fields the record does not
+    carry stay null or empty rather than being invented.
+    """
+    holder_name = _registration_field(
+        record, "holder_name", "holder")
+    holder_public = record.get("holder_public")
+    if holder_public is None:
+        holder_public = holder_name is not None
+    row = {
+        "id": _registration_field(record, "id", "record_id"),
+        "status": _registration_field(record, "status", default="unknown"),
+        "title": _registration_field(record, "title", "name"),
+        "issuer": _registration_field(
+            record, "issuer", "issuer_name", "creator_name"),
+        "holder_name": holder_name,
+        "holder_public": 1 if holder_public else 0,
+        "issued_at": _registration_field(
+            record, "issued_at", "registered_at", "created_at"),
+        "expires_at": _registration_field(record, "expires_at"),
+        "skills_json": _registration_json_field(
+            record, "assessed_skills", "skills", default=[]),
+        "signature_b64": _registration_field(
+            record, "signature_b64", "signature", default=""),
+        "key_id": _registration_field(record, "key_id", default=""),
+        "verification_url": _registration_field(
+            record, "verification_url", default=""),
+    }
+    return _credential_body(row)
+
+
+def _product_body_from_registration(record):
+    """Build the product response shape from a product record."""
+    row = {
+        "tag_id": _registration_field(
+            record, "tag_id", "record_id", "id"),
+        "status": _registration_field(record, "status", default="unknown"),
+        "name": _registration_field(record, "name", "title"),
+        "creator": _registration_field(
+            record, "creator", "creator_name"),
+        "description": _registration_field(
+            record, "description", default=""),
+        "provenance_json": _registration_json_field(
+            record, "provenance", default=[]),
+        "attestation_id": _registration_field(record, "attestation_id"),
+    }
+    return _product_body(row)
+
+
+def _agent_body_from_registration(store, record):
+    """Build the agent response shape from an agent record.
+
+    A registration's standing is not an attestation verdict. When the
+    record has no explicit verdict, its status label is carried in
+    the verdict field (for a registry registration, that label is
+    "registered, checks pending"), so the fallback never upgrades a
+    registration into a verified agent.
+    """
+    verdict = _registration_field(record, "verdict")
+    if verdict is None:
+        verdict = _registration_field(
+            record, "status_label", "status", default="unknown")
+    row = {
+        "agent_id": _registration_field(
+            record, "agent_id", "record_id", "id"),
+        "verdict": verdict,
+        "scope_json": _registration_json_field(
+            record, "scope", "declared_scope", default={}),
+        "valid_from": _registration_field(
+            record, "valid_from", "registered_at", "issued_at",
+            "created_at"),
+        "valid_until": _registration_field(
+            record, "valid_until", "expires_at"),
+        "attestation_id": _registration_field(record, "attestation_id"),
+        "notes": _registration_field(
+            record, "notes", "description", "status_label", default=""),
+    }
+    return _agent_body(store, row)
+
+
 def _attestation_body(store, row):
     body = {
         "id": row["id"],
@@ -297,6 +444,71 @@ def _attestation_body(store, row):
     return body
 
 
+def _registration_claim_body(claim_hash, rec):
+    """POST /v1/claims/verify answer when a registration matches.
+
+    A registration is not an attestation: it carries no verdict and
+    no verification mark, and the record itself says "registered,
+    checks pending". The body keeps that standing in its shape:
+    match_type and the registration object carry the record's own
+    fields. The attestation-shaped summary exists because clients
+    are built against the attestation contract: the extension reads
+    attestation.verdict first and defaults a MISSING verdict to
+    "verified", so the honest standing is spelled out in that field,
+    never omitted. Its signature and key_id are the registration
+    record's own, so the full record resolves at GET
+    /v1/records/{id} and verifies offline exactly as issued.
+    """
+    locator = rec.get("locator") or ""
+    by_address = isinstance(locator, str) and (
+        locator.startswith("https://")
+        or locator.startswith("http://")) and hashlib.sha256(
+            locator.strip().encode("utf-8")).hexdigest() == claim_hash
+    standing = rec.get("status_label") or "registered, checks pending"
+    return {
+        "matched": True,
+        "claim_hash": claim_hash,
+        "match_type": "registration",
+        "registration": {
+            "id": rec.get("record_id"),
+            "record_type": rec.get("record_type"),
+            "status": rec.get("status"),
+            "status_label": standing,
+            "title": rec.get("title"),
+            "creator_name": rec.get("creator_name"),
+            "content_kind": rec.get("content_kind"),
+            "locator": rec.get("locator"),
+            "registered_at": rec.get("registered_at"),
+            "matched_by": "locator_address" if by_address
+                          else "content_bytes",
+            "signature": rec.get("signature"),
+            "key_id": rec.get("key_id"),
+        },
+        "attestation": {
+            "id": rec.get("record_id"),
+            "verdict": standing,
+            "creator_name": rec.get("creator_name"),
+            "title": rec.get("title"),
+            "scope": {},
+            "tested_at": None,
+            "created_at": rec.get("registered_at"),
+            "expires_at": None,
+            "findings_summary": (
+                "Registered, checks pending. Registration is not "
+                "verification, and no verification mark has been "
+                "issued for this record."),
+            "signature": rec.get("signature"),
+            "key_id": rec.get("key_id"),
+            "onchain_anchor": {
+                "chain": None,
+                "tx": None,
+                "hash": None,
+                "status": "not_anchored",
+            },
+        },
+    }
+
+
 class UnsignedBody:
     """Marker wrapper: a response body that must NOT be signed.
 
@@ -309,10 +521,23 @@ class UnsignedBody:
         self.body = body
 
 
+class HtmlBody:
+    """Marker wrapper: an HTML page response, served unsigned.
+
+    The account sign-in page is not a record either, and it cannot
+    be canonicalized or signed like a JSON body. The finalize step
+    emits it as text/html with the no-store and nosniff transport
+    headers and no signature pair."""
+
+    def __init__(self, html):
+        self.html = html
+
+
 class App:
     def __init__(self, db_path: str, keys_dir: str, detector=None,
                  fetcher=None, chat_provider=None, chat_config=None,
-                 mailer=None, link_http=None, coinbase_reader=None):
+                 mailer=None, link_http=None, coinbase_reader=None,
+                 payments=None, anchor_chain=None):
         self.store = make_store(db_path)
         self.keys = KeyRegistry(self.store, keys_dir)
         self.auth = Auth(self.store)
@@ -340,6 +565,25 @@ class App:
         # Every send fails soft: mail never breaks a request.
         self.mailer = mailer if mailer is not None \
             else mailer_module.mailer_from_env()
+        # Paid check credits (npc_verify.credits). The payments
+        # client comes from the environment (NPC_STRIPE_*) when not
+        # injected; with any piece missing the purchase rail rests
+        # and its routes answer honestly. Pack configuration is read
+        # once here, from NPC_CREDITS_PACKS_JSON.
+        self.payments = payments if payments is not None \
+            else credits_module.payments_from_env()
+        self.credit_packs, self.credit_packs_is_default = \
+            credits_module.packs_from_env()
+        # Onchain anchoring (npc_verify.anchor). Configuration comes
+        # from the environment (NPC_ANCHOR_*), the chain client is
+        # built against the configured RPC URL, and tests inject a
+        # fake chain here. With the lane off (the default) the engine
+        # rests and record payloads are byte-identical to before. A
+        # malformed anchoring key in an enabled lane raises here, at
+        # build time, rather than resting silently (config_from_env).
+        self.anchor_config = anchor_module.config_from_env()
+        self.anchor_chain = anchor_chain if anchor_chain is not None \
+            else anchor_module.chain_from_env()
         # Federated identity linking (phase 1). Every external call
         # the linking service makes (OAuth exchanges, the Coinbase
         # EAS read) goes through this one injectable HTTP callable,
@@ -350,6 +594,16 @@ class App:
         self.coinbase_reader = coinbase_reader \
             if coinbase_reader is not None \
             else linking_module.CoinbaseReader(self.link_http)
+        # Unified accounts (Gate G1, npc_verify.accounts). One
+        # account per person across every surface: passkeys first,
+        # email links as the anchor and fallback, revocable device
+        # sessions, and the desktop browser handoff. Configuration
+        # comes from the environment (NPC_AUTH_*); the mailer is the
+        # app's own, so with mail resting the link flow rests too
+        # (locally the stub mailer carries it end to end).
+        self.accounts = accounts_module.AccountService(
+            self.store, self.mailer,
+            accounts_module.config_from_env())
         self.keys.ensure_bootstrap()
         # Trust-layer memory shares the API store's connection and
         # lock on the SQLite backend. The DynamoDB backend has no
@@ -391,13 +645,24 @@ class App:
         def get_keys(req):
             return 200, app.keys.publish()
 
+        # PUBLIC (anonymous-first, decided 2026-11-09): the per-type
+        # lookups carry no key gate. A typed-table ID returns that
+        # table's body. On a typed-table miss, a registration record
+        # ID returns a body in the same per-type shape when the
+        # registration's kind matches this endpoint; GET
+        # /v1/records/{id} still returns the signed registration
+        # itself. Writes and claim verification stay gated; see
+        # POST /v1/claims/verify below.
         @app.route("GET", r"^/v1/credentials/(?P<id>[^/]{1,128})$")
-        @app.require_role("verifier")
         def get_credential(req, id):
             row = app.store.get_credential(id)
-            if row is None:
-                return errors.unknown()
-            return 200, _credential_body(row)
+            if row is not None:
+                return 200, _credential_body(row)
+            record = app.store.get_registration(id)
+            if record is not None \
+                    and record.get("kind") == "credential":
+                return 200, _credential_body_from_registration(record)
+            return errors.unknown()
 
         @app.route("POST", r"^/v1/claims/verify$")
         @app.require_role("verifier")
@@ -422,6 +687,19 @@ class App:
                     "provide claim_text or claim_hash")
             rows = app.store.attestations_by_claim_hash(claim_hash)
             if not rows:
+                # No attestation attests to this hash. A public
+                # registration may still name it: registrations are
+                # indexed by the hash of their locator address and
+                # by the content hash recorded at intake, which is
+                # the lookup the browser extension performs for an
+                # image on a page. A registration match is presented
+                # as a registration (its own standing, "registered,
+                # checks pending"), never as a verification.
+                records = app.store.registrations_by_claim_hash(
+                    claim_hash)
+                if records:
+                    return 200, _registration_claim_body(
+                        claim_hash, records[0])
                 status, body = errors.unknown()
                 body = dict(body)
                 body["matched"] = False
@@ -522,21 +800,560 @@ class App:
                 "checked_at": utcnow_iso(),
             }
 
+        # -- paid check credits (npc_verify.credits) --------------------
+        # Public by design: the redeem code is the credential, the
+        # way a gift card is, so no API key gates these routes. A
+        # per-IP rate limit bounds code guessing, and a code carries
+        # 100 bits of entropy. Free checks stay local to the
+        # extension; these routes are only about paid credits.
+
+        def _credits_limited(req):
+            key = "credits-ip:" + (req.client_ip or "unknown")
+            app.limiter.set_limit(key, 120)
+            return app.limiter.allowed(key)
+
+        def _credit_body(row):
+            # The balance is the ledger truth: the code row's own
+            # counters plus whatever its live Pass grants still
+            # hold. ai_balance is the part of that balance an AI
+            # generation check may spend: the Pass grants' AI
+            # sub-allowances plus any bonus balance plus the code
+            # row's own pack counters (AI draws spend the
+            # sub-allowances first, then bonus grants, then the
+            # pack counters).
+            # registry_unlimited is the Pass's other half: while
+            # the subscription is active, standard registry checks
+            # are covered by the Pass and draw no pool at all, so
+            # the finite balance below is what stands if the
+            # subscription ends.
+            grant_balance = row.get("grant_balance", 0)
+            return {
+                "pack_id": row["pack_id"],
+                "status": row["status"],
+                "credits_total": row["credits_total"],
+                "credits_used": row["credits_used"],
+                "grant_balance": grant_balance,
+                "ai_balance": row.get("ai_balance", 0),
+                "balance": row["credits_total"] - row["credits_used"]
+                    + grant_balance,
+                "subscription_status": row.get("subscription_status"),
+                "registry_unlimited":
+                    row.get("subscription_status") == "active",
+            }
+
+        def _code_from_body(req):
+            """(code_hash, None) or (None, error tuple)."""
+            if not isinstance(req.body, dict):
+                return None, errors.bad_request(
+                    "JSON object body required")
+            code = req.body.get("code")
+            if not isinstance(code, str) \
+                    or not credits_module.valid_code_shape(code):
+                return None, errors.bad_request(
+                    "a valid NPC checks code is required")
+            return credits_module.code_hash(code), None
+
+        @app.route("GET", r"^/v1/credits/packs$")
+        def credit_packs(req):
+            return 200, {
+                "packs": [credits_module.public_pack(p)
+                          for p in app.credit_packs],
+                "packs_source": "default"
+                    if app.credit_packs_is_default else "environment",
+                "checkout_available": bool(
+                    getattr(app.payments, "configured", False)),
+            }
+
+        @app.route("POST", r"^/v1/credits/checkout$")
+        def credit_checkout(req):
+            ok, retry_after = _credits_limited(req)
+            if not ok:
+                return errors.rate_limited(retry_after)
+            if not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            pack = credits_module.find_pack(
+                app.credit_packs, req.body.get("pack_id"))
+            if pack is None:
+                return errors.bad_request("unknown pack_id")
+            # Both kinds are on sale (Bayo, 2026-10-28): "pack" is a
+            # one-time grant, "access" is the Verifier Pass, whose
+            # checkout the payments layer runs as a subscription.
+            email = req.body.get("email")
+            if email is not None:
+                if not isinstance(email, str) or "@" not in email \
+                        or len(email) > 254:
+                    return errors.bad_request("email must be an address")
+                email = email.strip() or None
+            # An optional referral code rides the purchase (only
+            # its hash is stored): when the payment completes, the
+            # webhook attributes the new code to the referral
+            # code's owner and lands both referral bonuses.
+            referral_hash = None
+            referral_code = req.body.get("referral_code")
+            if referral_code is not None:
+                if not isinstance(referral_code, str) \
+                        or not credits_module.valid_code_shape(
+                            referral_code):
+                    return errors.bad_request(
+                        "referral_code must be a valid NPC code")
+                referral_hash = credits_module.code_hash(
+                    referral_code)
+            if not getattr(app.payments, "configured", False):
+                return errors.unavailable(
+                    "payments_not_configured",
+                    "payments are not configured on this API")
+            # Fail closed on the catalog wiring (Bayo, 2026-10-29):
+            # an offer with no Stripe catalog price cannot check
+            # out, and no session or purchase row is created for
+            # it. There is no inline-price fallback.
+            if not pack.get("stripe_price_id"):
+                return errors.unavailable(
+                    "checkout_not_configured",
+                    "this offer is not configured for checkout")
+            try:
+                session = app.payments.create_checkout_session(
+                    pack, email=email)
+            except credits_module.PaymentsError:
+                return errors.unavailable(
+                    "payments_unavailable",
+                    "the payment provider could not start checkout")
+            app.store.create_credit_purchase(
+                session["id"], pack["id"], email, utcnow_iso(),
+                referral_hash=referral_hash)
+            return 201, {"session_id": session["id"],
+                         "checkout_url": session["url"],
+                         "pack_id": pack["id"]}
+
+        @app.route("POST", r"^/v1/credits/stripe-webhook$")
+        def credit_stripe_webhook(req):
+            if not getattr(app.payments, "configured", False):
+                return errors.unavailable(
+                    "payments_not_configured",
+                    "payments are not configured on this API")
+            try:
+                event = app.payments.verify_webhook(
+                    req.raw_body, req.headers.get("stripe-signature"))
+            except credits_module.WebhookSignatureError:
+                return errors.bad_request("invalid webhook signature")
+            except credits_module.PaymentsError:
+                return errors.unavailable(
+                    "payments_not_configured",
+                    "payments are not configured on this API")
+            etype = event.get("type")
+            obj = (event.get("data") or {}).get("object") or {}
+            session_id = obj.get("id")
+            if etype == "checkout.session.completed" \
+                    and isinstance(session_id, str):
+                purchase = app.store.get_credit_purchase(session_id)
+                if purchase is not None \
+                        and purchase["status"] != "paid":
+                    pack = credits_module.find_pack(
+                        app.credit_packs, purchase["pack_id"])
+                    # The charge ran on a Stripe catalog price.
+                    # When the event names the price it charged
+                    # (expanded line items), that price is the
+                    # ground truth of the money: it must resolve
+                    # (pack_by_price_id) to the pack the purchase
+                    # recorded. An unknown price, or one resolving
+                    # to a different pack, refuses the mint: the
+                    # handler still answers 200 below, so Stripe
+                    # stops retrying a charge we cannot account
+                    # for, and no code is granted against it. When
+                    # the purchase's own pack has left the
+                    # configuration, a resolving price names what
+                    # was sold; failing that, the session metadata
+                    # (metadata[pack_id], set at checkout) does.
+                    refused = False
+                    price_id = credits_module.session_price_id(obj)
+                    if price_id is not None:
+                        priced = credits_module.pack_by_price_id(
+                            app.credit_packs, price_id)
+                        if priced is None or (
+                                pack is not None
+                                and priced["id"] != pack["id"]):
+                            refused = True
+                        elif pack is None:
+                            pack = priced
+                    if pack is None and not refused:
+                        meta = obj.get("metadata")
+                        if isinstance(meta, dict):
+                            pack = credits_module.find_pack(
+                                app.credit_packs,
+                                meta.get("pack_id"))
+                    if pack is not None and not refused:
+                        email = purchase["buyer_email"]
+                        details = obj.get("customer_details") or {}
+                        if isinstance(details.get("email"), str) \
+                                and details["email"]:
+                            email = details["email"]
+                        elif isinstance(obj.get("customer_email"),
+                                        str) and obj["customer_email"]:
+                            email = obj["customer_email"]
+                        code = credits_module.generate_code()
+                        now = utcnow_iso()
+                        if pack.get("kind") == "access" and isinstance(
+                                obj.get("subscription"), str):
+                            # The Verifier Pass: open the
+                            # subscription and land the first
+                            # month's grant. The grant is keyed by
+                            # the session's invoice when Stripe
+                            # names one, so a replay can never
+                            # double-grant (activation itself is
+                            # also idempotent in the store).
+                            subscription_id = obj.get("subscription")
+                            invoice_id = obj.get("invoice")
+                            grant_id = invoice_id \
+                                if isinstance(invoice_id, str) \
+                                and invoice_id else \
+                                "first:" + session_id
+                            row = app.store.activate_pass_subscription(
+                                session_id,
+                                credits_module.code_hash(code), code,
+                                pack, email,
+                                subscription_id
+                                if isinstance(subscription_id, str)
+                                else None,
+                                obj.get("customer")
+                                if isinstance(obj.get("customer"), str)
+                                else None,
+                                grant_id, now,
+                                credits_module.grant_expiry(now))
+                            if row is not None:
+                                mailer_module.send_verifier_pass(
+                                    app.mailer, email, code, pack)
+                        else:
+                            row = app.store.complete_credit_purchase(
+                                session_id,
+                                credits_module.code_hash(code), code,
+                                pack, email, now)
+                            if row is not None:
+                                mailer_module.send_credit_code(
+                                    app.mailer, email, code, pack)
+                        if row is not None:
+                            # Every minted code, pack or Pass,
+                            # carries a personal referral code
+                            # (hash-only; its plaintext rests until
+                            # the one-time referral lookup delivery).
+                            own_referral = credits_module \
+                                .generate_code()
+                            app.store.ensure_referral_code(
+                                row["code_hash"],
+                                credits_module.code_hash(own_referral),
+                                own_referral, now)
+                            # A purchase carried in with a referral
+                            # code attributes here, at the buyer's
+                            # first paid purchase: the referral row
+                            # the store writes makes both bonuses
+                            # land exactly once, so a replayed
+                            # webhook grants nothing twice.
+                            if purchase.get("referral_hash"):
+                                app.store.attribute_referral(
+                                    row["code_hash"],
+                                    purchase["referral_hash"],
+                                    "referee:" + row["code_hash"],
+                                    "referrer:" + row["code_hash"],
+                                    now,
+                                    credits_module.grant_expiry(now),
+                                    credits_module
+                                    .REFEREE_BONUS_CHECKS,
+                                    credits_module
+                                    .REFERRER_BONUS_CHECKS,
+                                    credits_module
+                                    .REFERRAL_MONTHLY_CAP_CHECKS,
+                                    referrer_link_bonus=
+                                    credits_module
+                                    .REFERRER_LINK_BONUS_CHECKS,
+                                    referrer_link_grant_id=
+                                    "referrer-link:"
+                                    + row["code_hash"])
+            elif etype == "invoice.paid":
+                # A Pass renewal was paid. The invoice id keys the
+                # grant, so a replayed delivery grants exactly
+                # once; a canceled subscription grants nothing.
+                # The renewal resolves through the catalog too
+                # (Bayo, 2026-10-29): when the invoice names its
+                # price (the 2022-08-01 shape assumed here carries
+                # it at lines.data[].price.id, with the
+                # subscription at the top level), the price must
+                # resolve to the very pack this subscription was
+                # opened under; an unknown or foreign price grants
+                # nothing. An invoice naming no price keeps the
+                # recorded subscription as its authority.
+                subscription_id = obj.get("subscription")
+                invoice_id = obj.get("id")
+                if isinstance(subscription_id, str) \
+                        and isinstance(invoice_id, str):
+                    grant = True
+                    price_id = credits_module.invoice_price_id(obj)
+                    if price_id is not None:
+                        priced = credits_module.pack_by_price_id(
+                            app.credit_packs, price_id)
+                        sub = app.store.get_subscription(
+                            subscription_id)
+                        grant = priced is not None \
+                            and sub is not None \
+                            and priced["id"] == sub["pack_id"]
+                    if grant:
+                        now = utcnow_iso()
+                        app.store.grant_subscription_allowance(
+                            subscription_id, invoice_id, now,
+                            credits_module.grant_expiry(now))
+            elif etype == "customer.subscription.deleted":
+                # Cancellation stops future grants. Checks already
+                # granted stay spendable until their expiry.
+                if isinstance(session_id, str):
+                    app.store.cancel_subscription(
+                        session_id, utcnow_iso())
+            elif etype == "checkout.session.expired" \
+                    and isinstance(session_id, str):
+                app.store.expire_credit_purchase(
+                    session_id, utcnow_iso())
+            return 200, {"received": True}
+
+        @app.route("GET", r"^/v1/credits/checkout-status$")
+        def credit_checkout_status(req):
+            session_id = req.query.get("session_id")
+            if not session_id:
+                return errors.bad_request("session_id is required")
+            purchase = app.store.get_credit_purchase(session_id)
+            if purchase is None:
+                return 404, {"error": "session_not_found"}
+            body = {"status": purchase["status"],
+                    "pack_id": purchase["pack_id"]}
+            if purchase["status"] == "paid":
+                pack = credits_module.find_pack(
+                    app.credit_packs, purchase["pack_id"])
+                if pack is not None:
+                    body["checks"] = pack["checks"]
+                code, _purchase = app.store.take_credit_code_delivery(
+                    session_id)
+                body["delivered_with_this_response"] = code is not None
+                if code is not None:
+                    body["code"] = code
+            return 200, body
+
+        @app.route("POST", r"^/v1/credits/redeem$")
+        def credit_redeem(req):
+            ok, retry_after = _credits_limited(req)
+            if not ok:
+                return errors.rate_limited(retry_after)
+            code_hash, err = _code_from_body(req)
+            if err:
+                return err
+            row = app.store.redeem_credit_code(
+                code_hash, utcnow_iso())
+            if row is None:
+                return 404, {"error": "code_not_found"}
+            if row["status"] == "revoked":
+                return 403, {"error": "code_revoked"}
+            return 200, _credit_body(row)
+
+        @app.route("POST", r"^/v1/credits/balance$")
+        def credit_balance(req):
+            ok, retry_after = _credits_limited(req)
+            if not ok:
+                return errors.rate_limited(retry_after)
+            code_hash, err = _code_from_body(req)
+            if err:
+                return err
+            row = app.store.get_credit_code(code_hash, utcnow_iso())
+            if row is None:
+                return 404, {"error": "code_not_found"}
+            if row["status"] == "revoked":
+                return 403, {"error": "code_revoked"}
+            return 200, _credit_body(row)
+
+        @app.route("POST", r"^/v1/credits/referral/lookup$")
+        def credit_referral_lookup(req):
+            """Read a code's own referral code and referral record.
+
+            The referral plaintext is delivered exactly once, the
+            way the redeem code is: later lookups report the record
+            (counts, this month's bonus, whether this code was
+            itself referred) without the code. A code minted before
+            referrals existed gets its referral code here, on
+            demand."""
+            ok, retry_after = _credits_limited(req)
+            if not ok:
+                return errors.rate_limited(retry_after)
+            code_hash, err = _code_from_body(req)
+            if err:
+                return err
+            now = utcnow_iso()
+            row = app.store.get_credit_code(code_hash, now)
+            if row is None:
+                return 404, {"error": "code_not_found"}
+            if row["status"] == "revoked":
+                return 403, {"error": "code_revoked"}
+            if app.store.get_referral_code_for(code_hash) is None:
+                own_referral = credits_module.generate_code()
+                app.store.ensure_referral_code(
+                    code_hash,
+                    credits_module.code_hash(own_referral),
+                    own_referral, now)
+            plain, _rec = app.store.take_referral_code_delivery(
+                code_hash)
+            stats = app.store.referral_stats(code_hash, now)
+            return 200, {
+                "referral_code": plain,
+                "referral_code_included": plain is not None,
+                "referred_count": stats["referred_count"],
+                "referral_bonus_this_month":
+                    stats["referral_bonus_this_month"],
+                "referred_by": stats["referred_by"],
+            }
+
+        @app.route("POST", r"^/v1/credits/referral/link$")
+        def credit_referral_link(req):
+            """Attribute the presented code to a referral code's
+            owner and land the bonuses (the store's
+            attribute_referral is the exactly-once record).
+
+            A code exists only because a paid purchase minted it,
+            so linking attributes that first purchase: both sides
+            are rewarded at the link itself (the referee +10, the
+            referrer +10), and the referrer earns +100 more for
+            that first purchase, the referrer's grants trimmed
+            together at the monthly cap. Linking again, or linking
+            one's own code (or a code bought under the same email),
+            grants nothing."""
+            ok, retry_after = _credits_limited(req)
+            if not ok:
+                return errors.rate_limited(retry_after)
+            if not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            code_hash, err = _code_from_body(req)
+            if err:
+                return err
+            referral_code = req.body.get("referral_code")
+            if not isinstance(referral_code, str) \
+                    or not credits_module.valid_code_shape(
+                        referral_code):
+                return errors.bad_request(
+                    "a valid referral_code is required")
+            now = utcnow_iso()
+            result = app.store.attribute_referral(
+                code_hash, credits_module.code_hash(referral_code),
+                "referee:" + code_hash, "referrer:" + code_hash,
+                now, credits_module.grant_expiry(now),
+                credits_module.REFEREE_BONUS_CHECKS,
+                credits_module.REFERRER_BONUS_CHECKS,
+                credits_module.REFERRAL_MONTHLY_CAP_CHECKS,
+                referrer_link_bonus=
+                credits_module.REFERRER_LINK_BONUS_CHECKS,
+                referrer_link_grant_id="referrer-link:" + code_hash)
+            outcome = result["outcome"]
+            if outcome == "not_found":
+                return 404, {"error": "code_not_found"}
+            if outcome == "revoked":
+                return 403, {"error": "code_revoked"}
+            if outcome == "referral_not_found":
+                return 404, {"error": "referral_not_found"}
+            if outcome == "self_referral":
+                return 200, {"outcome": "self_referral",
+                             "granted": False}
+            body = _credit_body(
+                app.store.get_credit_code(code_hash, now))
+            body["outcome"] = outcome
+            body["granted"] = outcome == "linked"
+            if outcome == "linked":
+                body["referee_bonus_checks"] = \
+                    result["referee_bonus"]
+                body["referrer_bonus_checks"] = \
+                    result["referrer_bonus"]
+                body["referrer_link_bonus_checks"] = \
+                    result["referrer_link_bonus"]
+            return 200, body
+
+        @app.route("POST", r"^/v1/credits/consume$")
+        def credit_consume(req):
+            """Charge one credit for one new image.
+
+            The extension calls this only after a signature-verified
+            registry answer about an image it has not charged before,
+            so a failed or unreachable check never reaches this route
+            and never consumes. A repeat call for the same image is
+            the ledger's duplicate: answered, never charged twice.
+            While the code's Verifier Pass subscription is active a
+            standard charge is covered by the Pass (unlimited
+            registry checks) and draws no pool; a per-code hourly
+            backstop answers 429 rate_limited when a code's charged
+            consumes inside the trailing hour pass the
+            anti-scripting limit, an engineering guard rather than
+            a usage cap.
+            """
+            ok, retry_after = _credits_limited(req)
+            if not ok:
+                return errors.rate_limited(retry_after)
+            if not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            code_hash, err = _code_from_body(req)
+            if err:
+                return err
+            identity = req.body.get("image_identity")
+            if not isinstance(identity, str) \
+                    or not 1 <= len(identity) <= 160:
+                return errors.bad_request(
+                    "image_identity is required")
+            claim_hash = req.body.get("claim_hash")
+            if claim_hash is not None:
+                if not isinstance(claim_hash, str) or not re.fullmatch(
+                        r"[0-9a-f]{64}", claim_hash.strip().lower()):
+                    return errors.bad_request(
+                        "claim_hash must be 64 hex chars")
+                claim_hash = claim_hash.strip().lower()
+            # kind: "standard" (a registry check, the default) or
+            # "ai" (an AI generation check, funded by a Verifier
+            # Pass grant's AI sub-allowance first, by bonus grants
+            # after it, and by the code's pack counters last).
+            kind = req.body.get("kind", "standard")
+            if kind not in credits_module.CHECK_KINDS:
+                return errors.bad_request(
+                    "kind must be \"standard\" or \"ai\"")
+            result = app.store.consume_credit(
+                code_hash, identity, claim_hash,
+                "chg_" + uuid.uuid4().hex, utcnow_iso(), kind=kind,
+                hourly_limit=credits_module.CONSUME_HOURLY_LIMIT)
+            outcome = result["outcome"]
+            row = result["code"]
+            if outcome == "not_found":
+                return 404, {"error": "code_not_found"}
+            if outcome == "revoked":
+                return 403, {"error": "code_revoked"}
+            body = _credit_body(row)
+            body["charged"] = outcome == "charged"
+            body["duplicate"] = outcome == "duplicate"
+            body["kind"] = kind
+            if outcome == "rate_limited":
+                body["error"] = "rate_limited"
+                return 429, body
+            if outcome in ("no_credits", "no_ai_credits"):
+                body["error"] = outcome
+                return 402, body
+            return 200, body
+
         @app.route("GET", r"^/v1/products/(?P<tag_id>[^/]{1,128})$")
-        @app.require_role("verifier")
         def get_product(req, tag_id):
             row = app.store.get_product(tag_id)
-            if row is None:
-                return errors.unknown()
-            return 200, _product_body(row)
+            if row is not None:
+                return 200, _product_body(row)
+            record = app.store.get_registration(tag_id)
+            if record is not None \
+                    and record.get("kind") == "product":
+                return 200, _product_body_from_registration(record)
+            return errors.unknown()
 
         @app.route("GET", r"^/v1/agents/(?P<agent_id>[^/]{1,128})/attestation$")
-        @app.require_role("verifier")
         def get_agent_attestation(req, agent_id):
             row = app.store.get_agent(agent_id)
-            if row is None:
-                return errors.unknown()
-            return 200, _agent_body(app.store, row)
+            if row is not None:
+                return 200, _agent_body(app.store, row)
+            record = app.store.get_registration(agent_id)
+            if record is not None \
+                    and record.get("kind") == "agent":
+                return 200, _agent_body_from_registration(
+                    app.store, record)
+            return errors.unknown()
 
         def _mint_attestation(req):
             if not isinstance(req.body, dict):
@@ -612,6 +1429,13 @@ class App:
         # checks that ran at intake and those that have not, and carry
         # no verdict and no verification mark. Shapes, intake checks,
         # and signing live in npc_verify.registry.
+        #
+        # Content registration runs two cap lanes (Bayo, 2026-11-01;
+        # the tier table and resolver live in npc_verify.registry):
+        # the OPERATOR lane — a request carrying a valid issuer-role
+        # API key is NPC's own submission and skips the public caps
+        # entirely — and the PUBLIC lane, tiered per email with an
+        # IP abuse floor. Agent registration keeps the flat caps.
 
         def _register_content_impl(req):
             if not isinstance(req.body, dict):
@@ -620,10 +1444,20 @@ class App:
             if problems:
                 return errors.unprocessable("; ".join(problems))
             email = req.body["creator_email"].strip().lower()
-            hit = registry.cap_exceeded(app.store, email, req.client_ip,
-                                        utcnow_iso())
-            if hit:
-                return errors.rate_limited(3600)
+            # Operator lane: the API key is the credential, never
+            # the unauthenticated creator_email. An absent or
+            # invalid key is not an error on this public endpoint;
+            # it simply stays on the public lane.
+            key = app.auth.authenticate(req.headers)
+            if key is None or not Auth.allows(key, "issuer"):
+                tier = registry.registration_tier_for_email(
+                    app.store, email)
+                capped = registry.content_cap_status(
+                    app.store, email, req.client_ip, utcnow_iso(),
+                    tier)
+                if capped is not None:
+                    return errors.rate_limited(
+                        capped["retry_after_seconds"])
             checks_run, checks_not_run = registry.run_content_intake(
                 app.detector, app.fetcher, req.body["kind"],
                 req.body["locator"],
@@ -682,6 +1516,19 @@ class App:
             """
             rec = app.store.get_registration(id)
             if rec is not None:
+                # The onchain anchor section is read-time metadata,
+                # like the KYA block on agent records: the stored
+                # signed record is never edited. With the anchor
+                # lane off and no anchor data on record, the section
+                # is absent and the answer is byte-identical to
+                # before the lane existed.
+                section = anchor_module.anchor_section(
+                    app.store, id, app.anchor_config.enabled,
+                    cfg=app.anchor_config)
+                if section is not None:
+                    body = dict(rec)
+                    body["anchor"] = section
+                    return 200, body
                 return 200, rec
             row = app.store.get_credential(id)
             if row is not None:
@@ -704,6 +1551,133 @@ class App:
                 if batch is not None:
                     return 200, batch
             return errors.unknown()
+
+        # -- onchain anchoring (internal trigger) -------------------------
+        # The anchor engine (npc_verify.anchor) batches unanchored
+        # registrations and writes their Merkle root to Base. It runs
+        # when an issuer calls the run endpoint; the scheduled caller
+        # is whatever cron the operator points at it (the deploy
+        # runbook names the fleet scheduler). One pass per call:
+        # finalize an open batch or prepare and submit the next. The
+        # summary answers honestly in every state, including disabled
+        # and unfunded, so a scheduled caller can log the truth.
+        @app.route("POST", r"^/v1/internal/anchor/run$")
+        @app.require_role("issuer")
+        def anchor_run(req):
+            return 200, anchor_module.run_anchor_pass(
+                app.store, app.anchor_chain, app.anchor_config,
+                utcnow_iso())
+
+        @app.route("GET", r"^/v1/internal/anchor/status$")
+        @app.require_role("issuer")
+        def anchor_status(req):
+            return 200, anchor_module.anchor_status(
+                app.store, app.anchor_chain, app.anchor_config)
+
+        # The signer half of the flow: a prepared batch waits for
+        # the signer wallet's signature (Bayo signs the commitment
+        # statement in MetaMask). The signature is recorded only
+        # when it recovers to the currently authorized signer; the
+        # next run pass then submits the batch from the owner
+        # wallet. The summary states answer honestly.
+        @app.route("POST", r"^/v1/internal/anchor/sign$")
+        @app.require_role("issuer")
+        def anchor_sign(req):
+            if not isinstance(req.body, dict):
+                return 400, {
+                    "error": "invalid_signature",
+                    "detail": "The body must carry batch_id and "
+                              "signature."}
+            out = anchor_module.record_batch_signature(
+                app.store, app.anchor_config,
+                str(req.body.get("batch_id") or ""),
+                str(req.body.get("signature") or ""))
+            if out["status"] == "signed":
+                return 200, out
+            if out["status"] == "unknown_batch":
+                return 404, dict(out, error="unknown_batch")
+            return 400, dict(out, error=out["status"])
+
+        # Signer rotation: the OWNER wallet (the fresh server
+        # wallet, the sole rotation authority) rotates the signer
+        # by signing a rotation notice. The endpoint builds the
+        # notice and signs it with the owner key server-side; the
+        # recorded notice is the inspectable event, also served
+        # publicly at GET /v1/anchor/authority. A compromised
+        # signer cannot rotate itself: that takes the owner key,
+        # which never leaves the Lambda environment.
+        @app.route("POST", r"^/v1/internal/anchor/rotate-signer$")
+        @app.require_role("issuer")
+        def anchor_rotate_signer(req):
+            cfg = app.anchor_config
+            if cfg.private_key is None:
+                return 409, {
+                    "error": "owner_not_configured",
+                    "detail": "No owner key is configured on this "
+                              "deployment, so no rotation can be "
+                              "signed. Nothing was recorded."}
+            if not isinstance(req.body, dict):
+                return 400, {
+                    "error": "invalid_rotation",
+                    "detail": "The body must carry "
+                              "to_signer_address."}
+            from .ethkeys import is_valid_address, \
+                to_checksum_address
+            to_signer = req.body.get("to_signer_address")
+            if not isinstance(to_signer, str) \
+                    or not is_valid_address(to_signer):
+                return 400, {
+                    "error": "invalid_rotation",
+                    "detail": "to_signer_address is not a valid "
+                              "Ethereum address. Nothing was "
+                              "recorded."}
+            current = anchor_module.authorized_signer(
+                app.store, cfg)
+            if to_checksum_address(to_signer) == current:
+                return 400, {
+                    "error": "invalid_rotation",
+                    "detail": "That address is already the "
+                              "authorized signer. Nothing was "
+                              "recorded."}
+            notice = anchor_module.build_signer_rotation(
+                cfg.private_key, current,
+                to_checksum_address(to_signer), utcnow_iso(),
+                note=req.body.get("note"))
+            if not anchor_module.verify_signer_rotation(
+                    notice, cfg.address):
+                # The builder and the verifier disagreeing is a
+                # code fault, never a recorded rotation.
+                return 500, {
+                    "error": "rotation_self_check_failed",
+                    "detail": "The rotation notice did not verify "
+                              "against the owner wallet. Nothing "
+                              "was recorded."}
+            notice_id = anchor_module.rotation_notice_id(notice)
+            app.store.add_anchor_rotation(
+                notice_id, notice, utcnow_iso())
+            return 200, {
+                "status": "recorded",
+                "notice_id": notice_id,
+                "notice": notice,
+                "authorized_signer": notice["to_signer"],
+                "detail": "The signer rotation is recorded and "
+                          "owner-signed. Batches signed by the "
+                          "previous signer stay provable against "
+                          "the rotation history."}
+
+        # The public authority statement: who submits (the owner
+        # wallet), who signs (the authorized signer), and the
+        # complete owner-signed rotation history. Public because
+        # the authority claim must be inspectable by the same
+        # people who check anchor proofs. With the lane off there
+        # is no authority to state, and the answer fails closed
+        # like any unknown resource.
+        @app.route("GET", r"^/v1/anchor/authority$")
+        def anchor_authority(req):
+            if not app.anchor_config.enabled:
+                return errors.unknown()
+            return 200, anchor_module.authority_block(
+                app.store, app.anchor_config)
 
         # -- Request verification (cycle completion, 2026-10-15) ---------
         # Step two of the self-serve cycle: the registrant asks NPC
@@ -1410,6 +2384,219 @@ class App:
                 return errors.unknown()
             return 200, rec
 
+        # -- continuous monitoring (build plan 2026-11-11) ---------------
+        # The Verified Trace Audit run on a cadence (npc_verify.
+        # monitoring): subjects are enrolled, due subjects are
+        # re-audited from the evidence lanes that exist (the PACT feed
+        # first, the registry attestation lane second), each outcome
+        # is compared with the last signed audit under the ratchet
+        # rule, and the events are published as signed registry
+        # records (npc.registry.monitoring_event) through the normal
+        # record path, resolvable at GET /v1/records/{id}. Reads and
+        # the pure comparison are verifier+; anything that changes
+        # state or publishes a record is issuer, mirroring the PACT
+        # and anchor sections. NPC signs every output; monitoring
+        # never touches a client's running agent.
+
+        def _monitoring_subject(subject_id):
+            for subject in app.store.list_monitoring_subjects():
+                if subject["subject_id"] == subject_id:
+                    return subject
+            return None
+
+        def _monitoring_now(body):
+            """The pass clock: an optional pinned ISO time (replays
+            and tests, mirroring monitoring_cli --now), else now."""
+            pinned = (body or {}).get("now")
+            if pinned is None:
+                return utcnow_iso(), None
+            if not isinstance(pinned, str):
+                return None, errors.bad_request(
+                    "now must be an ISO-8601 string")
+            try:
+                monitoring_module._parse_ts(pinned)
+            except (ValueError, TypeError):
+                return None, errors.bad_request(
+                    "now must be an ISO-8601 string")
+            return pinned, None
+
+        @app.route("POST", r"^/v1/monitoring/subjects$")
+        @app.require_role("issuer")
+        def monitoring_enroll_subject(req):
+            """Enroll (or update) a subject under monitoring.
+
+            The subject_id is the certified record's id (a PACT grant
+            id or an attestation subject id, per the evidence lanes).
+            cadence_hours and expires_at carry the schedule; an
+            update changes the schedule only, never the baseline.
+            """
+            if not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            subject_id = req.body.get("subject_id")
+            if not isinstance(subject_id, str) or not subject_id \
+                    or len(subject_id) > 128:
+                return errors.bad_request(
+                    "subject_id is required (string, max 128 chars)")
+            cadence = req.body.get("cadence_hours")
+            if cadence is not None and (
+                    isinstance(cadence, bool)
+                    or not isinstance(cadence, (int, float))
+                    or cadence <= 0):
+                return errors.bad_request(
+                    "cadence_hours must be a positive number")
+            expires_at = req.body.get("expires_at")
+            if expires_at is not None:
+                if not isinstance(expires_at, str):
+                    return errors.bad_request(
+                        "expires_at must be an ISO-8601 string")
+                try:
+                    monitoring_module._parse_ts(expires_at)
+                except (ValueError, TypeError):
+                    return errors.bad_request(
+                        "expires_at must be an ISO-8601 string")
+            app.store.upsert_monitoring_subject(
+                subject_id, cadence, expires_at, utcnow_iso())
+            subject = _monitoring_subject(subject_id)
+            body = dict(subject)
+            body["due_reason"] = monitoring_module.due_reason(
+                subject, utcnow_iso())
+            return 201, body
+
+        @app.route("GET", r"^/v1/monitoring/subjects$")
+        @app.require_role("verifier")
+        def monitoring_list_subjects(req):
+            """Every monitored subject, with its due state at now."""
+            now = utcnow_iso()
+            subjects = []
+            for subject in app.store.list_monitoring_subjects():
+                entry = dict(subject)
+                entry["due_reason"] = monitoring_module.due_reason(
+                    subject, now)
+                subjects.append(entry)
+            return 200, {"subjects": subjects, "time": now}
+
+        @app.route("GET", r"^/v1/monitoring/due$")
+        @app.require_role("verifier")
+        def monitoring_due(req):
+            """Due computation: the subjects due for re-audit now,
+            each annotated with its reason (never_audited,
+            expiry_due, or cadence_due)."""
+            now = utcnow_iso()
+            return 200, {
+                "due": monitoring_module.due_subjects(
+                    app.store.list_monitoring_subjects(), now),
+                "time": now,
+            }
+
+        @app.route("POST", r"^/v1/monitoring/run$")
+        @app.require_role("issuer")
+        def monitoring_run(req):
+            """One scheduler pass over every monitored subject.
+
+            The HTTP form of monitoring_cli's pass: due subjects are
+            re-audited (PACT feed first, registry attestation lane
+            second; a subject with no evidence in either lane is
+            skipped, never fabricated), baselines advance, and every
+            event the pass produces is published as a signed
+            monitoring event record. The response carries the pass
+            result plus the published records.
+            """
+            if req.body is not None and not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            now, problem = _monitoring_now(req.body)
+            if problem is not None:
+                return problem
+            pact_runner = make_pact_audit_runner(
+                app.store, app.keys, now_fn=lambda: now)
+            registry_runner = make_registry_audit_runner(
+                app.store, now_fn=lambda: now)
+
+            def runner(subject):
+                result = pact_runner(subject)
+                if result is not None:
+                    return result
+                return registry_runner(subject)
+
+            result = monitoring_module.run_once(app.store, now, runner)
+            records = [registry.mint_monitoring_event(
+                app.store, app.keys, event) for event in result["events"]]
+            body = dict(result)
+            body["records"] = records
+            return 200, body
+
+        @app.route("POST", r"^/v1/monitoring/compare$")
+        @app.require_role("verifier")
+        def monitoring_compare(req):
+            """Ratchet comparison of two audit results: score deltas,
+            flagged regressions, and conclusion-strength movement on
+            the separate axis. Pure computation; nothing is stored."""
+            if not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            baseline = req.body.get("baseline")
+            current = req.body.get("current")
+            if not isinstance(baseline, dict) \
+                    or not isinstance(current, dict):
+                return errors.bad_request(
+                    "baseline and current audit objects are required")
+            return 200, monitoring_module.compare_audits(
+                baseline, current)
+
+        @app.route("POST", r"^/v1/monitoring/crosscheck$")
+        @app.require_role("issuer")
+        def monitoring_crosscheck(req):
+            """Attach an external cross-check verdict to a subject.
+
+            The verdict (e.g. Humanos) is recorded as third-party
+            evidence in a signed monitoring event, labeled as such,
+            never as NPC's own judgment. Where it materially
+            disagrees with NPC's comparison (one side flags, the
+            other clears), the disagreement is itself recorded as a
+            second event for the human review queue; neither score
+            overwrites the other.
+            """
+            if not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            subject_id = req.body.get("subject_id")
+            if not isinstance(subject_id, str) or not subject_id \
+                    or len(subject_id) > 128:
+                return errors.bad_request(
+                    "subject_id is required (string, max 128 chars)")
+            comparison = req.body.get("npc_comparison")
+            if not isinstance(comparison, dict):
+                return errors.bad_request(
+                    "npc_comparison object is required")
+            external = req.body.get("external_verdict")
+            if not isinstance(external, dict):
+                return errors.bad_request(
+                    "external_verdict object is required")
+            stance = str(external.get("stance") or "").strip().lower()
+            if stance not in ("clear", "concern", "flag"):
+                return errors.unprocessable(
+                    "external_verdict.stance must be one of "
+                    "clear, concern, flag")
+            if _monitoring_subject(subject_id) is None:
+                return errors.unknown()
+            evaluation = monitoring_module.crosscheck_disagreement(
+                comparison, external)
+            now = utcnow_iso()
+            records = [registry.mint_monitoring_event(
+                app.store, app.keys,
+                monitoring_module.monitoring_event_payload(
+                    subject_id, "crosscheck_attached",
+                    {"source": "external_crosscheck",
+                     "third_party": True,
+                     "external_verdict": external,
+                     "evaluation": evaluation}, now))]
+            if evaluation["disagreement"]:
+                records.append(registry.mint_monitoring_event(
+                    app.store, app.keys,
+                    monitoring_module.monitoring_event_payload(
+                        subject_id, "crosscheck_disagreement",
+                        {"npc_comparison": comparison,
+                         "external_verdict": external,
+                         "evaluation": evaluation}, now)))
+            return 201, {"evaluation": evaluation, "records": records}
+
         # -- trust-layer memory (DESIGN v1 section 5) --------------------
         # Authenticated, agent-scoped endpoints under /v1/memory/.
         # Every write is a signed MemoryRecord: the API checks shape,
@@ -1635,6 +2822,180 @@ class App:
                 "count": len(items),
             }
 
+        # -- unified accounts (Gate G1, npc_verify.accounts) -----------
+        # One account per person, rooted at an email address:
+        # passkeys first, one-time email links as the anchor and
+        # fallback, recovery codes from the first enrollment,
+        # revocable device sessions on every surface, and the
+        # desktop app's browser handoff. These routes authenticate
+        # with the account session token, never with an API key:
+        # the two credential families stay separate by design, and
+        # a session token presented to a key route (or the reverse)
+        # simply does not authenticate.
+
+        def _bearer(req):
+            header = req.headers.get("authorization") or ""
+            if header.lower().startswith("bearer "):
+                return header[7:].strip()
+            return ""
+
+        def _account_ctx(req):
+            token = _bearer(req)
+            if not token:
+                return None
+            return app.accounts.authenticate(token)
+
+        def _auth_limited(req, bucket, per_minute):
+            key = "auth-%s:%s" % (bucket, req.client_ip or "unknown")
+            app.limiter.set_limit(key, per_minute)
+            return app.limiter.allowed(key)
+
+        def _account_call(fn):
+            try:
+                return 200, fn()
+            except accounts_module.AccountError as exc:
+                return exc.status, exc.body
+
+        @app.route("GET", r"^/auth/sign-in$")
+        def auth_sign_in_page(req):
+            return 200, HtmlBody(signin_page_module.render_signin_page())
+
+        @app.route("POST", r"^/v1/auth/email/request$")
+        def auth_email_request(req):
+            if not _auth_limited(req, "email", 20):
+                return errors.rate_limited(60)
+            body = req.body or {}
+            return _account_call(lambda: app.accounts.request_email_link(
+                body.get("email"), handoff_id=body.get("handoff_id")))
+
+        @app.route("POST", r"^/v1/auth/email/redeem$")
+        def auth_email_redeem(req):
+            if not _auth_limited(req, "email-redeem", 30):
+                return errors.rate_limited(60)
+            body = req.body or {}
+            return _account_call(lambda: app.accounts.redeem_email_link(
+                body.get("token"), surface=body.get("surface") or "web",
+                device_label=body.get("device_label") or ""))
+
+        @app.route("POST", r"^/v1/auth/passkeys/register/begin$")
+        def auth_passkey_register_begin(req):
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, _session = ctx
+            return _account_call(
+                lambda: app.accounts.begin_passkey_registration(account))
+
+        @app.route("POST", r"^/v1/auth/passkeys/register/finish$")
+        def auth_passkey_register_finish(req):
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, _session = ctx
+            body = dict(req.body or {})
+            challenge_id = body.pop("challenge_id", "")
+            return _account_call(
+                lambda: app.accounts.finish_passkey_registration(
+                    account, challenge_id, body))
+
+        @app.route("POST", r"^/v1/auth/passkeys/authenticate/begin$")
+        def auth_passkey_auth_begin(req):
+            if not _auth_limited(req, "passkey-begin", 60):
+                return errors.rate_limited(60)
+            body = req.body or {}
+            return _account_call(
+                lambda: app.accounts.begin_passkey_authentication(
+                    email=body.get("email") or None))
+
+        @app.route("POST", r"^/v1/auth/passkeys/authenticate/finish$")
+        def auth_passkey_auth_finish(req):
+            if not _auth_limited(req, "passkey-finish", 60):
+                return errors.rate_limited(60)
+            body = dict(req.body or {})
+            challenge_id = body.pop("challenge_id", "")
+            surface = body.pop("surface", None) or "web"
+            device_label = body.pop("device_label", None) or ""
+            handoff_id = body.pop("handoff_id", None)
+            return _account_call(
+                lambda: app.accounts.finish_passkey_authentication(
+                    challenge_id, body, surface=surface,
+                    device_label=device_label, handoff_id=handoff_id))
+
+        @app.route("POST", r"^/v1/auth/recovery/redeem$")
+        def auth_recovery_redeem(req):
+            if not _auth_limited(req, "recovery", 10):
+                return errors.rate_limited(60)
+            body = req.body or {}
+            return _account_call(
+                lambda: app.accounts.redeem_recovery_code(
+                    body.get("email"), body.get("code"),
+                    surface=body.get("surface") or "web",
+                    device_label=body.get("device_label") or ""))
+
+        @app.route("GET", r"^/v1/auth/me$")
+        def auth_me(req):
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, session = ctx
+            return 200, {
+                "account": app.accounts._account_body(account),
+                "session": app.accounts._session_body(
+                    session, current=True),
+            }
+
+        @app.route("GET", r"^/v1/auth/sessions$")
+        def auth_sessions(req):
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, session = ctx
+            return 200, app.accounts.list_sessions(
+                account, current_session_id=session["session_id"])
+
+        @app.route("POST", r"^/v1/auth/sessions/revoke$")
+        def auth_sessions_revoke(req):
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, session = ctx
+            body = req.body or {}
+            return _account_call(
+                lambda: app.accounts.revoke_session(
+                    account, body.get("session_id") or "",
+                    current_session_id=session["session_id"]))
+
+        @app.route("POST", r"^/v1/auth/sign-out$")
+        def auth_sign_out(req):
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, session = ctx
+            return _account_call(
+                lambda: app.accounts.revoke_session(
+                    account, session["session_id"],
+                    current_session_id=session["session_id"]))
+
+        @app.route("POST", r"^/v1/auth/handoff$")
+        def auth_handoff_create(req):
+            if not _auth_limited(req, "handoff", 30):
+                return errors.rate_limited(60)
+            body = req.body or {}
+            return _account_call(lambda: app.accounts.create_handoff(
+                device_label=body.get("device_label") or ""))
+
+        @app.route("POST", r"^/v1/auth/handoff/poll$")
+        def auth_handoff_poll(req):
+            body = req.body or {}
+            return _account_call(lambda: app.accounts.poll_handoff(
+                body.get("handoff_id"), body.get("secret")))
+
+        @app.route("POST", r"^/v1/auth/handoff/exchange$")
+        def auth_handoff_exchange(req):
+            body = req.body or {}
+            return _account_call(lambda: app.accounts.exchange_handoff(
+                body.get("handoff_id"), body.get("secret")))
+
     # -- idempotency (audit D4) ---------------------------------------------
     def _idempotent(self, req, route, produce):
         """Honor an optional Idempotency-Key header on a minting POST.
@@ -1725,7 +3086,7 @@ class App:
             m = pattern.match(path)
             if m:
                 req = Request(method, path, headers, body,
-                              query=query)
+                              query=query, raw_body=body_bytes)
                 try:
                     status, resp_body = fn(req, **m.groupdict())
                 except Exception:  # never leak internals
@@ -1741,6 +3102,15 @@ class App:
         are never signed, because chat is never a record. They carry
         the same transport headers, minus the signature pair."""
         code = status.value if hasattr(status, "value") else int(status)
+        if isinstance(body, HtmlBody):
+            payload = body.html.encode("utf-8")
+            headers = {
+                "Content-Type": "text/html; charset=utf-8",
+                "Content-Length": str(len(payload)),
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            }
+            return code, headers, payload
         if isinstance(body, UnsignedBody):
             payload = canonicalize(body.body)
             headers = {
@@ -1822,11 +3192,13 @@ class Handler(BaseHTTPRequestHandler):
 def create_app(db_path: str, keys_dir: str, detector=None,
                fetcher=None, chat_provider=None, chat_config=None,
                mailer=None, link_http=None,
-               coinbase_reader=None) -> App:
+               coinbase_reader=None, payments=None,
+               anchor_chain=None) -> App:
     return App(db_path, keys_dir, detector=detector, fetcher=fetcher,
                chat_provider=chat_provider, chat_config=chat_config,
                mailer=mailer, link_http=link_http,
-               coinbase_reader=coinbase_reader)
+               coinbase_reader=coinbase_reader, payments=payments,
+               anchor_chain=anchor_chain)
 
 
 def run(db_path: str, keys_dir: str, host="127.0.0.1", port=8787):

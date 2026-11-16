@@ -1,0 +1,20 @@
+Hello,
+
+Thank you for buying NPC Verify checks.
+
+Your code is:
+
+$code
+
+It holds $checks checks from the $pack_label pack. Open the NPC Verify extension, paste the code into the credits field, and the checks are ready to use. Checking an image you have already checked never uses another check, and a check that cannot complete never uses one either.
+
+Keep this code somewhere safe. Anyone who has the code can spend its checks, so treat it like a gift card.
+
+You can see your balance at any time from the extension, or buy more checks here:
+
+$checks_link
+
+NPC Labs
+A for profit company for public good and AI blockchain research lab.
+
+You are receiving this email because this address was given at checkout. We use it only for messages about this purchase, never for marketing.

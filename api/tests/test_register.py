@@ -24,6 +24,7 @@ sys.path.insert(0, BASE)
 
 from npc_verify import pact, registry  # noqa: E402
 from npc_verify.seed import seed_all  # noqa: E402
+from npc_verify.store import Store  # noqa: E402
 from npc_verify.server import Handler, create_app  # noqa: E402
 from tests.helpers import ApiTestCase  # noqa: E402
 
@@ -95,15 +96,21 @@ def build_plain_jpeg():
             + b"\xff\xd9")
 
 
+def build_plain_jpeg_2():
+    return (b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"\x00" * 48
+            + b"\xff\xd9")
+
+
 C2PA_JPEG = build_c2pa_jpeg()
 PLAIN_JPEG = build_plain_jpeg()
+PLAIN_JPEG_2 = build_plain_jpeg_2()
 SHA_LOCATOR = "sha256:" + "ab" * 32
 
 
 class _FixtureHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body = {"/c2pa.jpg": C2PA_JPEG, "/plain.jpg": PLAIN_JPEG}.get(
-            self.path)
+        body = {"/c2pa.jpg": C2PA_JPEG, "/plain.jpg": PLAIN_JPEG,
+                "/plain2.jpg": PLAIN_JPEG_2}.get(self.path)
         if body is None:
             self.send_response(404)
             self.end_headers()
@@ -365,6 +372,142 @@ class RecordsResolutionTest(ApiTestCase):
         self.assertEqual(body, {"verdict": "unknown"})
 
 
+class ClaimsVerifyRegistrationTest(ApiTestCase):
+    """The claims/verify registration bridge.
+
+    Registrations mint registry records, never attestations, so the
+    attestation-only lookup could never find a registered work: the
+    browser extension hashes the address of the image it is checking
+    and asks claims/verify, and a registered cover answered 404
+    unknown. The endpoint now also consults registrations, indexed
+    by locator-address hash and by the content hash from intake,
+    and presents a match as what it is: a registration, standing
+    "registered, checks pending", never a verification.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.files = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _FixtureHandler)
+        cls.file_port = cls.files.server_address[1]
+        threading.Thread(target=cls.files.serve_forever,
+                         daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.files.shutdown()
+        super().tearDownClass()
+
+    def url(self, name):
+        return "http://127.0.0.1:%d/%s" % (self.file_port, name)
+
+    def register_cover(self, email="bridge@example.com"):
+        status, _, data = self.post("/v1/register/content", body={
+            "title": "A plain photo", "kind": "image",
+            "locator": self.url("plain.jpg"),
+            "creator_name": "Bridge Maker", "creator_email": email,
+        })
+        self.assertEqual(status, 201)
+        return json.loads(data)
+
+    def verify(self, claim_hash):
+        return self.post("/v1/claims/verify",
+                         body={"claim_hash": claim_hash},
+                         key=self.verifier_key)
+
+    def test_match_by_locator_address_hash(self):
+        rec = self.register_cover()
+        address_hash = hashlib.sha256(
+            self.url("plain.jpg").encode("utf-8")).hexdigest()
+        status, headers, data = self.verify(address_hash)
+        self.assertEqual(status, 200)
+        body = self.check_signature(headers, data)
+        self.assertTrue(body["matched"])
+        self.assertEqual(body["match_type"], "registration")
+        reg = body["registration"]
+        self.assertEqual(reg["id"], rec["record_id"])
+        self.assertEqual(reg["matched_by"], "locator_address")
+        self.assertEqual(reg["status"], "registered_checks_pending")
+        self.assertEqual(reg["status_label"],
+                         "registered, checks pending")
+        self.assertEqual(reg["title"], "A plain photo")
+        self.assertEqual(reg["creator_name"], "Bridge Maker")
+        self.assertEqual(reg["registered_at"], rec["registered_at"])
+        # The attestation-shaped summary states the honest standing;
+        # it is never "verified" and never omitted (clients default
+        # a missing verdict to "verified", so omission would lie).
+        att = body["attestation"]
+        self.assertEqual(att["id"], rec["record_id"])
+        self.assertEqual(att["verdict"], "registered, checks pending")
+        self.assertNotEqual(att["verdict"], "verified")
+        self.assertEqual(att["creator_name"], "Bridge Maker")
+        self.assertEqual(att["created_at"], rec["registered_at"])
+        self.assertEqual(att["signature"], rec["signature"])
+        self.assertEqual(att["key_id"], rec["key_id"])
+        self.assertIn("not verification", att["findings_summary"])
+
+    def test_match_by_content_bytes_hash(self):
+        status, _, data = self.post("/v1/register/content", body={
+            "title": "A second plain photo", "kind": "image",
+            "locator": self.url("plain2.jpg"),
+            "creator_name": "Bridge Maker",
+            "creator_email": "bytes@example.com",
+        })
+        self.assertEqual(status, 201)
+        rec = json.loads(data)
+        content_hash = hashlib.sha256(PLAIN_JPEG_2).hexdigest()
+        status, headers, data = self.verify(content_hash)
+        self.assertEqual(status, 200)
+        body = self.check_signature(headers, data)
+        self.assertTrue(body["matched"])
+        self.assertEqual(body["match_type"], "registration")
+        self.assertEqual(body["registration"]["id"],
+                         rec["record_id"])
+        self.assertEqual(body["registration"]["matched_by"],
+                         "content_bytes")
+
+    def test_match_by_provided_content_hash_locator(self):
+        status, _, data = self.post("/v1/register/content", body={
+            "title": "Hash-addressed text", "kind": "text",
+            "locator": SHA_LOCATOR, "creator_name": "Hash Maker",
+            "creator_email": "hash@example.com",
+        })
+        self.assertEqual(status, 201)
+        rec = json.loads(data)
+        status, headers, data = self.verify("ab" * 32)
+        self.assertEqual(status, 200)
+        body = self.check_signature(headers, data)
+        self.assertEqual(body["registration"]["id"],
+                         rec["record_id"])
+        self.assertEqual(body["registration"]["matched_by"],
+                         "content_bytes")
+
+    def test_unregistered_hash_still_unknown(self):
+        self.register_cover(email="solo@example.com")
+        unknown_hash = hashlib.sha256(
+            b"https://example.com/never-registered.png").hexdigest()
+        status, headers, data = self.verify(unknown_hash)
+        self.assertEqual(status, 404)
+        body = self.check_signature(headers, data)
+        self.assertEqual(body["verdict"], "unknown")
+        self.assertFalse(body["matched"])
+
+    def test_agent_registration_is_not_a_claim_match(self):
+        status, _, _ = self.post("/v1/register/agent", body={
+            "agent_name": "Bridge Agent",
+            "owner_name": "Bridge Owner",
+            "owner_email": "agentbridge@example.com",
+            "homepage": "https://example.com/bridge-agent",
+        })
+        self.assertEqual(status, 201)
+        homepage_hash = hashlib.sha256(
+            b"https://example.com/bridge-agent").hexdigest()
+        status, _, data = self.verify(homepage_hash)
+        self.assertEqual(status, 404)
+        self.assertFalse(json.loads(data)["matched"])
+
+
 class RegisterEmailCapTest(ApiTestCase):
     def test_per_email_cap(self):
         old = registry.EMAIL_DAILY_CAP
@@ -477,6 +620,217 @@ class RegisterDetectorTest(unittest.TestCase):
                  if c["check"] == "c2pa_credentials"]
         self.assertEqual(creds[0]["status"],
                          "present_not_cryptographically_validated")
+
+
+class RegisterContentLanesTest(ApiTestCase):
+    """Content-registration cap lanes (Bayo's directive, 2026-11-01):
+    the operator lane (a valid issuer-role key skips the public caps
+    entirely), the tiered public lane, and an honest retry_after on
+    a cap 429. The agent lane keeps the flat caps (RegisterEmailCap-
+    Test / RegisterIpCapTest above cover the shared constants)."""
+
+    def _piece(self, i, email, key=None):
+        return self.post("/v1/register/content", body={
+            "title": "Lane piece %d" % i, "kind": "text",
+            "locator": "sha256:" + ("%02x" % (i % 256)) * 32,
+            "creator_name": "Maker", "creator_email": email,
+        }, key=key)
+
+    def test_operator_issuer_key_skips_caps(self):
+        old = registry.EMAIL_DAILY_CAP
+        registry.EMAIL_DAILY_CAP = 2
+        try:
+            for i in range(2):
+                status, _, _ = self._piece(i, "op@example.com")
+                self.assertEqual(status, 201)
+            status, _, _ = self._piece(2, "op@example.com")
+            self.assertEqual(status, 429)
+            # The same email, carrying NPC's issuer key, is the
+            # operator lane: uncapped, well past the public limit.
+            for i in range(3, 7):
+                status, _, _ = self._piece(
+                    i, "op@example.com", key=self.issuer_key)
+                self.assertEqual(status, 201)
+        finally:
+            registry.EMAIL_DAILY_CAP = old
+
+    def test_verifier_and_invalid_keys_stay_public(self):
+        old = registry.EMAIL_DAILY_CAP
+        registry.EMAIL_DAILY_CAP = 2
+        try:
+            for i in range(2):
+                status, _, _ = self._piece(i, "pub@example.com")
+                self.assertEqual(status, 201)
+            # A verifier key is a real key but not the operator
+            # credential: the public lane still applies.
+            status, _, _ = self._piece(
+                2, "pub@example.com", key=self.verifier_key)
+            self.assertEqual(status, 429)
+            # A garbage key is not an error on a public endpoint;
+            # it simply stays on the public lane too.
+            status, _, _ = self._piece(
+                3, "pub@example.com", key="npc_test_not_a_real_key")
+            self.assertEqual(status, 429)
+        finally:
+            registry.EMAIL_DAILY_CAP = old
+
+    def test_retry_after_is_the_real_wait(self):
+        old = registry.EMAIL_DAILY_CAP
+        registry.EMAIL_DAILY_CAP = 1
+        try:
+            status, _, _ = self._piece(0, "wait@example.com")
+            self.assertEqual(status, 201)
+            status, _, data = self._piece(1, "wait@example.com")
+            self.assertEqual(status, 429)
+            retry = json.loads(data)["retry_after_seconds"]
+            self.assertIsInstance(retry, int)
+            # The one counted registration landed seconds ago, so
+            # the honest wait is close to the full 24h window —
+            # never the old flat 3600 that understated it.
+            self.assertGreater(retry, 3600)
+            self.assertLessEqual(retry, 86400)
+        finally:
+            registry.EMAIL_DAILY_CAP = old
+
+    def test_paid_tier_raises_the_email_cap(self):
+        old_free = registry.EMAIL_DAILY_CAP
+        old_starter = registry.REGISTRATION_TIER_PAID_EMAIL_CAPS[
+            "starter"]
+        old_resolver = registry.registration_tier_for_email
+        registry.EMAIL_DAILY_CAP = 2
+        registry.REGISTRATION_TIER_PAID_EMAIL_CAPS["starter"] = 3
+        registry.registration_tier_for_email = (
+            lambda store, email: "starter")
+        try:
+            # Free would cap at 2; the starter tier governs at 3.
+            for i in range(3):
+                status, _, _ = self._piece(i, "tiered@example.com")
+                self.assertEqual(status, 201)
+            status, _, _ = self._piece(3, "tiered@example.com")
+            self.assertEqual(status, 429)
+        finally:
+            registry.EMAIL_DAILY_CAP = old_free
+            registry.REGISTRATION_TIER_PAID_EMAIL_CAPS[
+                "starter"] = old_starter
+            registry.registration_tier_for_email = old_resolver
+
+    def test_tier_cap_table(self):
+        self.assertEqual(registry.registration_tier_cap("free"),
+                         registry.EMAIL_DAILY_CAP)
+        self.assertEqual(registry.registration_tier_cap("starter"),
+                         100)
+        self.assertEqual(registry.registration_tier_cap("growth"),
+                         500)
+        self.assertEqual(registry.registration_tier_cap("scale"),
+                         2500)
+        # An unrecognized tier fails closed to the free cap.
+        self.assertEqual(registry.registration_tier_cap("platinum"),
+                         registry.EMAIL_DAILY_CAP)
+
+    def test_tier_resolver_returns_free_today(self):
+        # Paid state is keyed to redeem codes, not emails, so no
+        # public email resolves above free until an account/tier
+        # source is wired into the resolver seam.
+        self.assertEqual(
+            registry.registration_tier_for_email(
+                self.app.store, "anyone@example.com"), "free")
+
+
+class ContentCapStatusTest(unittest.TestCase):
+    """registry.content_cap_status against a bare store: per-tier
+    email caps, the max(IP_DAILY_CAP, tier cap) IP floor, and the
+    retry_after computed from the oldest counted registration."""
+
+    def setUp(self):
+        from datetime import datetime, timezone
+        self.tmp = tempfile.mkdtemp(prefix="npc_cap_status_")
+        self.store = Store(os.path.join(self.tmp, "t.db"))
+        self.now = datetime(2026, 11, 1, 12, 0, 0,
+                            tzinfo=timezone.utc)
+
+    def tearDown(self):
+        self.store.close()
+
+    def _add(self, rid, email, ip, when):
+        rec = {"record_id": rid, "kind": "content",
+               "registered_at": when.isoformat(timespec="seconds")}
+        self.store.add_registration(rec, email, ip)
+
+    def _now_iso(self):
+        return self.now.isoformat(timespec="seconds")
+
+    def test_retry_after_from_oldest_in_window(self):
+        from datetime import timedelta
+        old = registry.EMAIL_DAILY_CAP
+        registry.EMAIL_DAILY_CAP = 1
+        try:
+            self._add("reg_old", "a@example.com", "203.0.113.9",
+                      self.now - timedelta(hours=23))
+            capped = registry.content_cap_status(
+                self.store, "a@example.com", "203.0.113.9",
+                self._now_iso(), "free")
+            self.assertEqual(capped["dimension"], "email")
+            # The oldest (only) counted registration ages out one
+            # hour from now: the hint is that hour, not a flat one.
+            self.assertGreaterEqual(capped["retry_after_seconds"],
+                                    3500)
+            self.assertLessEqual(capped["retry_after_seconds"],
+                                 3600)
+        finally:
+            registry.EMAIL_DAILY_CAP = old
+
+    def test_ip_floor_scales_with_tier(self):
+        from datetime import timedelta
+        old_ip = registry.IP_DAILY_CAP
+        old_starter = registry.REGISTRATION_TIER_PAID_EMAIL_CAPS[
+            "starter"]
+        registry.IP_DAILY_CAP = 2
+        registry.REGISTRATION_TIER_PAID_EMAIL_CAPS["starter"] = 3
+        try:
+            for i in range(3):
+                self._add("reg_ip_%d" % i,
+                          "person%d@example.com" % i, "203.0.113.9",
+                          self.now - timedelta(hours=1))
+            # Free floor is max(2, free cap 10) = 10: not capped.
+            self.assertIsNone(registry.content_cap_status(
+                self.store, "fresh@example.com", "203.0.113.9",
+                self._now_iso(), "free"))
+            # Starter floor is max(2, 3) = 3: the IP caps here,
+            # even though this email itself is fresh.
+            capped = registry.content_cap_status(
+                self.store, "fresh@example.com", "203.0.113.9",
+                self._now_iso(), "starter")
+            self.assertEqual(capped["dimension"], "ip")
+        finally:
+            registry.IP_DAILY_CAP = old_ip
+            registry.REGISTRATION_TIER_PAID_EMAIL_CAPS[
+                "starter"] = old_starter
+
+    def test_paid_tier_email_cap_counts(self):
+        from datetime import timedelta
+        old_starter = registry.REGISTRATION_TIER_PAID_EMAIL_CAPS[
+            "starter"]
+        old_growth = registry.REGISTRATION_TIER_PAID_EMAIL_CAPS[
+            "growth"]
+        registry.REGISTRATION_TIER_PAID_EMAIL_CAPS["starter"] = 3
+        registry.REGISTRATION_TIER_PAID_EMAIL_CAPS["growth"] = 5
+        try:
+            for i in range(3):
+                self._add("reg_t_%d" % i, "busy@example.com",
+                          "203.0.113.9", self.now - timedelta(hours=1))
+            self.assertEqual(
+                registry.content_cap_status(
+                    self.store, "busy@example.com", "203.0.113.9",
+                    self._now_iso(), "starter")["dimension"],
+                "email")
+            self.assertIsNone(registry.content_cap_status(
+                self.store, "busy@example.com", "203.0.113.9",
+                self._now_iso(), "growth"))
+        finally:
+            registry.REGISTRATION_TIER_PAID_EMAIL_CAPS[
+                "starter"] = old_starter
+            registry.REGISTRATION_TIER_PAID_EMAIL_CAPS[
+                "growth"] = old_growth
 
 
 if __name__ == "__main__":
