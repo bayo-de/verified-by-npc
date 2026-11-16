@@ -1992,10 +1992,10 @@ _HEALTH_CALL = """curl https://api.npclabs.xyz/v1/health"""
 
 _HEALTH_RESPONSE = """{
   "chain": {
-    "anchoring": "disabled",
+    "anchoring": "live",
     "mode": "local-first",
-    "network": "none",
-    "note": "Phase 1 records anchor hashes locally; no chain writes until the mainnet gate clears."
+    "network": "base",
+    "note": "Records anchor to Base in signed Merkle batches (NPC-ANCHOR-V2). Batch two anchored 2026-11-09 at Base block 55250723."
   },
   "key_id": "npc-demo-api-signing-20261014-e9c73a",
   "status": "ok",
@@ -2705,7 +2705,7 @@ def _search_example_links(values):
 
 def search_view(query="", result_html="", credential_examples=(),
                 product_examples=(), keys_doc=None, live_lookup_id=None,
-                api_base=PUBLIC_API_BASE):
+                api_base=PUBLIC_API_BASE, worked_example=None):
     parts = ["""
 <p class="kicker">Search</p>
 <h1>Look up any NPC ID.</h1>
@@ -2715,6 +2715,14 @@ def search_view(query="", result_html="", credential_examples=(),
         parts.append(live_lookup_marker(api_base, live_lookup_id))
     if result_html:
         parts.append(result_html)
+    if worked_example:
+        parts.append("""
+<h2>A real record</h2>
+<p>This one is not a sample. It is a real record, registered by NPC Labs and anchored on %s in block %s. Open it and Search answers from the signed record itself, with its anchor proof.</p>
+<p class="examples">%s</p>
+""" % (esc(worked_example["chain"]),
+       "{:,}".format(worked_example["block_number"]),
+       _search_example_links([worked_example["id"]])))
     parts.append("""
 <h2>Sample IDs</h2>
 <p>The samples below show how Search answers. They are test records, not real products, credentials, or people.</p>

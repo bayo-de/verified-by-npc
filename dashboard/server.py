@@ -186,7 +186,8 @@ class _App:
                 credential_examples=fixtures.PREVIEW_CREDENTIALS,
                 product_examples=fixtures.PREVIEW_PRODUCTS,
                 keys_doc=doc, live_lookup_id=live_lookup_id,
-                api_base=app.api_url)
+                api_base=app.api_url,
+                worked_example=fixtures.SEARCH_WORKED_EXAMPLE)
 
         def search_result(query):
             try:
@@ -220,7 +221,8 @@ class _App:
                         query=query, result_html=result,
                         credential_examples=fixtures.PREVIEW_CREDENTIALS,
                         product_examples=fixtures.PREVIEW_PRODUCTS,
-                        keys_doc=doc, api_base=app.api_url)
+                        keys_doc=doc, api_base=app.api_url,
+                        worked_example=fixtures.SEARCH_WORKED_EXAMPLE)
             # API-issued IDs (registrations above all) resolve through
             # the one records endpoint, signature-verified like every
             # API answer this dashboard renders.
@@ -245,7 +247,8 @@ class _App:
                         query=query, result_html=rendered,
                         credential_examples=fixtures.PREVIEW_CREDENTIALS,
                         product_examples=fixtures.PREVIEW_PRODUCTS,
-                        keys_doc=doc, api_base=app.api_url)
+                        keys_doc=doc, api_base=app.api_url,
+                        worked_example=fixtures.SEARCH_WORKED_EXAMPLE)
             except UnknownSubject:
                 pass
             except ApiError:
