@@ -71,6 +71,14 @@ paths:
     get:
       operationId: getCredential
       summary: Credential lookup
+      description: |
+        PUBLIC: no API key. Returns the credential body for a
+        credential ID from the typed table. On a typed-table miss,
+        returns a credential-shaped body built from the registration
+        when the ID names a credential registration. A registration
+        of another kind and an unknown ID return 404. This body is
+        not the signed registration returned by `GET /records/{id}`.
+      security: []
       parameters:
         - name: id
           in: path
@@ -460,6 +468,14 @@ paths:
     get:
       operationId: getProduct
       summary: Smart-tag authenticity lookup
+      description: |
+        PUBLIC: no API key. Returns the product body for a product
+        tag ID from the typed table. On a typed-table miss, returns
+        a product-shaped body built from the registration when the
+        ID names a product registration. A registration of another
+        kind and an unknown ID return 404. This body is not the
+        signed registration returned by `GET /records/{id}`.
+      security: []
       parameters:
         - name: tag_id
           in: path
@@ -488,6 +504,16 @@ paths:
     get:
       operationId: getAgentAttestation
       summary: Agent verification status
+      description: |
+        PUBLIC: no API key. Returns the agent attestation body for
+        an agent ID from the typed table. On a typed-table miss,
+        returns an agent-shaped body built from the registration
+        when the ID names an agent registration; a registration's
+        standing is carried as its verdict and is never upgraded to
+        verified. A registration of another kind and an unknown ID
+        return 404. This body is not the signed registration
+        returned by `GET /records/{id}`.
+      security: []
       parameters:
         - name: agent_id
           in: path

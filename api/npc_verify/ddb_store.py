@@ -326,6 +326,37 @@ class DynamoDBStore:
                 for r in rows]
 
     # -- PACT record layer ----------------------------------------------------
+    # -- continuous monitoring ----------------------------------------------
+    # Parity with store.py's monitoring_subjects (added 2026-11-11):
+    # one row per certified record under monitoring, in the shape
+    # npc_verify.monitoring consumes. The signed registry records that
+    # publish monitoring events are created by the caller through the
+    # normal record path, never by the store.
+
+    def upsert_monitoring_subject(self, subject_id, cadence_hours,
+                                  expires_at, enrolled_at) -> None:
+        with self._lock:
+            row = self._get_row("MONITORING_SUBJECT", subject_id) or {
+                "subject_id": subject_id, "enrolled_at": enrolled_at,
+                "last_audit_at": None, "last_audit": None}
+            row["cadence_hours"] = cadence_hours
+            row["expires_at"] = expires_at
+            self._put_row("MONITORING_SUBJECT", subject_id, row)
+
+    def list_monitoring_subjects(self):
+        with self._lock:
+            return self._query_rows("MONITORING_SUBJECT")
+
+    def record_monitoring_audit(self, subject_id, audited_at,
+                                audit) -> None:
+        with self._lock:
+            row = self._get_row("MONITORING_SUBJECT", subject_id)
+            if row is None:
+                return
+            row["last_audit_at"] = audited_at
+            row["last_audit"] = audit
+            self._put_row("MONITORING_SUBJECT", subject_id, row)
+
     def add_pact_consent(self, record) -> bool:
         """Insert a signed consent record. False if the grant exists."""
         row = {"record_id": record["record_id"],

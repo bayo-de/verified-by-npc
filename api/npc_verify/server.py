@@ -8,10 +8,19 @@ public keys so responses verify offline.
 Endpoints:
   GET  /v1/health                        (no auth)
   GET  /v1/keys                          (no auth)
-  GET  /v1/credentials/{id}              (verifier+)
+  GET  /v1/credentials/{id}              (PUBLIC; typed-table body for
+                                           a credential ID, or a typed
+                                           body built from a same-kind
+                                           registration for a record ID)
   POST /v1/claims/verify                  (verifier+)
-  GET  /v1/products/{tag_id}             (verifier+)
-  GET  /v1/agents/{agent_id}/attestation  (verifier+)
+  GET  /v1/products/{tag_id}             (PUBLIC; typed-table body for
+                                           a product tag ID, or a typed
+                                           body built from a same-kind
+                                           registration for a record ID)
+  GET  /v1/agents/{agent_id}/attestation  (PUBLIC; typed-table body for
+                                           an agent ID, or a typed body
+                                           built from a same-kind
+                                           registration for a record ID)
   POST /v1/attestations                   (issuer only)
   POST /v1/images/ai-check                (verifier+; Sightengine-backed,
                                            signed like every response)
@@ -24,6 +33,22 @@ Endpoints:
   POST /v1/pact/grants/{id}:revoke        (issuer only; signed append-only
                                            revocation record)
   GET  /v1/pact/grants/{id}/status        (verifier+; signed status record)
+  POST /v1/monitoring/subjects            (issuer only; enroll or update
+                                           a continuous-monitoring subject)
+  GET  /v1/monitoring/subjects            (verifier+; monitored subjects
+                                           with their live due state)
+  GET  /v1/monitoring/due                 (verifier+; due computation:
+                                           subjects due for re-audit now)
+  POST /v1/monitoring/run                 (issuer only; one scheduler
+                                           pass over every subject;
+                                           publishes signed monitoring
+                                           event records)
+  POST /v1/monitoring/compare             (verifier+; ratchet/drift
+                                           comparison of two audit results)
+  POST /v1/monitoring/crosscheck          (issuer only; attach an external
+                                           cross-check verdict to a
+                                           subject; a material disagreement
+                                           is itself recorded)
   POST /v1/register/content               (PUBLIC; registers a piece of
                                            content and starts verification:
                                            a signed registration record,
@@ -109,6 +134,9 @@ from . import social as social_module
 from . import kya as kya_module
 from . import pact
 from . import registry
+from . import monitoring as monitoring_module
+from .monitoring_pact import make_pact_audit_runner
+from .monitoring_registry import make_registry_audit_runner
 from .seed import ANCHOR_CHAIN
 from .store import Store, make_store  # noqa: F401  (Store re-exported)
 from .store import registration_email_hash as _email_hash_of
@@ -137,10 +165,11 @@ MAX_BODY = 1024 * 1024  # 1 MiB
 # 750 KB of image keeps the JSON body under MAX_BODY.
 MAX_IMAGE_BYTES = 750 * 1000
 MAX_IMAGE_URL = 2048
-CHAIN_STATUS = {"network": "none", "anchoring": "disabled",
+CHAIN_STATUS = {"network": "base", "anchoring": "live",
                 "mode": "local-first",
-                "note": "Phase 1 records anchor hashes locally; "
-                        "no chain writes until the mainnet gate clears."}
+                "note": "Records anchor to Base in signed Merkle "
+                        "batches (NPC-ANCHOR-V2). Batch two anchored "
+                        "2026-11-09 at Base block 55250723."}
 
 
 class Request:
@@ -227,7 +256,16 @@ def _product_body(row):
 
 
 def _agent_body(store, row):
-    att = store.get_attestation(row["attestation_id"])
+    # A row with no attestation_id has no linked attestation to
+    # fetch (registration-derived rows never carry one). Asking the
+    # store anyway is not a harmless miss on the DynamoDB backend:
+    # boto3 serializes a None key as {"NULL": true} and DynamoDB
+    # rejects a null key attribute with a ValidationException,
+    # which the dispatch catch-all turns into a 400. The SQLite and
+    # fake-table transports silently return no row, which is why
+    # only production saw it (v6.5 fallback, fixed in v6.5.1).
+    att = store.get_attestation(row["attestation_id"]) \
+        if row["attestation_id"] else None
     anchor = None
     if att is not None:
         anchor = {"chain": att["anchor_chain"], "tx": att["anchor_tx"],
@@ -267,6 +305,105 @@ def _agent_body(store, row):
                     "agent", row["agent_id"]),
                 as_of=utcnow_iso()))
     return body
+
+
+def _registration_field(record, *names, default=None):
+    """The first present, non-null field among ``names``."""
+    for name in names:
+        if name in record and record[name] is not None:
+            return record[name]
+    return default
+
+
+def _registration_json_field(record, *names, default):
+    value = _registration_field(record, *names, default=default)
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def _credential_body_from_registration(record):
+    """Build the credential response shape from a credential record.
+
+    Registrations are signed registry records, not typed-table rows.
+    Their field names are mapped into the credential body only when
+    the registration's kind is credential; fields the record does not
+    carry stay null or empty rather than being invented.
+    """
+    holder_name = _registration_field(
+        record, "holder_name", "holder")
+    holder_public = record.get("holder_public")
+    if holder_public is None:
+        holder_public = holder_name is not None
+    row = {
+        "id": _registration_field(record, "id", "record_id"),
+        "status": _registration_field(record, "status", default="unknown"),
+        "title": _registration_field(record, "title", "name"),
+        "issuer": _registration_field(
+            record, "issuer", "issuer_name", "creator_name"),
+        "holder_name": holder_name,
+        "holder_public": 1 if holder_public else 0,
+        "issued_at": _registration_field(
+            record, "issued_at", "registered_at", "created_at"),
+        "expires_at": _registration_field(record, "expires_at"),
+        "skills_json": _registration_json_field(
+            record, "assessed_skills", "skills", default=[]),
+        "signature_b64": _registration_field(
+            record, "signature_b64", "signature", default=""),
+        "key_id": _registration_field(record, "key_id", default=""),
+        "verification_url": _registration_field(
+            record, "verification_url", default=""),
+    }
+    return _credential_body(row)
+
+
+def _product_body_from_registration(record):
+    """Build the product response shape from a product record."""
+    row = {
+        "tag_id": _registration_field(
+            record, "tag_id", "record_id", "id"),
+        "status": _registration_field(record, "status", default="unknown"),
+        "name": _registration_field(record, "name", "title"),
+        "creator": _registration_field(
+            record, "creator", "creator_name"),
+        "description": _registration_field(
+            record, "description", default=""),
+        "provenance_json": _registration_json_field(
+            record, "provenance", default=[]),
+        "attestation_id": _registration_field(record, "attestation_id"),
+    }
+    return _product_body(row)
+
+
+def _agent_body_from_registration(store, record):
+    """Build the agent response shape from an agent record.
+
+    A registration's standing is not an attestation verdict. When the
+    record has no explicit verdict, its status label is carried in
+    the verdict field (for a registry registration, that label is
+    "registered, checks pending"), so the fallback never upgrades a
+    registration into a verified agent.
+    """
+    verdict = _registration_field(record, "verdict")
+    if verdict is None:
+        verdict = _registration_field(
+            record, "status_label", "status", default="unknown")
+    row = {
+        "agent_id": _registration_field(
+            record, "agent_id", "record_id", "id"),
+        "verdict": verdict,
+        "scope_json": _registration_json_field(
+            record, "scope", "declared_scope", default={}),
+        "valid_from": _registration_field(
+            record, "valid_from", "registered_at", "issued_at",
+            "created_at"),
+        "valid_until": _registration_field(
+            record, "valid_until", "expires_at"),
+        "attestation_id": _registration_field(record, "attestation_id"),
+        "notes": _registration_field(
+            record, "notes", "description", "status_label", default=""),
+    }
+    return _agent_body(store, row)
 
 
 def _attestation_body(store, row):
@@ -508,13 +645,24 @@ class App:
         def get_keys(req):
             return 200, app.keys.publish()
 
+        # PUBLIC (anonymous-first, decided 2026-11-09): the per-type
+        # lookups carry no key gate. A typed-table ID returns that
+        # table's body. On a typed-table miss, a registration record
+        # ID returns a body in the same per-type shape when the
+        # registration's kind matches this endpoint; GET
+        # /v1/records/{id} still returns the signed registration
+        # itself. Writes and claim verification stay gated; see
+        # POST /v1/claims/verify below.
         @app.route("GET", r"^/v1/credentials/(?P<id>[^/]{1,128})$")
-        @app.require_role("verifier")
         def get_credential(req, id):
             row = app.store.get_credential(id)
-            if row is None:
-                return errors.unknown()
-            return 200, _credential_body(row)
+            if row is not None:
+                return 200, _credential_body(row)
+            record = app.store.get_registration(id)
+            if record is not None \
+                    and record.get("kind") == "credential":
+                return 200, _credential_body_from_registration(record)
+            return errors.unknown()
 
         @app.route("POST", r"^/v1/claims/verify$")
         @app.require_role("verifier")
@@ -1185,20 +1333,27 @@ class App:
             return 200, body
 
         @app.route("GET", r"^/v1/products/(?P<tag_id>[^/]{1,128})$")
-        @app.require_role("verifier")
         def get_product(req, tag_id):
             row = app.store.get_product(tag_id)
-            if row is None:
-                return errors.unknown()
-            return 200, _product_body(row)
+            if row is not None:
+                return 200, _product_body(row)
+            record = app.store.get_registration(tag_id)
+            if record is not None \
+                    and record.get("kind") == "product":
+                return 200, _product_body_from_registration(record)
+            return errors.unknown()
 
         @app.route("GET", r"^/v1/agents/(?P<agent_id>[^/]{1,128})/attestation$")
-        @app.require_role("verifier")
         def get_agent_attestation(req, agent_id):
             row = app.store.get_agent(agent_id)
-            if row is None:
-                return errors.unknown()
-            return 200, _agent_body(app.store, row)
+            if row is not None:
+                return 200, _agent_body(app.store, row)
+            record = app.store.get_registration(agent_id)
+            if record is not None \
+                    and record.get("kind") == "agent":
+                return 200, _agent_body_from_registration(
+                    app.store, record)
+            return errors.unknown()
 
         def _mint_attestation(req):
             if not isinstance(req.body, dict):
@@ -2228,6 +2383,219 @@ class App:
             if rec is None:
                 return errors.unknown()
             return 200, rec
+
+        # -- continuous monitoring (build plan 2026-11-11) ---------------
+        # The Verified Trace Audit run on a cadence (npc_verify.
+        # monitoring): subjects are enrolled, due subjects are
+        # re-audited from the evidence lanes that exist (the PACT feed
+        # first, the registry attestation lane second), each outcome
+        # is compared with the last signed audit under the ratchet
+        # rule, and the events are published as signed registry
+        # records (npc.registry.monitoring_event) through the normal
+        # record path, resolvable at GET /v1/records/{id}. Reads and
+        # the pure comparison are verifier+; anything that changes
+        # state or publishes a record is issuer, mirroring the PACT
+        # and anchor sections. NPC signs every output; monitoring
+        # never touches a client's running agent.
+
+        def _monitoring_subject(subject_id):
+            for subject in app.store.list_monitoring_subjects():
+                if subject["subject_id"] == subject_id:
+                    return subject
+            return None
+
+        def _monitoring_now(body):
+            """The pass clock: an optional pinned ISO time (replays
+            and tests, mirroring monitoring_cli --now), else now."""
+            pinned = (body or {}).get("now")
+            if pinned is None:
+                return utcnow_iso(), None
+            if not isinstance(pinned, str):
+                return None, errors.bad_request(
+                    "now must be an ISO-8601 string")
+            try:
+                monitoring_module._parse_ts(pinned)
+            except (ValueError, TypeError):
+                return None, errors.bad_request(
+                    "now must be an ISO-8601 string")
+            return pinned, None
+
+        @app.route("POST", r"^/v1/monitoring/subjects$")
+        @app.require_role("issuer")
+        def monitoring_enroll_subject(req):
+            """Enroll (or update) a subject under monitoring.
+
+            The subject_id is the certified record's id (a PACT grant
+            id or an attestation subject id, per the evidence lanes).
+            cadence_hours and expires_at carry the schedule; an
+            update changes the schedule only, never the baseline.
+            """
+            if not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            subject_id = req.body.get("subject_id")
+            if not isinstance(subject_id, str) or not subject_id \
+                    or len(subject_id) > 128:
+                return errors.bad_request(
+                    "subject_id is required (string, max 128 chars)")
+            cadence = req.body.get("cadence_hours")
+            if cadence is not None and (
+                    isinstance(cadence, bool)
+                    or not isinstance(cadence, (int, float))
+                    or cadence <= 0):
+                return errors.bad_request(
+                    "cadence_hours must be a positive number")
+            expires_at = req.body.get("expires_at")
+            if expires_at is not None:
+                if not isinstance(expires_at, str):
+                    return errors.bad_request(
+                        "expires_at must be an ISO-8601 string")
+                try:
+                    monitoring_module._parse_ts(expires_at)
+                except (ValueError, TypeError):
+                    return errors.bad_request(
+                        "expires_at must be an ISO-8601 string")
+            app.store.upsert_monitoring_subject(
+                subject_id, cadence, expires_at, utcnow_iso())
+            subject = _monitoring_subject(subject_id)
+            body = dict(subject)
+            body["due_reason"] = monitoring_module.due_reason(
+                subject, utcnow_iso())
+            return 201, body
+
+        @app.route("GET", r"^/v1/monitoring/subjects$")
+        @app.require_role("verifier")
+        def monitoring_list_subjects(req):
+            """Every monitored subject, with its due state at now."""
+            now = utcnow_iso()
+            subjects = []
+            for subject in app.store.list_monitoring_subjects():
+                entry = dict(subject)
+                entry["due_reason"] = monitoring_module.due_reason(
+                    subject, now)
+                subjects.append(entry)
+            return 200, {"subjects": subjects, "time": now}
+
+        @app.route("GET", r"^/v1/monitoring/due$")
+        @app.require_role("verifier")
+        def monitoring_due(req):
+            """Due computation: the subjects due for re-audit now,
+            each annotated with its reason (never_audited,
+            expiry_due, or cadence_due)."""
+            now = utcnow_iso()
+            return 200, {
+                "due": monitoring_module.due_subjects(
+                    app.store.list_monitoring_subjects(), now),
+                "time": now,
+            }
+
+        @app.route("POST", r"^/v1/monitoring/run$")
+        @app.require_role("issuer")
+        def monitoring_run(req):
+            """One scheduler pass over every monitored subject.
+
+            The HTTP form of monitoring_cli's pass: due subjects are
+            re-audited (PACT feed first, registry attestation lane
+            second; a subject with no evidence in either lane is
+            skipped, never fabricated), baselines advance, and every
+            event the pass produces is published as a signed
+            monitoring event record. The response carries the pass
+            result plus the published records.
+            """
+            if req.body is not None and not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            now, problem = _monitoring_now(req.body)
+            if problem is not None:
+                return problem
+            pact_runner = make_pact_audit_runner(
+                app.store, app.keys, now_fn=lambda: now)
+            registry_runner = make_registry_audit_runner(
+                app.store, now_fn=lambda: now)
+
+            def runner(subject):
+                result = pact_runner(subject)
+                if result is not None:
+                    return result
+                return registry_runner(subject)
+
+            result = monitoring_module.run_once(app.store, now, runner)
+            records = [registry.mint_monitoring_event(
+                app.store, app.keys, event) for event in result["events"]]
+            body = dict(result)
+            body["records"] = records
+            return 200, body
+
+        @app.route("POST", r"^/v1/monitoring/compare$")
+        @app.require_role("verifier")
+        def monitoring_compare(req):
+            """Ratchet comparison of two audit results: score deltas,
+            flagged regressions, and conclusion-strength movement on
+            the separate axis. Pure computation; nothing is stored."""
+            if not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            baseline = req.body.get("baseline")
+            current = req.body.get("current")
+            if not isinstance(baseline, dict) \
+                    or not isinstance(current, dict):
+                return errors.bad_request(
+                    "baseline and current audit objects are required")
+            return 200, monitoring_module.compare_audits(
+                baseline, current)
+
+        @app.route("POST", r"^/v1/monitoring/crosscheck$")
+        @app.require_role("issuer")
+        def monitoring_crosscheck(req):
+            """Attach an external cross-check verdict to a subject.
+
+            The verdict (e.g. Humanos) is recorded as third-party
+            evidence in a signed monitoring event, labeled as such,
+            never as NPC's own judgment. Where it materially
+            disagrees with NPC's comparison (one side flags, the
+            other clears), the disagreement is itself recorded as a
+            second event for the human review queue; neither score
+            overwrites the other.
+            """
+            if not isinstance(req.body, dict):
+                return errors.bad_request("JSON object body required")
+            subject_id = req.body.get("subject_id")
+            if not isinstance(subject_id, str) or not subject_id \
+                    or len(subject_id) > 128:
+                return errors.bad_request(
+                    "subject_id is required (string, max 128 chars)")
+            comparison = req.body.get("npc_comparison")
+            if not isinstance(comparison, dict):
+                return errors.bad_request(
+                    "npc_comparison object is required")
+            external = req.body.get("external_verdict")
+            if not isinstance(external, dict):
+                return errors.bad_request(
+                    "external_verdict object is required")
+            stance = str(external.get("stance") or "").strip().lower()
+            if stance not in ("clear", "concern", "flag"):
+                return errors.unprocessable(
+                    "external_verdict.stance must be one of "
+                    "clear, concern, flag")
+            if _monitoring_subject(subject_id) is None:
+                return errors.unknown()
+            evaluation = monitoring_module.crosscheck_disagreement(
+                comparison, external)
+            now = utcnow_iso()
+            records = [registry.mint_monitoring_event(
+                app.store, app.keys,
+                monitoring_module.monitoring_event_payload(
+                    subject_id, "crosscheck_attached",
+                    {"source": "external_crosscheck",
+                     "third_party": True,
+                     "external_verdict": external,
+                     "evaluation": evaluation}, now))]
+            if evaluation["disagreement"]:
+                records.append(registry.mint_monitoring_event(
+                    app.store, app.keys,
+                    monitoring_module.monitoring_event_payload(
+                        subject_id, "crosscheck_disagreement",
+                        {"npc_comparison": comparison,
+                         "external_verdict": external,
+                         "evaluation": evaluation}, now)))
+            return 201, {"evaluation": evaluation, "records": records}
 
         # -- trust-layer memory (DESIGN v1 section 5) --------------------
         # Authenticated, agent-scoped endpoints under /v1/memory/.

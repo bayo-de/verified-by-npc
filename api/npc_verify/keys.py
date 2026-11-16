@@ -20,19 +20,56 @@ from .models import utcnow_iso
 
 PURPOSES = ("api_signing", "issuer")
 
-# Deployment-supplied signing key (audit item D1): when BOTH of these
-# environment variables are set, the deployment's api_signing key is
-# loaded from them instead of being generated or bundled, so the
-# production seed never lives in a deploy artifact. The bundled/demo
-# key stays published alongside it (see KeyRegistry.register_external_key).
+# Deployment-supplied signing keys (audit item D1): when BOTH of a
+# purpose's environment variables are set, the deployment's key for
+# that purpose is loaded from them instead of being generated or
+# bundled, so the production seed never lives in a deploy artifact.
+# The bundled/demo key stays published alongside it (see
+# KeyRegistry.register_external_key). api_signing came first (v5.5);
+# the issuer pair beside it is the Gate G2 cutover change (v6.6).
 SIGNING_SEED_ENV = "NPC_SIGNING_SEED"
 SIGNING_KEY_ID_ENV = "NPC_SIGNING_KEY_ID"
+ISSUER_SEED_ENV = "NPC_ISSUER_SEED"
+ISSUER_KEY_ID_ENV = "NPC_ISSUER_KEY_ID"
 
 
 def _key_id(purpose: str) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     rand = secrets.token_hex(3)
     return f"npc-{purpose}-{stamp}-{rand}"
+
+
+def env_key(seed_env, key_id_env, env=None):
+    """The deployment-supplied key named by an env pair, or None.
+
+    Reads the seed variable (base64 of the 32-byte Ed25519 seed) and
+    the key-id variable from `env` (default os.environ). Both or
+    neither: a half-configured deployment raises ValueError, because
+    silently falling back to a bundled key is exactly the failure D1
+    exists to remove. The key id is restricted to alphanumerics,
+    dash, and underscore, max 128 chars.
+    """
+    env = os.environ if env is None else env
+    seed_b64 = (env.get(seed_env) or "").strip()
+    key_id = (env.get(key_id_env) or "").strip()
+    if not seed_b64 and not key_id:
+        return None
+    if not seed_b64 or not key_id:
+        raise ValueError(
+            f"{seed_env} and {key_id_env} must be "
+            "set together (or both left unset)")
+    if len(key_id) > 128 or any(
+            not (c.isalnum() or c in "-_") for c in key_id):
+        raise ValueError(f"{key_id_env} is not a safe key id")
+    try:
+        seed = base64.b64decode(seed_b64, validate=True)
+    except Exception as exc:
+        raise ValueError(
+            f"{seed_env} is not valid base64") from exc
+    if len(seed) != 32:
+        raise ValueError(
+            f"{seed_env} must decode to a 32-byte seed")
+    return key_id, seed
 
 
 def env_signing_key(env=None):
@@ -44,27 +81,19 @@ def env_signing_key(env=None):
     silently falling back to a bundled key is exactly the failure D1
     exists to remove.
     """
-    env = os.environ if env is None else env
-    seed_b64 = (env.get(SIGNING_SEED_ENV) or "").strip()
-    key_id = (env.get(SIGNING_KEY_ID_ENV) or "").strip()
-    if not seed_b64 and not key_id:
-        return None
-    if not seed_b64 or not key_id:
-        raise ValueError(
-            f"{SIGNING_SEED_ENV} and {SIGNING_KEY_ID_ENV} must be "
-            "set together (or both left unset)")
-    if len(key_id) > 128 or any(
-            not (c.isalnum() or c in "-_") for c in key_id):
-        raise ValueError(f"{SIGNING_KEY_ID_ENV} is not a safe key id")
-    try:
-        seed = base64.b64decode(seed_b64, validate=True)
-    except Exception as exc:
-        raise ValueError(
-            f"{SIGNING_SEED_ENV} is not valid base64") from exc
-    if len(seed) != 32:
-        raise ValueError(
-            f"{SIGNING_SEED_ENV} must decode to a 32-byte seed")
-    return key_id, seed
+    return env_key(SIGNING_SEED_ENV, SIGNING_KEY_ID_ENV, env)
+
+
+def env_issuer_key(env=None):
+    """The deployment-supplied issuer key, or None when unset.
+
+    Reads NPC_ISSUER_SEED (base64 of the 32-byte Ed25519 seed) and
+    NPC_ISSUER_KEY_ID from `env` (default os.environ), with the same
+    both-or-neither validation as the api_signing pair: a
+    half-configured deployment raises ValueError rather than
+    silently signing records with the bundled demo issuer key.
+    """
+    return env_key(ISSUER_SEED_ENV, ISSUER_KEY_ID_ENV, env)
 
 
 class KeyRegistry:

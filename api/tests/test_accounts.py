@@ -350,8 +350,13 @@ class TestSessions(AccountHttpTestCase):
 class TestSeparationFromApiKeys(AccountHttpTestCase):
     def test_session_token_is_not_an_api_key(self):
         data = self.redeem_link("separate@example.com")
-        status, _h, body = self.get(
-            "/v1/credentials/cred_whatever",
+        # The probe targets a still-gated route: the per-type record GETs
+        # became public on 2026-11-09 (anonymous reads ignore credentials
+        # entirely), so they can no longer distinguish key kinds. The
+        # separation property is asserted here against claims/verify,
+        # which stays verifier-gated.
+        status, _h, body = self.post(
+            "/v1/claims/verify", {},
             token=data["session_token"])
         self.assertEqual(status, 401, body)
 

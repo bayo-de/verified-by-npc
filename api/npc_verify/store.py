@@ -703,6 +703,7 @@ class Store:
             self._migrate_api_keys()
             self._migrate_registrations()
             self._migrate_credits()
+            self._migrate_monitoring()
             self.db.commit()
 
     @property
@@ -841,6 +842,63 @@ class Store:
              a.findings_summary, a.claim_hash, a.signature_b64, a.key_id,
              a.anchor_chain, a.anchor_tx, a.anchor_hash, a.anchor_status,
              1 if a.revoked else 0, a.created_at))
+
+    def _migrate_monitoring(self):
+        """monitoring_subjects table (continuous monitoring, added
+        2026-11-11): one row per certified record under monitoring,
+        carrying its schedule and its last signed audit result so the
+        monitoring engine (npc_verify.monitoring) can compute what is
+        due and compare each re-audit against the baseline under the
+        ratchet rule. CREATE IF NOT EXISTS keeps this safe on both
+        fresh and existing databases."""
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS monitoring_subjects ("
+            " subject_id TEXT PRIMARY KEY,"
+            " cadence_hours REAL,"
+            " expires_at TEXT,"
+            " enrolled_at TEXT NOT NULL,"
+            " last_audit_at TEXT,"
+            " last_audit_json TEXT)")
+
+    def upsert_monitoring_subject(self, subject_id, cadence_hours,
+                                  expires_at, enrolled_at) -> None:
+        self._write(
+            "INSERT INTO monitoring_subjects (subject_id, cadence_hours,"
+            " expires_at, enrolled_at) VALUES (?,?,?,?)"
+            " ON CONFLICT(subject_id) DO UPDATE SET"
+            " cadence_hours=excluded.cadence_hours,"
+            " expires_at=excluded.expires_at",
+            (subject_id, cadence_hours, expires_at, enrolled_at))
+
+    def list_monitoring_subjects(self):
+        """Every monitored subject as plain dicts in the shape
+        npc_verify.monitoring consumes, last audit result decoded."""
+        rows = self._fetchall("SELECT * FROM monitoring_subjects"
+                              " ORDER BY subject_id")
+        subjects = []
+        for r in rows:
+            subject = {
+                "subject_id": r["subject_id"],
+                "cadence_hours": r["cadence_hours"],
+                "expires_at": r["expires_at"],
+                "enrolled_at": r["enrolled_at"],
+                "last_audit_at": r["last_audit_at"],
+                "last_audit": (json.loads(r["last_audit_json"])
+                               if r["last_audit_json"] else None),
+            }
+            subjects.append(subject)
+        return subjects
+
+    def record_monitoring_audit(self, subject_id, audited_at,
+                                audit) -> None:
+        """Store a completed audit as the subject's new baseline.
+        The audit dict is kept verbatim; the signed registry record
+        that publishes it is created by the caller through the normal
+        record path, never by the store."""
+        self._write(
+            "UPDATE monitoring_subjects SET last_audit_at=?,"
+            " last_audit_json=? WHERE subject_id=?",
+            (audited_at, json.dumps(audit), subject_id))
 
     def get_attestation(self, att_id):
         return self._fetchone(

@@ -14,8 +14,17 @@ Spec: [`openapi.yaml`](../openapi.yaml) (OpenAPI 3.1)
 
 ## 1. Authentication
 
-All endpoints except `GET /v1/health` and `GET /v1/keys` require a Bearer
-API key:
+The read surface is public (anonymous-first, decided 2026-11-09): no key
+is needed for `GET /v1/health`, `GET /v1/keys`, `GET /v1/records/{id}`,
+`GET /v1/credentials/{id}`, `GET /v1/products/{tag_id}`, or
+`GET /v1/agents/{agent_id}/attestation`. Each per-type lookup first
+checks its typed table; on a miss it checks the registrations store
+and, when the ID names a registration of the same kind, returns a body
+in that endpoint's per-type shape built from the registration. A
+registration of a different kind, and any unknown ID, returns 404.
+The records endpoint is different: for a registration ID it returns
+the signed registration record itself. Writes and the remaining
+endpoints require a Bearer API key:
 
 ```
 Authorization: Bearer npc_test_...
@@ -25,8 +34,8 @@ Authorization: Bearer npc_test_...
 
 | Role       | Can do |
 |------------|--------|
-| `verifier` | All lookups and claim verification |
-| `issuer`   | Everything a verifier can, plus `POST /v1/attestations` |
+| `verifier` | Claim verification, the AI image check, and the keyed memory and credit routes |
+| `issuer`   | Everything a verifier can, plus `POST /v1/attestations` and the internal anchor endpoints |
 
 A key with an insufficient role gets `403`. A missing or invalid key gets
 `401`. Keys are stored as SHA-256 hashes; the plaintext is shown once at
@@ -88,10 +97,10 @@ No auth. Liveness, the active signing key ID, and chain status.
   "version": "1.0.0",
   "key_id": "npc-api_signing-20261005-x1y2",
   "chain": {
-    "network": "none",
-    "anchoring": "disabled",
+    "network": "base",
+    "anchoring": "live",
     "mode": "local-first",
-    "note": "Phase 1 records anchor hashes locally; no chain writes until the mainnet gate clears."
+    "note": "Records anchor to Base in signed Merkle batches (NPC-ANCHOR-V2). Batch two anchored 2026-11-09 at Base block 55250723."
   },
   "time": "2026-10-05T23:00:00+00:00"
 }
@@ -104,13 +113,15 @@ keys. No private material is ever published.
 
 ### GET /v1/credentials/{id}
 
-Credential lookup. `status` is `valid`, `revoked`, or `expired`.
+**No auth.** Credential lookup. `status` is `valid`, `revoked`, or `expired`.
 `holder_name` is present only if the holder made it public — otherwise
 `null`, always.
 
 Unknown ID → `404 {"verdict": "unknown"}`.
 
 ### POST /v1/claims/verify
+
+**Verifier role required.**
 
 Body: `{"claim_text": "..."}` or `{"claim_hash": "<64 hex chars>"}`.
 
@@ -135,14 +146,14 @@ unverifiable claim is reported as unknown, never as false.
 
 ### GET /v1/products/{tag_id}
 
-Smart-tag authenticity lookup. `status` is `authentic`, `counterfeit`, or
+**No auth.** Smart-tag authenticity lookup. `status` is `authentic`, `counterfeit`, or
 `unknown`, with the public provenance chain (origin, transfers).
 
 Unknown tag → `404 {"verdict": "unknown"}`.
 
 ### GET /v1/agents/{agent_id}/attestation
 
-Agent verification status: `verified`, `verified_with_caveats`,
+**No auth.** Agent verification status: `verified`, `verified_with_caveats`,
 `not_verified`, or `unknown`, with scope, time bounds, the attestation ID,
 and the onchain anchor reference.
 

@@ -1513,3 +1513,44 @@ def mint_agent_registration(store, keys, fields, email, client_ip):
     rec = pact.sign_record(keys, core)
     store.add_registration(rec, email, client_ip)
     return rec
+
+
+# -- continuous monitoring events --------------------------------------
+MONITORING_EVENT_RECORD_TYPE = "npc.registry.monitoring_event"
+
+# Server-side submitter column for internal records. The
+# registrations schema requires a non-null email (it keys the
+# submission caps for public registrations); a monitoring event has
+# no submitter, so the column carries NPC's own system address (the
+# mailer's default sender). It is server-side only, never part of
+# the signed record, and monitoring mints are issuer-gated internal
+# actions, never public submissions, so no cap accounting applies.
+MONITORING_EVENT_ACTOR = "hello@npclabs.xyz"
+
+
+def mint_monitoring_event(store, keys, payload):
+    """Sign and store one monitoring event as a registry record.
+
+    `payload` is npc_verify.monitoring.monitoring_event_payload's
+    output: {kind: "monitoring_event", subject_id, event_type,
+    detail, at}. The record is the event's signed, publicly
+    resolvable form (GET /v1/records/{id}); the event's own
+    timestamp becomes the record's registered_at so registry order
+    matches the monitoring timeline, and it is also carried verbatim
+    as event_at. The server-side registration columns carry
+    MONITORING_EVENT_ACTOR and an empty client_ip; neither is part
+    of the record.
+    """
+    core = {
+        "record_type": MONITORING_EVENT_RECORD_TYPE,
+        "record_id": "reg_" + secrets.token_hex(12),
+        "kind": "monitoring_event",
+        "subject_id": payload["subject_id"],
+        "event_type": payload["event_type"],
+        "detail": payload["detail"],
+        "event_at": payload["at"],
+        "registered_at": payload["at"],
+    }
+    rec = pact.sign_record(keys, core)
+    store.add_registration(rec, MONITORING_EVENT_ACTOR, "")
+    return rec
