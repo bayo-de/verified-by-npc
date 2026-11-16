@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Get checks - Verified by NPC</title>
+<!--
+  NPC Verify check packs: the purchase page for paid credits.
+  Ships with the dashboard export (wired 2026-10-29):
+  dashboard/export_static.py copies this file verbatim to
+  get-checks/index.html, so it serves at /get-checks on
+  verify.npclabs.xyz (the address the API's purchase email and the
+  extension's credits flow already point at). It talks to the NPC
+  API (default https://api.npclabs.xyz; override with ?api= for a
+  local demo). Prices come from the API, never from this file.
+-->
+<style>
+:root{
+  --ink:#181818; --muted:#6f6f6f; --faint:#9a9a9a;
+  --line:#e6e6e4; --bg:#fbfbf9; --card:#ffffff;
+  --ok:#1a7a3c; --okbg:#eef7f0;
+  --warn:#8f5e00; --warnbg:#faf4e3;
+  --bad:#b02318; --badbg:#fbeeee;
+  --unk:#6f6f6f; --unkbg:#f2f2f1;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",Inter,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:760px;margin:0 auto;padding:0 24px}
+.top{border-bottom:1px solid var(--line);background:var(--card)}
+.top-in{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;padding-top:18px;padding-bottom:18px;gap:12px}
+.brand{color:var(--ink);text-decoration:none;font-weight:650;font-size:17px;letter-spacing:-0.01em}
+nav a{color:var(--muted);text-decoration:none;font-size:14px;margin-left:20px}
+nav a:hover{color:var(--ink)}
+main.wrap{padding:72px 24px 64px}
+h1{font-size:32px;line-height:1.25;letter-spacing:-0.02em;font-weight:650;margin:0 0 12px}
+h2{font-size:20px;font-weight:650;letter-spacing:-0.01em;margin:40px 0 10px}
+.kicker{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin:0 0 10px}
+.lede{font-size:18px;color:var(--muted);max-width:34em;margin:0 0 8px}
+p{max-width:38em}
+a{color:var(--ink)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin:16px 0}
+.card h3{margin:0 0 6px;font-size:17px;font-weight:650}
+.card p{margin:6px 0 0;color:var(--muted);font-size:15px}
+.card.featured{border-color:var(--ink)}
+.pill{display:inline-block;font-size:11.5px;font-weight:650;letter-spacing:.08em;text-transform:uppercase;
+  padding:3px 11px;border-radius:999px;border:1px solid var(--line);background:var(--unkbg);color:var(--unk);white-space:nowrap}
+.pill.verified{color:var(--ok);background:var(--okbg);border-color:#cfe8d6}
+.price{font-size:28px;font-weight:650;letter-spacing:-0.02em;margin:8px 0 0}
+.termsline{color:var(--faint);font-size:13.5px;margin:2px 0 0}
+button{padding:11px 20px;font-size:15px;font-weight:600;border:0;border-radius:10px;background:var(--ink);color:#fff;cursor:pointer;margin-top:14px}
+button:hover{opacity:.88}
+button[disabled]{opacity:.5;cursor:default}
+input[type=email]{width:100%;max-width:420px;padding:11px 14px;font-size:15px;border:1px solid var(--line);
+  border-radius:10px;background:var(--card);color:var(--ink)}
+label.small{font-size:13px;color:var(--muted);display:block;margin:14px 0 6px}
+.keybox{background:#f4f4f2;border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:8px 0}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:15px;word-break:break-all}
+.notice{border:1px solid var(--line);border-radius:12px;padding:18px 20px;background:var(--card);margin:18px 0}
+.notice.warn{background:var(--warnbg);border-color:#e9d9ab}
+.notice.bad{background:var(--badbg);border-color:#efc9c4}
+.notice h3{margin:0 0 6px;font-size:16px}
+.notice p{margin:4px 0 0;color:var(--muted);font-size:14.5px}
+.steps{margin:14px 0;padding-left:22px}
+.steps li{padding:6px 0;color:var(--muted)}
+.steps li strong{color:var(--ink);font-weight:650}
+.hidden{display:none}
+footer{border-top:1px solid var(--line);color:var(--faint);font-size:13.5px}
+footer .wrap{padding-top:20px;padding-bottom:28px}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-in">
+    <a class="brand" href="/">Verified by NPC</a>
+    <nav>
+      <a href="/records">Records</a>
+      <a href="/search">Search</a>
+      <a href="/help">Help</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <p class="kicker">NPC Verify checks</p>
+  <h1>Get more checks</h1>
+  <p class="lede">The NPC Verify extension comes with 10 free checks. When they run out, you can buy more on this page. Paying gives you a checks code. Paste the code into the extension and your checks are added. No account to create. The email field below is only for a copy of that code, sent as a receipt and a backup. The code is private, and it is not a referral code. After you buy, you get a personal referral link. Share that link with friends, not the code.</p>
+
+  <div id="success" class="hidden">
+    <h2>Your checks code</h2>
+    <div class="notice">
+      <h3>Payment received</h3>
+      <p>Here is your code. It appears on this page once, so save it now. If you gave an email address at checkout, the same code is on its way to your inbox.</p>
+      <div class="keybox mono" id="code-box">Reading your purchase...</div>
+      <button id="copy-btn" type="button" class="hidden">Copy the code</button>
+      <p>Open the NPC Verify extension, paste the code into the credits field, and your checks are ready. Anyone who has this code can spend its checks, so keep it somewhere safe, like a gift card.</p>
+    </div>
+  </div>
+
+  <div id="shop">
+    <label class="small" for="email">Email for a copy of your code (optional). It is a receipt and a backup. Stripe also asks on the payment page.</label>
+    <input type="email" id="email" autocomplete="email" placeholder="you@example.com">
+    <div id="packs"><p>Loading check packs...</p></div>
+    <div id="checkout-off" class="notice warn hidden">
+      <h3>Checkout is not open yet</h3>
+      <p>Check packs are priced and ready, but the payment rail is still being connected on our side. Nothing can be charged from this page right now.</p>
+    </div>
+    <div id="shop-error" class="notice bad hidden">
+      <h3>We could not load the check packs</h3>
+      <p>The verification API did not answer. Your free checks in the extension are unaffected. Please try again in a little while.</p>
+    </div>
+  </div>
+
+  <h2>How checks work</h2>
+  <ol class="steps">
+    <li><strong>Buy a pack, or start the Verifier Pass,</strong> on this page. Payment runs through Stripe.</li>
+    <li><strong>Get one code</strong> on this page, and by email if you gave an address.</li>
+    <li><strong>Paste the code</strong> into the NPC Verify extension. The extension shows your balance and spends from it only after your 10 free checks are used.</li>
+    <li><strong>The Pass refills monthly.</strong> While your Verifier Pass runs, registry checks are unlimited and the AI generation allowance refills on the same code each month. The unused part of the allowance rolls into the next month once, then it expires.</li>
+    <li><strong>Checking an image you already checked is free.</strong> The extension remembers, and the ledger will not charge the same image twice.</li>
+    <li><strong>A check that cannot complete costs nothing.</strong> If the registry cannot be reached or an answer cannot be verified, no check is spent.</li>
+  </ol>
+
+  <h2>How referrals work</h2>
+  <p>Every code comes with a personal referral link. Share it, and when a friend joins through your link you each get 10 checks. Registering a first work or agent earns the 25-check registration bonus. When a friend you brought makes a first purchase, you get 100 checks. Referral earnings cap at 500 checks a month. Bonus checks can pay for registry checks and for AI generation checks.</p>
+</main>
+
+<footer>
+  <div class="wrap">Verified by NPC. We never claim more than we can check.</div>
+</footer>
+
+<script>
+(function () {
+  var params = new URLSearchParams(location.search);
+  var API = (params.get("api") || "https://api.npclabs.xyz").replace(/\/$/, "");
+  var sessionId = params.get("session_id");
+
+  function money(cents, currency) {
+    var v = cents / 100;
+    var s = (v % 1 === 0) ? String(v) : v.toFixed(2);
+    return (currency === "usd" ? "$" : "") + s;
+  }
+  function buyButton(p, data, text) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = text;
+    btn.disabled = !data.checkout_available || !p.on_sale;
+    btn.addEventListener("click", function () { buy(p, btn); });
+    return btn;
+  }
+
+  function renderPass(p, data, box) {
+    var card = document.createElement("div");
+    card.className = "card featured";
+    var price = money(p.price_cents, p.currency);
+    var terms;
+    if (p.registry_unlimited) {
+      terms =
+        "<p>Unlimited registry checks, including " + p.ai_checks + " AI generation checks a month.</p>" +
+        "<p>Unused AI generation checks roll into the next month once. After that they expire.</p>";
+    } else {
+      terms =
+        "<p>" + p.checks.toLocaleString("en-US") + " checks every month, including " + p.ai_checks + " AI generation checks.</p>" +
+        "<p>Unused checks roll into the next month once. After that they expire.</p>";
+    }
+    card.innerHTML =
+      "<span class='pill verified'>Best value</span>" +
+      "<h3>" + p.label + "</h3>" +
+      "<p class='price'>" + price + " <span style='font-size:16px;font-weight:600'>a month</span></p>" +
+      terms;
+    card.appendChild(buyButton(p, data, "Start the Verifier Pass"));
+    box.appendChild(card);
+  }
+
+  function renderPacks(data) {
+    var box = document.getElementById("packs");
+    box.innerHTML = "";
+    var pass = null;
+    var packs = [];
+    data.packs.forEach(function (p) {
+      if (p.kind === "access") { pass = p; } else { packs.push(p); }
+    });
+    if (pass) renderPass(pass, data, box);
+    packs.forEach(function (p, i) {
+      var card = document.createElement("div");
+      card.className = "card" + (i === 0 && !pass ? " featured" : "");
+      var tag = i === 0 ? "Launch pack" : "More checks";
+      card.innerHTML =
+        "<span class='pill" + (i === 0 ? " verified" : "") + "'>" + tag + "</span>" +
+        "<h3>" + p.label + "</h3>" +
+        "<p class='price'>" + money(p.price_cents, p.currency) + "</p>" +
+        "<p class='termsline'>One payment, no subscription.</p>";
+      card.appendChild(buyButton(p, data, "Buy " + p.label));
+      box.appendChild(card);
+    });
+    if (!data.checkout_available) {
+      document.getElementById("checkout-off").classList.remove("hidden");
+    }
+  }
+
+  function buy(pack, btn) {
+    var originalLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Opening checkout...";
+    // Open the checkout tab inside the click itself, while the click
+    // still counts as a user gesture, so popup blockers let it
+    // through. The tab waits blank until checkout answers; this page
+    // stays put either way, and the button always gets its label back.
+    var tab = window.open("", "_blank");
+    var email = document.getElementById("email").value.trim();
+    var body = { pack_id: pack.id };
+    if (email) body.email = email;
+    function restore() {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+    fetch(API + "/v1/credits/checkout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json().then(function (j) { return { s: r.status, j: j }; }); })
+      .then(function (res) {
+        if (res.s === 201 && res.j.checkout_url) {
+          if (tab) {
+            tab.location.href = res.j.checkout_url;
+          } else {
+            // The browser blocked the early tab; try once more now
+            // that the checkout address is known.
+            window.open(res.j.checkout_url, "_blank");
+          }
+        } else {
+          if (tab) tab.close();
+          document.getElementById("checkout-off").classList.remove("hidden");
+        }
+        restore();
+      })
+      .catch(function () {
+        if (tab) tab.close();
+        document.getElementById("shop-error").classList.remove("hidden");
+        restore();
+      });
+  }
+
+  function pollStatus(tries) {
+    fetch(API + "/v1/credits/checkout-status?session_id=" + encodeURIComponent(sessionId))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        var boxEl = document.getElementById("code-box");
+        if (j.status === "paid" && j.code) {
+          boxEl.textContent = j.code;
+          var btn = document.getElementById("copy-btn");
+          btn.classList.remove("hidden");
+          btn.addEventListener("click", function () {
+            if (navigator.clipboard) navigator.clipboard.writeText(j.code);
+            btn.textContent = "Copied";
+            setTimeout(function () { btn.textContent = "Copy the code"; }, 1600);
+          });
+        } else if (j.status === "paid") {
+          boxEl.textContent = "This code was already shown once. If you saved it, it is ready to use in the extension. The emailed copy, if you gave an address, carries the same code.";
+        } else if (j.status === "expired") {
+          boxEl.textContent = "That checkout session expired before payment completed. No charge was made. You can start again below.";
+        } else if (tries > 0) {
+          setTimeout(function () { pollStatus(tries - 1); }, 2000);
+        } else {
+          boxEl.textContent = "Payment is still processing. Refresh this page in a moment to collect your code.";
+        }
+      })
+      .catch(function () {
+        if (tries > 0) setTimeout(function () { pollStatus(tries - 1); }, 2000);
+      });
+  }
+
+  if (sessionId) {
+    document.getElementById("success").classList.remove("hidden");
+    pollStatus(30);
+  }
+
+  fetch(API + "/v1/credits/packs")
+    .then(function (r) { return r.json(); })
+    .then(renderPacks)
+    .catch(function () {
+      document.getElementById("packs").innerHTML = "";
+      document.getElementById("shop-error").classList.remove("hidden");
+    });
+})();
+</script>
+</body>
+</html>

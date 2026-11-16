@@ -57,6 +57,24 @@ PREVIEW_PRODUCTS = [
     "tag_test_trail_shoe",
 ]
 
+# -- Search worked example: one REAL anchored record (not a fixture) -----
+# Bayo approved this on 2026-11-09: the Search page shows one real record
+# as a worked example next to the labeled samples, so a visitor can see
+# the door work on a record that actually exists. This is the batch-one
+# registration record: registered 2026-10-16, anchored on Base in batch
+# anchor_f385ab44d4f70ef3 (the goal-file record of batch one and the live
+# API agree on the batch, block, and transaction). It is deliberately
+# NOT part of any PREVIEW_* list: the samples stay fictional and labeled,
+# and this one is presented as real, because it is. Facts verified
+# against the live API on 2026-11-09.
+SEARCH_WORKED_EXAMPLE = {
+    "id": "reg_6789fb4ca0f5363853a23dc0",
+    "batch_id": "anchor_f385ab44d4f70ef3",
+    "chain": "Base",
+    "block_number": 53308536,
+    "tx_hash": "0x1428119d831b4fa16a9a1c2e3dc386f89415d61e247256780fa5a1111da0dce6",
+}
+
 # -- Archive: REAL on-chain records (not fixtures) ------------------------
 # NPC Labs' own historical mints (2023-2024), seeded in the API seed as
 # tag_archive_* products and browsed on the /archive page only. They never

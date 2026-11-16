@@ -6,7 +6,9 @@
 - The widget talks to the chat endpoints and the feedback endpoint,
   renders the opening message, and has a resting path that disables
   only itself.
-- The privacy policy describes the chat in the same change.
+- The privacy policy described the chat in the same change; since
+  2026-10-28 it carries no chat section while the chat is not live
+  (see test_privacy_policy_describes_no_unlive_chat).
 - The icon assets exist, are real images, and ship in the export.
 """
 import os
@@ -62,12 +64,19 @@ class TestChatWidget(DashTestCase):
         self.assertIn('id="npc-content-form"', body)
         self.assertIn('id="npc-chat-float" hidden', body)
 
-    def test_privacy_policy_describes_the_chat(self):
+    def test_privacy_policy_describes_no_unlive_chat(self):
+        # Replaces test_privacy_policy_describes_the_chat (the
+        # 2026-10-15 assertion, from the change that shipped the
+        # widget and its policy section together). The chat is not
+        # live: exports ship --no-chat and the 2026-10-28 grounded
+        # rerun against the deployed endpoint again returned the
+        # resting reply on every case. Bayo's rule (2026-10-28):
+        # the policy covers the site as it is, so it carries no
+        # chat section until a grounded rerun passes and an export
+        # ships with chat on.
         _status, body = self.get("/privacy")
-        self.assertIn("Talking with Biblo on this site", body)
-        self.assertIn("kept for 90 days", body)
-        self.assertIn("may be read by the NPC team", body)
-        self.assertIn("Please do not share private details", body)
+        self.assertNotIn("Talking with Biblo on this site", body)
+        self.assertNotIn("kept for 90 days", body)
 
     def test_icon_assets_are_real_images(self):
         for rel in export_static.ASSET_FILES:

@@ -44,7 +44,7 @@ dashboard/
 | `/search[?id=]` | One lookup for credential, product, archive, and public key IDs, digital and physical; API-issued registration IDs resolve through `GET /v1/records/{id}` |
 | `/search/keys` | The full published NPC public key list, as a sub-view inside Search |
 | `/search/unknown` | The honest Unknown answer for an ID with no record; the page also asks the live API for the ID from the visitor's browser, so a registration ID resolves live and anything else stays Unknown |
-| `/verify` | Verify yours: the content and agent registration forms. They POST from the visitor's browser to the verification API base in the page's `data-api-base` (the public API in the export); if the service is not answering, the page says so plainly and offers the waitlist. Nothing is ever faked |
+| `/verify` | Verify yours: the content and agent registration forms. They POST from the visitor's browser to the verification API base in the page's `data-api-base` (the public API in the export). The page's health probe is advisory only: it paints a status line and never blocks a submission. If a submission itself gets no answer, the page says that registration did not go through. Nothing is ever faked |
 | `/archive` | NPC Labs' real historical on-chain mints, reached from Records |
 | `/plugins` | The plugin questions and each provider surface's honest status |
 | `/api` | For developers: what the public API does, a quickstart with examples taken from live calls, the MCP endpoint, and how to check NPC signatures against the published keys |

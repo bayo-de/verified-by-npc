@@ -147,6 +147,14 @@ class _Req:
         self.form = form    # dict of first values (POST forms)
 
 
+class _Redirect:
+    """A handler return value: answer with a bare redirect (301 plus a
+    Location header) instead of a rendered page."""
+
+    def __init__(self, location):
+        self.location = location
+
+
 class _App:
     def __init__(self, api_url, api_key):
         self.api_url = api_url
@@ -178,7 +186,8 @@ class _App:
                 credential_examples=fixtures.PREVIEW_CREDENTIALS,
                 product_examples=fixtures.PREVIEW_PRODUCTS,
                 keys_doc=doc, live_lookup_id=live_lookup_id,
-                api_base=app.api_url)
+                api_base=app.api_url,
+                worked_example=fixtures.SEARCH_WORKED_EXAMPLE)
 
         def search_result(query):
             try:
@@ -212,7 +221,8 @@ class _App:
                         query=query, result_html=result,
                         credential_examples=fixtures.PREVIEW_CREDENTIALS,
                         product_examples=fixtures.PREVIEW_PRODUCTS,
-                        keys_doc=doc, api_base=app.api_url)
+                        keys_doc=doc, api_base=app.api_url,
+                        worked_example=fixtures.SEARCH_WORKED_EXAMPLE)
             # API-issued IDs (registrations above all) resolve through
             # the one records endpoint, signature-verified like every
             # API answer this dashboard renders.
@@ -237,7 +247,8 @@ class _App:
                         query=query, result_html=rendered,
                         credential_examples=fixtures.PREVIEW_CREDENTIALS,
                         product_examples=fixtures.PREVIEW_PRODUCTS,
-                        keys_doc=doc, api_base=app.api_url)
+                        keys_doc=doc, api_base=app.api_url,
+                        worked_example=fixtures.SEARCH_WORKED_EXAMPLE)
             except UnknownSubject:
                 pass
             except ApiError:
@@ -290,6 +301,14 @@ class _App:
         def verify(req):
             return views.verify_view(api_base=app.api_url)
 
+        # /get-verified is the address the Chrome extension's creator
+        # invite carried before the page was named Verify yours. It
+        # permanently redirects to the one registration page; the
+        # static export carries the same rule in _redirects.
+        @app.route("GET", r"^/get-verified$")
+        def get_verified(req):
+            return _Redirect("/verify")
+
         @app.route("GET", r"^/archive$")
         def archive(req):
             return views.archive_view(_archive_rows(app.client))
@@ -324,10 +343,12 @@ class _App:
                 except Exception:
                     body_html = views.unavailable_notice(
                         "Something went wrong rendering this page.")
+                if isinstance(body_html, _Redirect):
+                    return 301, "", {"Location": body_html.location}
                 return 200, views.page(_title_for(req.path), body_html,
-                                       self.api_url)
+                                       self.api_url), {}
         return 404, views.page("Not found", views.not_found_view(),
-                               self.api_url)
+                               self.api_url), {}
 
 
 def _title_for(path):
@@ -368,11 +389,13 @@ def make_handler(api_url, api_key):
             query = {k: v[0] for k, v in
                      urllib.parse.parse_qs(parsed.query).items()}
             req = _Req(self.command, path, query, form)
-            code, html = app.dispatch(req)
+            code, html, extra_headers = app.dispatch(req)
             payload = html.encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
+            for name, value in extra_headers.items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(payload)
 
