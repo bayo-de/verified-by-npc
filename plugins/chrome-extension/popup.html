@@ -16,6 +16,12 @@
     <span class="wordmark">NPC Verify</span>
   </header>
 
+  <nav class="tabs" aria-label="Views">
+    <button id="tab-verify" class="tab active" type="button">Verify</button>
+    <button id="tab-biblo" class="tab" type="button">Biblo</button>
+    <button id="tab-usage" class="tab" type="button">Usage</button>
+  </nav>
+
   <main id="stage">
     <!-- state: loading -->
     <section id="view-loading" class="view">
@@ -36,6 +42,22 @@
       <div id="thumbs" class="thumbs"></div>
       <button id="check-btn" class="cta">Check this image</button>
       <p class="fineprint">We check the registry, the file itself, and say plainly what we found.</p>
+      <div id="media-block" class="hidden">
+        <p class="media-title">Video and audio on this page</p>
+        <div id="media-list"></div>
+        <p class="fineprint">The AI generation check for video and audio sends the file's address to the NPC API, which reads the file and states what it found.</p>
+      </div>
+      <div id="credits-cta" class="hidden">
+        <p class="fineprint" id="credits-cta-text">Your free checks are used up.</p>
+        <div id="upsell-list"></div>
+        <a id="buy-checks-btn" class="cta link-btn" href="#" target="_blank" rel="noopener">Get more checks</a>
+        <p class="fineprint">Bought a pack? Paste your code:</p>
+        <div class="credit-row">
+          <input id="credit-code-input" type="text" placeholder="NPC-...." autocomplete="off" spellcheck="false">
+          <button id="credit-redeem-btn" class="ghost-btn" type="button">Apply code</button>
+        </div>
+        <p id="credit-msg" class="fineprint"></p>
+      </div>
       <button class="ghost-btn wide history-open" type="button">Past checks</button>
     </section>
 
@@ -80,6 +102,48 @@
 
       <button id="again-btn" class="ghost-btn wide">Check another image</button>
       <button class="ghost-btn wide history-open" type="button">Past checks</button>
+    </section>
+
+    <!-- state: video / audio AI check result -->
+    <section id="view-av" class="view hidden">
+      <p id="av-word" class="verdict-word"></p>
+      <p id="av-sub" class="verdict-sub"></p>
+      <div id="av-detail" class="layer-body av-detail"></div>
+      <button id="av-back" class="ghost-btn wide" type="button">Back</button>
+    </section>
+
+    <!-- state: Biblo chat -->
+    <section id="view-biblo" class="view hidden">
+      <p class="biblo-name">Biblo</p>
+      <p class="quiet">AI assistant for NPC Labs.</p>
+      <p class="fineprint">Conversations may be read by the NPC team to improve these answers. Please do not share private details here.</p>
+      <div id="chat-log" class="chat-log"></div>
+      <div id="chat-starters" class="chat-starters">
+        <button class="chip" type="button" data-q="How do I register my own work?">How do I register my own work?</button>
+        <button class="chip" type="button" data-q="What does unknown mean?">What does unknown mean?</button>
+        <button class="chip" type="button" data-q="Where can I use the plugins?">Where can I use the plugins?</button>
+      </div>
+      <div class="chat-row">
+        <input id="chat-input" type="text" placeholder="Ask Biblo about Verified by NPC" maxlength="1000" autocomplete="off">
+        <button id="chat-send" class="ghost-btn" type="button">Send</button>
+      </div>
+      <p class="fineprint">Chat answers are conversation, not records. Verdicts come only from a check or a signed record. If you need a person, the team reads hello@npclabs.xyz.</p>
+    </section>
+
+    <!-- state: usage -->
+    <section id="view-usage" class="view hidden">
+      <p class="verdict-word small-word">Your usage</p>
+      <div id="usage-body" class="usage-body">
+        <p class="quiet">Loading…</p>
+      </div>
+      <div id="usage-upsell"></div>
+      <p class="fineprint">Have a code from a pack or the Verifier Pass? Paste it here:</p>
+      <div class="credit-row">
+        <input id="usage-code-input" type="text" placeholder="NPC-...." autocomplete="off" spellcheck="false">
+        <button id="usage-redeem-btn" class="ghost-btn" type="button">Apply code</button>
+      </div>
+      <p id="usage-msg" class="fineprint"></p>
+      <p class="fineprint">Usage shown here is the same count your desktop app and dashboard read. When free checks run out, a code keeps you checking, and the Verifier Pass covers registry checks while it is active.</p>
     </section>
 
     <!-- state: past checks -->

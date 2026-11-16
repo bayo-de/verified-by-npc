@@ -25,7 +25,7 @@
  * "api_unreachable". We never claim more than we checked.
  */
 
-importScripts("config.js", "forensics.js");
+importScripts("config.js", "forensics.js", "api-client.js");
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "NPC_CHECK") {
@@ -49,6 +49,49 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "NPC_HISTORY") {
     npcLoadHistory().then(entries =>
       sendResponse({ entries: entries.map(npcHistorySummary) })
+    );
+    return true;
+  }
+  if (msg.type === "NPC_CHAT_SEND") {
+    (async () => {
+      const cfg = await npcGetConfig();
+      sendResponse(await npcChatSend(
+        cfg, msg.threadId || null, String(msg.message || ""), "extension"));
+    })().catch(() => sendResponse({ state: "error" }));
+    return true;
+  }
+  if (msg.type === "NPC_CHAT_FEEDBACK") {
+    (async () => {
+      const cfg = await npcGetConfig();
+      sendResponse(await npcChatFeedback(
+        cfg, msg.threadId || null, msg.turn, msg.rating));
+    })().catch(() => sendResponse({ recorded: false }));
+    return true;
+  }
+  if (msg.type === "NPC_CREDIT_BALANCE") {
+    (async () => {
+      const cfg = await npcGetConfig();
+      sendResponse(await npcCreditSummary(cfg));
+    })().catch(() => sendResponse({ state: "unknown" }));
+    return true;
+  }
+  if (msg.type === "NPC_CREDIT_REDEEM") {
+    (async () => {
+      const cfg = await npcGetConfig();
+      sendResponse(await npcCreditRedeem(String(msg.code || ""), cfg));
+    })().catch(() => sendResponse({ state: "unknown" }));
+    return true;
+  }
+  if (msg.type === "NPC_CREDIT_PACKS") {
+    (async () => {
+      const cfg = await npcGetConfig();
+      sendResponse(await npcCreditPacks(cfg));
+    })().catch(() => sendResponse({ state: "unknown", packs: [] }));
+    return true;
+  }
+  if (msg.type === "NPC_AV_CHECK") {
+    runAvCheck(msg.kind, msg.url).then(sendResponse).catch(err =>
+      sendResponse({ status: "error", detail: String(err && err.message || err) })
     );
     return true;
   }
@@ -97,6 +140,186 @@ async function npcRememberCheck(identity, result) {
   await chrome.storage.local.set({
     [NPC_HISTORY_KEY]: kept.slice(0, NPC_HISTORY_MAX)
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Credits: the paid tier behind the free checks                        */
+/* ------------------------------------------------------------------ */
+
+/* Per the credits integration spec (2026-10-28). A buyer's code is a
+ * bearer credential and lives in local storage only, the same
+ * treatment the extension already gives its API key. No balance is
+ * ever trusted from storage: balances always come from the API,
+ * through the signature-verified client in api-client.js.
+ *
+ * Two codes can be held at once, in draw order: the primary key
+ * holds a Verifier Pass code (pack kind "access"), the pack key a
+ * one-time pack code. Draw order for a paid check: an active Pass
+ * first (standard checks are covered by the Pass and draw no pool;
+ * AI checks draw its AI sub-allowance), then the pack code. */
+const NPC_CREDIT_CODE_KEY = "npc_credit_code";
+const NPC_CREDIT_PACK_KEY = "npc_credit_code_pack";
+
+async function npcStoredCreditCodes() {
+  const s = await chrome.storage.local.get(
+    [NPC_CREDIT_CODE_KEY, NPC_CREDIT_PACK_KEY]);
+  return {
+    primary: s[NPC_CREDIT_CODE_KEY] || null,
+    pack: s[NPC_CREDIT_PACK_KEY] || null
+  };
+}
+
+/* Balance for one stored code. States: "ok" (with the ledger body),
+ * "none" (no code in this slot), "invalid" (the API says the code is
+ * gone or revoked; a 404 also clears the slot, per the spec),
+ * "unknown" (unreachable, unverified, or error: treated as no
+ * answer, and nothing is cleared or charged on it). */
+async function npcCreditBalanceFor(code, slotKey, cfg) {
+  if (!code) return { state: "none" };
+  const r = await npcCreditCall(cfg, "/credits/balance", { code });
+  if (r.status !== "http") return { state: "unknown" };
+  if (r.httpStatus === 200 && r.data) {
+    return {
+      state: "ok",
+      balance: r.data.balance,
+      creditsTotal: r.data.credits_total,
+      creditsUsed: r.data.credits_used,
+      grantBalance: r.data.grant_balance || 0,
+      aiBalance: typeof r.data.ai_balance === "number"
+        ? r.data.ai_balance : r.data.balance,
+      packId: r.data.pack_id,
+      codeStatus: r.data.status,
+      subscriptionStatus: r.data.subscription_status || null,
+      registryUnlimited: !!r.data.registry_unlimited
+    };
+  }
+  if (r.httpStatus === 404) {
+    await chrome.storage.local.remove([slotKey]);
+    return { state: "invalid" };
+  }
+  if (r.httpStatus === 403) return { state: "invalid" };
+  return { state: "unknown" };
+}
+
+/* Both slots, in draw order, for the popup's usage display. */
+async function npcCreditSummary(cfg) {
+  const codes = await npcStoredCreditCodes();
+  if (!codes.primary && !codes.pack) return { state: "none" };
+  const primary = await npcCreditBalanceFor(
+    codes.primary, NPC_CREDIT_CODE_KEY, cfg);
+  const pack = await npcCreditBalanceFor(
+    codes.pack, NPC_CREDIT_PACK_KEY, cfg);
+  const anyOk = primary.state === "ok" || pack.state === "ok";
+  const anyUnknown = primary.state === "unknown" || pack.state === "unknown";
+  return {
+    state: anyOk ? "ok" : (anyUnknown ? "unknown" : "invalid"),
+    primary,
+    pack
+  };
+}
+
+/* Redeem a code the buyer pasted. On success the code is stored in
+ * the slot its pack kind owns: an access (Pass) code in the primary
+ * slot, a one-time pack code in the pack slot, each replacing only
+ * its own kind. The kind is read off the packs list by pack_id. */
+async function npcCreditRedeem(code, cfg) {
+  code = String(code || "").trim();
+  if (!code) return { state: "unknown" };
+  const r = await npcCreditCall(cfg, "/credits/redeem", { code });
+  if (r.status !== "http") return { state: "unknown" };
+  if (r.httpStatus === 404) return { state: "not_found" };
+  if (r.httpStatus === 403) return { state: "revoked" };
+  if (r.httpStatus !== 200 || !r.data) return { state: "unknown" };
+  let kind = "pack";
+  const packs = await npcCreditPacks(cfg);
+  if (packs.state === "ok") {
+    const entry = packs.packs.find(p => p.id === r.data.pack_id);
+    if (entry && entry.kind) kind = entry.kind;
+  }
+  const slotKey = kind === "access"
+    ? NPC_CREDIT_CODE_KEY : NPC_CREDIT_PACK_KEY;
+  await chrome.storage.local.set({ [slotKey]: code });
+  return {
+    state: "ok",
+    kind,
+    balance: r.data.balance,
+    aiBalance: typeof r.data.ai_balance === "number"
+      ? r.data.ai_balance : r.data.balance,
+    packId: r.data.pack_id,
+    subscriptionStatus: r.data.subscription_status || null,
+    registryUnlimited: !!r.data.registry_unlimited
+  };
+}
+
+/* Pick the credit source for one paid check, in draw order.
+ * checkKind is "standard" or "ai". Returns one of:
+ *   {mode: "pass", slotKey, code, balance}   active Pass covers it
+ *   {mode: "credit", slotKey, code, balance} a finite balance pays
+ *   {mode: "none", reason}                   nothing can pay
+ *   {mode: "unknown"}                        a balance read failed
+ * For "ai", the figure that must be positive is aiBalance (the
+ * server already counts the Pass sub-allowance, then bonus grants,
+ * then pack counters in that one number). */
+async function npcPickCreditSource(cfg, checkKind) {
+  const codes = await npcStoredCreditCodes();
+  const slots = [
+    { code: codes.primary, slotKey: NPC_CREDIT_CODE_KEY },
+    { code: codes.pack, slotKey: NPC_CREDIT_PACK_KEY }
+  ];
+  let sawCode = false;
+  let sawUnknown = false;
+  let sawExhausted = false;
+  for (const slot of slots) {
+    if (!slot.code) continue;
+    sawCode = true;
+    const bal = await npcCreditBalanceFor(slot.code, slot.slotKey, cfg);
+    if (bal.state === "unknown") { sawUnknown = true; continue; }
+    if (bal.state !== "ok") continue;
+    if (checkKind === "standard" && bal.registryUnlimited
+        && bal.subscriptionStatus === "active") {
+      return { mode: "pass", slotKey: slot.slotKey, code: slot.code, bal };
+    }
+    const spendable = checkKind === "ai" ? bal.aiBalance : bal.balance;
+    if (spendable > 0) {
+      return { mode: "credit", slotKey: slot.slotKey, code: slot.code, bal };
+    }
+    sawExhausted = true;
+  }
+  if (sawUnknown) return { mode: "unknown" };
+  if (!sawCode) return { mode: "none", reason: "no_code" };
+  return {
+    mode: "none",
+    reason: sawExhausted
+      ? (checkKind === "ai" ? "no_ai_credits" : "exhausted")
+      : "invalid"
+  };
+}
+
+/* Consume one check against a picked source. Mirrors the spec's
+ * outcomes: charged, duplicate (already paid, never charged twice),
+ * exhausted (the balance moved between read and consume), or
+ * unrecorded (the call failed or did not verify, so nothing was
+ * charged server-side either). */
+async function npcConsumeCredit(cfg, source, identity, claimHash, kind) {
+  const payload = { code: source.code, image_identity: identity, kind };
+  if (claimHash) payload.claim_hash = claimHash;
+  const r = await npcCreditCall(cfg, "/credits/consume", payload);
+  if (r.status !== "http") return { charged: false, unrecorded: true };
+  if (r.httpStatus === 200 && r.data) {
+    if (r.data.duplicate) {
+      return { charged: false, duplicate: true, balance: r.data.balance };
+    }
+    return { charged: !!r.data.charged, balance: r.data.balance };
+  }
+  if (r.httpStatus === 402) {
+    return {
+      charged: false,
+      exhausted: true,
+      noAiCredits: !!(r.data && r.data.error === "no_ai_credits"),
+      balance: r.data ? r.data.balance : 0
+    };
+  }
+  return { charged: false, unrecorded: true };
 }
 
 /* ------------------------------------------------------------------ */
@@ -235,12 +458,13 @@ async function checkProvenance(src, cfg) {
     return { status: "signature_failed", detail: sigState };
   }
   if (res.status === 404 || !data || !data.matched) {
-    return { status: "unknown", sigVerified: true };
+    return { status: "unknown", sigVerified: true, claimHash: hash };
   }
   const a = data.attestation || {};
   return {
     status: "matched",
     sigVerified: true,
+    claimHash: hash,
     creator: a.creator_name || a.holder_name || "Registered creator",
     recordedAt: a.tested_at || a.created_at || null,
     attVerdict: a.verdict || "verified",
@@ -347,9 +571,33 @@ async function npcFetchImageBytesForCheck(image, tabId) {
  * service from here: the API holds the Sightengine credentials and
  * answers inside its signed envelope, verified before any result is
  * shown. Every failure returns an honest status, never a guess. */
+/* The paid-tier gate for AI generation checks (image, video, and
+ * audio alike), per credits spec section 6.3. In the free tier an
+ * AI check is part of a check's panel and consumes nothing. Past
+ * the free tier it draws on a code: a Pass code's AI sub-allowance
+ * first, then bonus grants, then pack counters, which is exactly
+ * the order the server's ai_balance figure already reflects.
+ * Returns {mode: "free"} | {mode: "paid", source} |
+ * {mode: "unknown"} (balance unreadable: run the check, charge
+ * nothing) | {mode: "blocked", reason} (do not run it). */
+async function npcAiGate(cfg) {
+  const store = await chrome.storage.local.get(["npc_checks_used"]);
+  const freeLeft = Math.max(
+    0, cfg.freeChecksTotal - (store.npc_checks_used || 0));
+  if (freeLeft > 0) return { mode: "free" };
+  const pick = await npcPickCreditSource(cfg, "ai");
+  if (pick.mode === "unknown") return { mode: "unknown" };
+  if (pick.mode === "none") return { mode: "blocked", reason: pick.reason };
+  return { mode: "paid", source: pick };
+}
+
 async function runAiCheck(image, tabId) {
   const cfg = await npcGetConfig();
   if (!cfg.apiKey) return { status: "not_configured" };
+  const gate = await npcAiGate(cfg);
+  if (gate.mode === "blocked") {
+    return { status: "no_ai_credits", reason: gate.reason };
+  }
   const bytes = await npcFetchImageBytesForCheck(image, tabId);
   let payload;
   if (bytes && bytes.length <= NPC_AI_MAX_BYTES) {
@@ -393,7 +641,7 @@ async function runAiCheck(image, tabId) {
   if (sigState !== "valid") {
     return { status: "signature_failed", detail: sigState };
   }
-  return {
+  const out = {
     status: "ok",
     sigVerified: true,
     percent: data.ai_generated_percent,
@@ -401,6 +649,65 @@ async function runAiCheck(image, tabId) {
     model: data.model,
     checkedAt: data.checked_at
   };
+  /* Paid tier: the consume fires only now, after the answer's
+   * signature verified, never on a failed or unreachable check. */
+  if (gate.mode === "paid") {
+    let identity = null;
+    try {
+      identity = bytes
+        ? "sha256:" + (await npcContentHashHex(bytes))
+        : "url-sha256:" + (await npcSha256Hex(image.src));
+    } catch (e) {
+      identity = null;
+    }
+    out.credits = identity
+      ? await npcConsumeCredit(
+          cfg, gate.source, identity + ":ai", null, "ai")
+      : { charged: false, unrecorded: true };
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Video and audio AI checks (explicit user action only)                */
+/* ------------------------------------------------------------------ */
+
+/* Runs only when the user picks a video or audio file on the page
+ * and presses its check button. The media address goes to the NPC
+ * API, which fetches and analyzes the file server-side; the answer
+ * returns inside the signed envelope and is verified by the client
+ * in api-client.js before anything is shown. The production API
+ * does not serve these routes yet (they live in the detector-av
+ * staging prototype), so until it does the honest answer here is
+ * "not_available", never a guessed score. Paid-tier funding follows
+ * the same AI gate as the image check. */
+async function runAvCheck(kind, url) {
+  const cfg = await npcGetConfig();
+  if (!cfg.apiKey) return { status: "not_configured" };
+  if (kind !== "video" && kind !== "audio") {
+    return { status: "error", detail: "bad_kind" };
+  }
+  if (!url || !/^https?:/.test(url)) {
+    return { status: "error", detail: "bad_url" };
+  }
+  const gate = await npcAiGate(cfg);
+  if (gate.mode === "blocked") {
+    return { status: "no_ai_credits", reason: gate.reason };
+  }
+  const out = await npcAvCheck(cfg, kind, url);
+  if (out.status === "ok" && gate.mode === "paid") {
+    let identity = null;
+    try {
+      identity = "url-sha256:" + (await npcSha256Hex(url));
+    } catch (e) {
+      identity = null;
+    }
+    out.credits = identity
+      ? await npcConsumeCredit(
+          cfg, gate.source, identity + ":" + kind + "-ai", null, "ai")
+      : { charged: false, unrecorded: true };
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -442,7 +749,37 @@ async function runCheck(image, tabId) {
     }
   }
 
-  const provenance = await checkProvenance(image.src, cfg);
+  /* Tier gate (credits spec section 2.4): history was consulted
+   * above, so a repeat check is free in every tier. While free
+   * checks remain, behavior is exactly the free tier. Past them, a
+   * stored code pays: an active Verifier Pass covers standard
+   * checks, a finite balance is consumed only after a
+   * signature-verified registry answer, and with nothing able to
+   * pay the popup is told needs_credits WITHOUT any registry call:
+   * nobody gets a free answer past the free tier, and nobody is
+   * charged for one either. */
+  const storeBefore = await chrome.storage.local.get(["npc_checks_used"]);
+  const freeUsed = storeBefore.npc_checks_used || 0;
+  const freeLeft = Math.max(0, cfg.freeChecksTotal - freeUsed);
+  let tier = "free";
+  let creditSource = null;
+  let gateUnknown = false;
+  if (freeLeft === 0) {
+    tier = "credit";
+    const pick = await npcPickCreditSource(cfg, "standard");
+    if (pick.mode === "none") {
+      return { error: "needs_credits", reason: pick.reason, image };
+    }
+    if (pick.mode === "unknown") {
+      gateUnknown = true;
+    } else {
+      creditSource = pick;
+    }
+  }
+
+  const provenance = gateUnknown
+    ? { status: "unreachable" }
+    : await checkProvenance(image.src, cfg);
 
   let verdict, verdictWord, verdictSub, showMark = false;
   const pv = provenance.status;
@@ -486,9 +823,24 @@ async function runCheck(image, tabId) {
     verdictSub = "We could not reach the verification API, so the registry was not checked. The file checks below still ran on your device.";
   }
 
-  const store = await chrome.storage.local.get(["npc_checks_used"]);
-  const used = (store.npc_checks_used || 0) + 1;
-  await chrome.storage.local.set({ npc_checks_used: used });
+  /* The free counter moves only in the free tier. In the paid tier
+   * the charge, when one is owed, is the consume call below: only a
+   * signature-verified registry answer (matched or unknown) is
+   * charged, mirroring the history rule exactly. */
+  let used = freeUsed;
+  if (tier === "free") {
+    used = freeUsed + 1;
+    await chrome.storage.local.set({ npc_checks_used: used });
+  }
+  let creditsNote = null;
+  if (tier === "credit" && creditSource && identity
+      && (pv === "matched" || pv === "unknown")) {
+    creditsNote = await npcConsumeCredit(
+      cfg, creditSource, identity, provenance.claimHash, "standard");
+    if (creditSource.mode === "pass" && creditsNote.charged) {
+      creditsNote.passCovered = true;
+    }
+  }
 
   const result = {
     image,
@@ -505,6 +857,8 @@ async function runCheck(image, tabId) {
     nudge: verdict === "no_record",
     nudgeUrl: cfg.getVerifiedUrl,
     fullReportUrl: cfg.fullReportUrl,
+    tier,
+    credits: creditsNote,
     checksUsed: used,
     checksTotal: cfg.freeChecksTotal,
     elapsedMs: Date.now() - started,

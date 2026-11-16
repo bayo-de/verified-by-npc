@@ -14,6 +14,7 @@ const NPC_CONFIG_DEFAULTS = {
   apiKey: "npc_demo_HNL8-qoMjLTVvDCYog1scIZm4JgrganOI2RRFoTFI-E",
   getVerifiedUrl: "https://verify.npclabs.xyz/verify",
   fullReportUrl: "https://verify.npclabs.xyz",
+  creditsPurchaseUrl: "https://verify.npclabs.xyz/get-checks",
   freeChecksTotal: 10
 };
 
@@ -24,6 +25,7 @@ async function npcGetConfig() {
     apiKey: stored.npc_api_key || NPC_CONFIG_DEFAULTS.apiKey,
     getVerifiedUrl: NPC_CONFIG_DEFAULTS.getVerifiedUrl,
     fullReportUrl: NPC_CONFIG_DEFAULTS.fullReportUrl,
+    creditsPurchaseUrl: NPC_CONFIG_DEFAULTS.creditsPurchaseUrl,
     freeChecksTotal: NPC_CONFIG_DEFAULTS.freeChecksTotal
   };
 }
