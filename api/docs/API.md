@@ -414,11 +414,13 @@ owner-signed rotation notices. Public because the authority claim
 must be inspectable by the same people who verify anchor proofs.
 With the lane off it fails closed (404).
 
-**Approved next layer (not built): wallet claiming.** A
-registrant will be able to claim a record with their own wallet:
-the wallet signs a claim statement and the record gains a
-claimed-by attestation naming that wallet. Claiming changes
-nothing about the record's status or its anchor.
+**Wallet claiming (built 2026-11-22).** A registrant can claim
+a record with their own wallet: the wallet signs a claim
+statement binding the record and its fingerprint, and the claim
+is minted as its own signed record (npc.wallet.record_claim)
+naming that wallet. See the wallet-claim paths in openapi.yaml.
+Claiming changes nothing about the record's status or its
+anchor, and it is not a verification decision.
 
 ## Unified accounts (Gate G1)
 
@@ -475,6 +477,47 @@ recovery codes) is stored only as a SHA-256 hash.
   secret}` trades a ready handoff, once, for the app's own
   desktop device session. The secret never leaves the app; the
   browser only ever sees the handoff id.
+- `POST /v1/account/checks/image` (session) `{code, image_url}`
+  or `{code, image_base64}` — an AI image check run under the
+  account session (the Biblo tab lane: no client holds a verifier
+  key). Validation and detection are the verifier image route's;
+  the body's check code pays through the credit ledger as an AI
+  charge. A code with no AI balance is answered `402
+  {"error": "no_ai_credits", ...}` before the detector runs; an
+  unknown code `404 {"error": "code_not_found"}`, a revoked one
+  `403 {"error": "code_revoked"}`; detector failure is the honest
+  signed `503` and charges nothing. The answer is the verifier
+  route's body plus `check_id`, `charged`, `duplicate`,
+  `balance`, and `ai_balance`. A repeat check of the same media
+  under the same code is the ledger's duplicate: answered, never
+  charged twice.
+- `POST /v1/account/checks/video` (session) `{code, video_url,
+  interval_seconds?}` — the same lane for video, over the
+  verifier video route's core.
+- `GET /v1/account/checks` (session) — the account's recorded
+  checks, newest first: `{checks: [{check_id, check, media_ref,
+  media_sha256, result, charged, duplicate, created_at}]}`,
+  where `result` is the exact check body the check was answered
+  with. Only session-run checks are recorded; checks run under
+  verifier API keys were recorded against codes in the credit
+  ledger, not against accounts, and carry no stored result, so
+  they do not appear here.
+- `GET /v1/account/fleet` (session) — the account's fleet: its
+  own agent registrations, newest first:
+  `{counts: {total, with_declared_identity, with_attestations},
+  agents: [{record, attestation}]}`. The fleet is the account's
+  own agent registrations keyed by the account email (the
+  registrations whose owner email is the session account's
+  email; one account never sees another's agents, and content
+  registrations under the same email are not fleet entries).
+  `record` is the full signed registration record, exactly as
+  minted; `attestation` is `{agent_id, verdict, valid_from,
+  valid_until, revoked}` from the agents table for the record's
+  declared `agent_id`, or `null` when the record declared none
+  or no attestation row exists. The counts are computed from
+  the same list the response carries. No `verified` count is
+  served: registration is not verification, and no agent
+  verification pipeline exists to count from.
 
 Configuration is environment only: `NPC_AUTH_RP_ID`,
 `NPC_AUTH_RP_NAME`, `NPC_AUTH_ORIGINS`, `NPC_AUTH_SITE_BASE`,

@@ -194,8 +194,17 @@ REGISTRATION_BONUS_CHECKS = 25
 # not make it standard-only. An AI generation check may spend a
 # bonus grant's whole remaining balance, drawn only after the
 # Pass grants' AI sub-allowances (Bayo, 2026-10-28).
+#
+# "operator_comp" (added 2026-11-22) is the operator test comp: a
+# grant an operator lands by hand on an account's ledger row
+# through the store's grant_account_comp (never through a route,
+# never sold, and never minted by a purchase), so a comped balance
+# is always distinguishable in the ledger from bought checks. It
+# spends like a bonus grant (the whole remainder can fund an AI
+# check) and expires under the same rollover rule.
 BONUS_GRANT_SOURCES = ("referral_referee", "referral_link",
-                       "referral_referrer", "registration")
+                       "referral_referrer", "registration",
+                       "operator_comp")
 
 # Sources whose balance funds AI generation checks out of the
 # whole remainder rather than an AI sub-allowance: the bonus
@@ -206,6 +215,72 @@ BONUS_GRANT_SOURCES = ("referral_referee", "referral_link",
 # "pack", so grant_ai_room stays the one place that prices every
 # balance's AI room, and the pack size itself is the only cap.
 WHOLE_BALANCE_AI_SOURCES = BONUS_GRANT_SOURCES + ("pack",)
+
+
+# -- agent run rates (DRAFT, awaiting Bayo's ruling) -------------------------
+#
+# NPC_RUN_RATES is the ONE config table for server-side agent runs
+# (npc_verify.runs): the band thresholds (by measured model usage,
+# total tokens in + out across the run's model calls) and the price
+# of each band both live here and nowhere else, in the same
+# configuration style as DEFAULT_PACKS above, so Bayo's ruling on
+# the rates is a one-line change to this table.
+#
+# The seeded prices are DRAFT defaults taken from
+# npc-rate-table-draft-2026-11-22.md (agent runs: Light 5,000 /
+# Standard 25,000 / Heavy 100,000 $NPC). They are NOT decided
+# prices: they await Bayo's ruling, and nothing outside this table
+# may hard-code them.
+#
+# The unit mapping, stated plainly because it is a draft decision,
+# not a settled one: this ledger counts INTEGER check units only.
+# It has no fractional unit and no $NPC-denominated smallest unit.
+# The locked presentation rate is 1 ledger unit = 10,000 $NPC
+# (NPC_PER_LEDGER_UNIT_NPC below; the desktop presents 1
+# verification = 10,000 $NPC the same way). The draft $NPC prices
+# are therefore NOT whole ledger units (5,000 $NPC = 0.5 units,
+# 25,000 = 2.5 units, 100,000 = 10 units), and a fractional charge
+# cannot be represented. Until Bayo rules, each band charges whole
+# ledger units rounded UP from its draft price
+# (ledger_units = ceil(price_npc / 10,000)): Light 1, Standard 3,
+# Heavy 10. Rounding up means a run never charges less than its
+# draft price; it also means Light and Standard runs charge more
+# $NPC-equivalent than the draft table says (10,000 and 30,000
+# respectively). That distortion is deliberate, visible, and
+# confined to the "ledger_units" column of this one table: when
+# the ruling lands, either the prices become whole units or the
+# ledger gains a smaller unit, and this column is the only change.
+NPC_PER_LEDGER_UNIT_NPC = 10_000
+
+NPC_RUN_RATES = [
+    {"band": "light", "max_total_tokens": 2_000,
+     "price_npc": 5_000, "ledger_units": 1},
+    {"band": "standard", "max_total_tokens": 16_000,
+     "price_npc": 25_000, "ledger_units": 3},
+    {"band": "heavy", "max_total_tokens": None,
+     "price_npc": 100_000, "ledger_units": 10},
+]
+
+
+def run_band_for_usage(tokens_in, tokens_out):
+    """The NPC_RUN_RATES entry a run's measured usage falls in.
+
+    Bands are ordered lightest first; a run lands in the first band
+    whose max_total_tokens covers its total measured tokens, and in
+    the last (uncapped) band when no cap covers it."""
+    total = max(0, int(tokens_in or 0)) + max(0, int(tokens_out or 0))
+    for entry in NPC_RUN_RATES:
+        cap = entry["max_total_tokens"]
+        if cap is None or total <= cap:
+            return entry
+    return NPC_RUN_RATES[-1]
+
+
+def run_max_ledger_units():
+    """The largest ledger-unit charge any single run can land: the
+    figure a balance must cover before a run starts, so a completed
+    run's charge can always land in full (see npc_verify.runs)."""
+    return max(entry["ledger_units"] for entry in NPC_RUN_RATES)
 
 
 def pack_grant_view(row):
@@ -464,6 +539,28 @@ def valid_code_shape(code):
     symbols = normalize_code(code)
     return len(symbols) == CODE_SYMBOLS \
         and all(c in CODE_ALPHABET for c in symbols)
+
+
+def account_ledger_hash(account_id):
+    """The credit ledger key of a signed-in account's own balance.
+
+    Desktop accounts hold their checks on this same ledger, under a
+    code row no one ever sees or presents: the row's key is the
+    SHA-256 of a namespaced account id, derived server-side from
+    the session alone (Bayo's ruling, 2026-11-22: account balance,
+    no codes in the desktop app). Because the account balance is an
+    ordinary ledger row, every ledger rule carries over unchanged:
+    a repeat check of the same media is the ledger duplicate and
+    charges nothing, a failed check never reaches the consume call,
+    and Pass grants and subscriptions keyed by this hash behave
+    exactly as they do for a code. The hash is not a credential: it
+    is only ever computed from an authenticated session's account
+    id, and presenting it on the public code routes reads nothing,
+    because those routes hash the presented code again.
+    """
+    return hashlib.sha256(
+        ("npc-account-ledger-v1:" + str(account_id)).encode("utf-8")
+    ).hexdigest()
 
 
 # -- Stripe payments ------------------------------------------------------------
