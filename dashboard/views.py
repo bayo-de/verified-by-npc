@@ -93,6 +93,7 @@ label.small{font-size:13px;color:var(--muted);display:block;margin:14px 0 6px}
 .npc-chat-btn img{width:100%;height:100%;border-radius:50%;display:block}
 .npc-chat-panel{border:1px solid var(--line);border-radius:14px;background:var(--card);
   display:flex;flex-direction:column;overflow:hidden}
+.npc-chat-panel[hidden]{display:none}
 .npc-chat-panel.floating{position:fixed;right:20px;bottom:88px;width:min(360px,calc(100vw - 40px));
   height:min(520px,calc(100vh - 120px));box-shadow:0 12px 40px rgba(0,0,0,.18);z-index:60}
 .npc-chat-panel.inline{height:520px;max-height:70vh;margin:16px 0}
@@ -105,8 +106,9 @@ label.small{font-size:13px;color:var(--muted);display:block;margin:14px 0 6px}
 .npc-chat-msg{margin:0 0 14px}
 .npc-chat-msg .from{font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin:0 0 2px}
 .npc-chat-msg p{margin:0;font-size:14.5px;white-space:pre-wrap;max-width:none}
-.npc-chat-msg .srcs{font-size:12.5px;color:var(--muted);margin-top:5px}
-.npc-chat-msg .srcs a{margin-right:10px}
+.npc-chat-msg .srcs{font-size:12.5px;color:var(--muted);margin-top:8px;line-height:1.55}
+.npc-chat-msg .srcs .srcs-label{display:block;font-weight:650;margin-bottom:2px}
+.npc-chat-msg .srcs a{display:block;margin:3px 0 0;word-break:normal;overflow-wrap:break-word}
 .npc-chat-fb{margin-top:5px}
 .npc-chat-fb button{background:none;color:var(--muted);padding:2px 8px 2px 0;font-size:14px}
 .npc-chat-fb button[disabled]{opacity:.45}
@@ -438,6 +440,10 @@ VERIFY_JS = """
       resultBox.appendChild(
         window.npcRequestVerificationBox(rec.record_id, base));
     }
+    if (window.npcWalletClaimBox && rec.record_id) {
+      resultBox.appendChild(
+        window.npcWalletClaimBox(rec.record_id, base));
+    }
     var link = el("a", "See this record in Search");
     link.href = "/search?id=" + encodeURIComponent(rec.record_id);
     var p = el("p");
@@ -526,6 +532,12 @@ def _load_sibling_js(name):
 
 
 NPC_CREDENTIAL_JS = _load_sibling_js("npc_credential.js")
+
+# wallet_claim.js, next to this one: the record wallet-claim flow
+# (challenge, readable statement, message signature, claim state),
+# shared with its Node tests exactly like npc_credential.js. The
+# page wiring below drives it through window.ethereum.
+WALLET_CLAIM_JS = _load_sibling_js("wallet_claim.js")
 
 # Register a file: the file-flow wiring for the Verify yours page.
 # The visitor picks or drops a file; the browser works out the
@@ -702,6 +714,10 @@ FILE_REGISTER_JS = """
       "can keep, share, and check anywhere, against the " +
       "fingerprint of the file itself."));
     resultBox.appendChild(dlRow);
+    if (window.npcWalletClaimBox && rec.record_id) {
+      resultBox.appendChild(
+        window.npcWalletClaimBox(rec.record_id, base));
+    }
     var link = el("a", "See this record in Search");
     link.href = "/search?id=" + encodeURIComponent(rec.record_id);
     var p = el("p");
@@ -1016,6 +1032,11 @@ LIVE_LOOKUP_JS = """
           }
         })
         .catch(function () { /* the card stands as rendered */ });
+      if (window.npcWalletClaimBox) {
+        try {
+          card.appendChild(window.npcWalletClaimBox(id, base));
+        } catch (e) {}
+      }
     })
     .catch(function () { showUnknown(); });
 })();
@@ -1171,13 +1192,32 @@ CHAT_JS = """
       greeted = true;
       addMsg("Biblo", OPENING);
     }
+    /* Only customer-safe source names ever render. A source
+     * whose label carries an internal name or an error note
+     * (for example a model name, or "unable to verify") is
+     * omitted entirely: an unverifiable source is dropped, never
+     * shown with an error label. A source also needs a real
+     * destination on this site or on npclabs.xyz to render. */
+    function safeSources(sources) {
+      if (!sources || !sources.length) return [];
+      return sources.filter(function (s) {
+        if (!s || typeof s.title !== "string" ||
+            typeof s.path !== "string") return false;
+        var t = s.title.trim();
+        if (!t) return false;
+        if (/unable to verify|not verified|internal|error|failed|unavailable|meta\\s*muse/i
+            .test(t)) return false;
+        return /^(\\/|https:\\/\\/)/.test(s.path);
+      });
+    }
     function addBiblo(text, sources, myTurn, withFeedback) {
       var wrap = addMsg("Biblo", text);
-      if (sources && sources.length) {
+      var safe = safeSources(sources);
+      if (safe.length) {
         var srcs = el("div", null, "srcs");
-        srcs.appendChild(document.createTextNode("Sources: "));
-        sources.forEach(function (s) {
-          var a = el("a", s.title);
+        srcs.appendChild(el("span", "Sources:", "srcs-label"));
+        safe.forEach(function (s) {
+          var a = el("a", s.title.trim());
           a.href = s.path;
           srcs.appendChild(a);
         });
@@ -1266,23 +1306,53 @@ CHAT_JS = """
   var btn = document.getElementById("npc-chat-btn");
   var panel = document.getElementById("npc-chat-float");
   if (btn && panel) {
-    btn.addEventListener("click", function () {
-      var opening = panel.hidden;
-      panel.hidden = !opening;
-      btn.setAttribute("aria-expanded", String(opening));
-      if (opening) {
+    /* Open and close only ever toggle the panel's hidden state:
+     * the conversation (messages, thread, turn count) lives in
+     * the panel for the life of the page and is never cleared by
+     * closing, so reopening picks the conversation up where it
+     * left off. The open or closed choice is remembered in
+     * localStorage and restored on the next page; the
+     * conversation itself is not stored, so a reload starts a
+     * fresh conversation while the panel stays as the visitor
+     * left it, open or closed. Storage failures (private
+     * windows, blocked storage) fall back to closed. */
+    var STORE_KEY = "npc-chat-open";
+    function remember(open) {
+      try {
+        window.localStorage.setItem(STORE_KEY, open ? "1" : "0");
+      } catch (e) { /* the panel still works without storage */ }
+    }
+    function setOpen(open, focusInput) {
+      panel.hidden = !open;
+      btn.setAttribute("aria-expanded", String(open));
+      remember(open);
+      if (open && focusInput) {
         var inp = panel.querySelector("input");
         if (inp) inp.focus();
       }
+    }
+    btn.addEventListener("click", function () {
+      setOpen(panel.hidden, true);
     });
     var close = panel.querySelector(".npc-chat-close");
     if (close) {
       close.addEventListener("click", function () {
-        panel.hidden = true;
-        btn.setAttribute("aria-expanded", "false");
+        setOpen(false, false);
         btn.focus();
       });
     }
+    document.addEventListener("keydown", function (ev) {
+      if ((ev.key === "Escape" || ev.key === "Esc") &&
+          !panel.hidden) {
+        setOpen(false, false);
+        btn.focus();
+      }
+    });
+    var wasOpen = false;
+    try {
+      wasOpen = window.localStorage.getItem(STORE_KEY) === "1";
+    } catch (e) { /* fall back to closed */ }
+    if (wasOpen) setOpen(true, false);
   }
 })();
 """
@@ -1309,7 +1379,7 @@ def chat_panel_html(api_base, floating):
 <div class="npc-chat-log"></div>
 <div class="npc-chat-starters">%s</div>
 <div class="npc-chat-notice">Conversations may be read by the NPC team to improve these answers. Please do not share private details here.</div>
-<form class="npc-chat-form"><input type="text" maxlength="1000" placeholder="Ask about records, registering, the checks, the plugins" aria-label="Your question"><button type="submit">Send</button></form>
+<form class="npc-chat-form"><input type="text" maxlength="1000" placeholder="Ask about records or verification" aria-label="Your question"><button type="submit">Send</button></form>
 </section>""" % (
         "floating" if floating else "inline",
         esc(api_base),
@@ -1335,7 +1405,9 @@ def live_lookup_marker(api_base, record_id=None):
             '<script>%s</script><script>%s</script>%s' % (
                 esc(api_base),
                 (' data-id="%s"' % esc(record_id)) if record_id else "",
-                LIVE_LOOKUP_JS, REQUEST_VERIFY_JS, IDENTITY_PANEL_JS))
+                LIVE_LOOKUP_JS, REQUEST_VERIFY_JS, IDENTITY_PANEL_JS)
+            + "<script>%s</script>%s" % (
+                WALLET_CLAIM_JS, WALLET_CLAIM_DOM_JS))
 
 
 def request_verification_html(record_id, api_base):
@@ -1391,6 +1463,165 @@ def identity_panel_html(panel):
     parts.append('<p class="small">%s</p>' % esc(p.get("boundary")))
     parts.append("</div>")
     return "".join(parts)
+
+
+
+# The wallet-claim box wiring. The flow itself lives in
+# wallet_claim.js (NPCWalletClaim); this script builds the box on a
+# record's page, reads the claim state first, and only then shows
+# anything: a claimed record names its claimant, an unclaimed one
+# offers the optional claim, and when the claim service is not
+# answering for the record (its deployment flag is off) the box
+# removes itself, so no section ever promises what is not there.
+# Before the wallet is asked to sign, the exact statement is shown
+# on the page. Signing is a message signature only.
+WALLET_CLAIM_DOM_JS = r"""
+<script>
+(function () {
+  function el(tag, text) {
+    var n = document.createElement(tag);
+    if (text) n.textContent = text;
+    return n;
+  }
+  function renderClaimed(box, wallet, claimedAt) {
+    box.innerHTML = "";
+    box.appendChild(el("h3", "Wallet claim"));
+    box.appendChild(el("p",
+      "This record was claimed by wallet " +
+      window.NPCWalletClaim.shortenWallet(wallet) +
+      (claimedAt ? " on " + String(claimedAt).slice(0, 10) : "") +
+      "."));
+    box.appendChild(el("p", window.NPCWalletClaim.BOUNDARY));
+  }
+  function buildBox(recordId, apiBase) {
+    var box = el("div");
+    box.className = "npc-wallet-claim";
+    box.setAttribute("data-record-id", recordId);
+    box.setAttribute("data-api-base", apiBase);
+    wire(box);
+    return box;
+  }
+  function wire(box) {
+    if (!box || box.getAttribute("data-wired")) return;
+    box.setAttribute("data-wired", "1");
+    if (!window.NPCWalletClaim || !window.fetch) {
+      box.remove();
+      return;
+    }
+    var base = (box.getAttribute("data-api-base") || "")
+      .replace(/\/+$/, "");
+    var id = box.getAttribute("data-record-id") || "";
+    if (!base || !id) { box.remove(); return; }
+    window.NPCWalletClaim.fetchClaimState({
+      fetchFn: window.fetch.bind(window), apiBase: base,
+      recordId: id
+    }).then(function (state) {
+      if (!state) { box.remove(); return; }
+      if (state.claimed) {
+        var latest = (state.claims || [])[0] || {};
+        renderClaimed(box, state.wallet_claimed_by,
+                      latest.claimed_at);
+        return;
+      }
+      box.appendChild(el("h3",
+        "Claim this record with your wallet"));
+      box.appendChild(el("p",
+        "Optional, and only for the person who registered this " +
+        "record. Your wallet signs one short statement naming " +
+        "this record. Signing is a message signature: it moves " +
+        "no funds, approves nothing, and costs nothing. Your " +
+        "record stands on its own without a claim."));
+      if (!window.ethereum) {
+        box.appendChild(el("p",
+          "No wallet was found in this browser, so there is " +
+          "nothing to connect yet. To claim this record, open " +
+          "this page in a browser with a wallet installed, " +
+          "such as MetaMask, or in your wallet app's own " +
+          "browser, then come back to this record. Claiming " +
+          "is optional, and your record stands on its own " +
+          "without a claim."));
+        box.appendChild(el("p", window.NPCWalletClaim.BOUNDARY));
+        return;
+      }
+      var form = el("form");
+      form.className = "npc-claim-form";
+      var label = el("label", "The email you registered with ");
+      var input = el("input");
+      input.type = "email";
+      input.name = "email";
+      input.required = true;
+      input.setAttribute("autocomplete", "email");
+      label.appendChild(input);
+      form.appendChild(label);
+      var button = el("button",
+        "Connect wallet and sign to claim");
+      button.type = "submit";
+      form.appendChild(button);
+      box.appendChild(form);
+      var statement = el("pre");
+      statement.className = "npc-claim-statement";
+      statement.hidden = true;
+      box.appendChild(statement);
+      var status = el("p");
+      status.className = "npc-claim-status";
+      status.setAttribute("role", "status");
+      box.appendChild(status);
+      box.appendChild(el("p", window.NPCWalletClaim.BOUNDARY));
+      form.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        var email = (form.elements["email"].value || "").trim();
+        status.textContent = "Connecting your wallet.";
+        button.disabled = true;
+        window.NPCWalletClaim.runClaimFlow({
+          provider: window.ethereum,
+          fetchFn: window.fetch.bind(window),
+          apiBase: base, recordId: id, email: email,
+          onStatement: function (message) {
+            statement.textContent = message;
+            statement.hidden = false;
+            status.textContent =
+              "Your wallet is showing this statement. Sign it " +
+              "to claim this record, or close the wallet prompt " +
+              "to stop.";
+          }
+        }).then(function (out) {
+          form.hidden = true;
+          statement.hidden = true;
+          renderClaimed(box, out.wallet,
+                        out.claim && out.claim.claimed_at);
+          if (out.created === false) {
+            box.appendChild(el("p",
+              "This wallet had already claimed this record, so " +
+              "nothing changed."));
+          }
+        }).catch(function (err) {
+          button.disabled = false;
+          status.textContent = err && err.message
+            ? err.message
+            : "The claim did not go through. Nothing was claimed.";
+        });
+      });
+    });
+  }
+  window.npcWalletClaimBox = buildBox;
+  document.addEventListener("DOMContentLoaded", function () {
+    var boxes = document.querySelectorAll(
+      ".npc-wallet-claim[data-record-id]");
+    for (var i = 0; i < boxes.length; i++) wire(boxes[i]);
+  });
+})();
+</script>
+"""
+
+
+def wallet_claim_html(record_id, api_base):
+    """The server-rendered wallet-claim container: filled by
+    WALLET_CLAIM_DOM_JS from the API's claim state. When the claim
+    service is not answering for the record, the script removes
+    the container, so nothing shows."""
+    return ('<div class="npc-wallet-claim" '
+            'data-record-id="%s" data-api-base="%s"></div>'
+            % (esc(record_id), esc(api_base)))
 
 
 # The live panel loader. Fetches the panel endpoint for a record and
@@ -2520,10 +2751,15 @@ def registration_result(rec, verification_request=None,
     panel_slot = ('<div class="npc-identity-panel" '
                   'data-record-id="%s" data-api-base="%s"></div>'
                   % (esc(rec.get("record_id")), esc(api_base)))
+    # The wallet-claim container: filled by WALLET_CLAIM_DOM_JS
+    # from the API's claim state when claiming is enabled for the
+    # record; removed by the script when it is not, so no section
+    # appears that cannot be used.
+    claim_slot = wallet_claim_html(rec.get("record_id"), api_base)
     body = ('<div class="card"><h3>%s</h3>'
             '<p>A registration record, signed by NPC at issuance. '
             'Registration is not verification.</p>'
-            '<dl class="kv">%s</dl>%s%s%s%s%s'
+            '<dl class="kv">%s</dl>%s%s%s%s%s%s'
             '<p>Signed with key <span class="mono">%s</span>. The public '
             'keys are published in Search, so this record can be '
             'confirmed independently.</p></div>' % (
@@ -2534,6 +2770,7 @@ def registration_result(rec, verification_request=None,
                                   rec.get("checks_not_run"), "reason"),
                 kya_html(rec) if rec.get("kind") == "agent" else "",
                 panel_slot,
+                claim_slot,
                 ask,
                 esc(rec.get("key_id"))))
     return body
@@ -2676,8 +2913,10 @@ def verify_view(api_base=PUBLIC_API_BASE):
 <script>%s</script>
 <script>%s</script>
 <script>%s</script>
+<script>%s</script>%s
 """ % (esc(api_base), esc(api_base), VERIFY_JS, NPC_CREDENTIAL_JS,
-       FILE_REGISTER_JS, REQUEST_VERIFY_JS)
+       FILE_REGISTER_JS, REQUEST_VERIFY_JS, WALLET_CLAIM_JS,
+       WALLET_CLAIM_DOM_JS)
 
 
 def key_entries(keys_doc):
