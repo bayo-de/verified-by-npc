@@ -242,6 +242,14 @@ class _App:
                 if rendered and "npc-request-verification" in rendered:
                     rendered += ("<script>%s</script>"
                                  % views.REQUEST_VERIFY_JS)
+                if rendered and "npc-wallet-claim" in rendered:
+                    # The registration card carries the claim
+                    # container; without these two scripts it is an
+                    # inert box and the claim can never be made from
+                    # a server-rendered record page.
+                    rendered += ("<script>%s</script>%s" % (
+                        views.WALLET_CLAIM_JS,
+                        views.WALLET_CLAIM_DOM_JS))
                 if rendered:
                     return views.search_view(
                         query=query, result_html=rendered,
