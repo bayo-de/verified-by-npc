@@ -8,6 +8,7 @@ import base64
 import http.client
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -837,6 +838,138 @@ class UnpricedPackFailClosedTest(CreditsHttpBase):
         purchase = self.app.store.get_credit_purchase(sid)
         self.assertEqual(purchase["pack_id"], "wired")
         self.assertEqual(purchase["status"], "pending")
+
+
+class AccountPurchaseTest(CreditsHttpBase):
+    """Signed-in purchases credit the buyer's account balance and
+    mint no code (Bayo's ruling, 2026-11-22). Checkout carries the
+    account session; the webhook completion lands on the account's
+    own ledger row, and checkout-status reports the credit instead
+    of delivering a code."""
+
+    packs_env = json.dumps([
+        {"id": "trio", "label": "3 checks", "checks": 3,
+         "price_cents": 300, "currency": "usd",
+         "stripe_price_id": "price_test_trio"},
+        {"id": "pass-monthly", "label": "Verifier Pass",
+         "checks": 1000, "price_cents": 2500, "currency": "usd",
+         "kind": "access", "ai_checks": 200, "interval": "month",
+         "stripe_price_id": "price_test_pass_monthly"},
+    ])
+
+    def setUp(self):
+        os.environ["NPC_AUTH_RP_ID"] = "localhost"
+        os.environ["NPC_AUTH_ORIGINS"] = "http://127.0.0.1"
+        os.environ["NPC_AUTH_SITE_BASE"] = "http://127.0.0.1"
+        super().setUp()
+
+    # -- helpers ---------------------------------------------------------
+
+    def sign_in(self, email):
+        status, _h, data = self.post("/v1/auth/email/request",
+                                     {"email": email})
+        self.assertEqual(status, 200, data)
+        text = self.mailer.sent[-1]["text"]
+        token = re.search(r"token=([A-Za-z0-9_\-]+)", text).group(1)
+        status, _h, data = self.request(
+            "POST", "/v1/auth/email/redeem",
+            body={"token": token, "surface": "desktop",
+                  "device_label": "Test desktop"})
+        self.assertEqual(status, 200, data)
+        return json.loads(data)["session_token"]
+
+    def buy_signed_in(self, token, pack_id="trio"):
+        status, _h, data = self.request(
+            "POST", "/v1/credits/checkout", body={"pack_id": pack_id},
+            headers={"Authorization": "Bearer " + token})
+        self.assertEqual(status, 201, data)
+        return json.loads(data)["session_id"]
+
+    def account_balance(self, token):
+        status, _h, data = self.request(
+            "GET", "/v1/account/balance",
+            headers={"Authorization": "Bearer " + token})
+        self.assertEqual(status, 200, data)
+        return json.loads(data)
+
+    def fire_event(self, event_type, obj, event_id="evt_acct_1"):
+        event = {"id": event_id, "type": event_type,
+                 "data": {"object": obj}}
+        raw = json.dumps(event).encode()
+        header = credits.sign_webhook_payload(
+            WEBHOOK_SECRET, raw, int(time.time()))
+        return self.request(
+            "POST", "/v1/credits/stripe-webhook", raw_body=raw,
+            headers={"Stripe-Signature": header,
+                     "Content-Type": "application/json"})
+
+    # -- tests -------------------------------------------------------------
+
+    def test_signed_in_pack_purchase_credits_account_no_code(self):
+        token = self.sign_in("member@example.com")
+        sid = self.buy_signed_in(token)
+        purchase = self.app.store.get_credit_purchase(sid)
+        self.assertEqual(purchase["status"], "pending")
+        self.assertTrue(purchase["account_id"])
+        self.assertEqual(purchase["buyer_email"],
+                         "member@example.com")
+        mails_before = len(self.mailer.sent)
+        status, _h, data = self.fire_webhook(sid,
+                                             email="member@example.com")
+        self.assertEqual(status, 200, data)
+        purchase = self.app.store.get_credit_purchase(sid)
+        self.assertEqual(purchase["status"], "paid")
+        self.assertIsNone(purchase["code_plaintext"])
+        # No code email: the only mail so far is the sign-in link.
+        self.assertEqual(len(self.mailer.sent), mails_before)
+        status, _h, data = self.get(
+            "/v1/credits/checkout-status?session_id=" + sid)
+        body = json.loads(data)
+        self.assertEqual(body["status"], "paid")
+        self.assertTrue(body["account_credited"])
+        self.assertNotIn("code", body)
+        balance = self.account_balance(token)
+        self.assertEqual(balance["balance"], 3)
+        self.assertEqual(balance["ai_balance"], 3)
+        # A replayed webhook credits nothing twice.
+        status, _h, data = self.fire_webhook(sid,
+                                             email="member@example.com")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(self.account_balance(token)["balance"], 3)
+
+    def test_signed_in_pass_opens_on_account(self):
+        token = self.sign_in("passmember@example.com")
+        sid = self.buy_signed_in(token, pack_id="pass-monthly")
+        status, _h, data = self.fire_event(
+            "checkout.session.completed",
+            {"id": sid, "subscription": "sub_acct_1",
+             "customer": "cus_acct_1", "invoice": "in_acct_1",
+             "customer_details": {"email": "passmember@example.com"}})
+        self.assertEqual(status, 200, data)
+        status, _h, data = self.get(
+            "/v1/credits/checkout-status?session_id=" + sid)
+        body = json.loads(data)
+        self.assertTrue(body["account_credited"])
+        self.assertNotIn("code", body)
+        balance = self.account_balance(token)
+        self.assertEqual(balance["balance"], 1000)
+        self.assertEqual(balance["ai_balance"], 200)
+        self.assertEqual(balance["subscription_status"], "active")
+        self.assertTrue(balance["registry_unlimited"])
+        # Renewal grants land on the account too.
+        status, _h, data = self.fire_event(
+            "invoice.paid",
+            {"id": "in_acct_2", "subscription": "sub_acct_1"},
+            event_id="evt_acct_2")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(self.account_balance(token)["balance"], 2000)
+
+    def test_bad_session_refuses_checkout(self):
+        status, _h, data = self.request(
+            "POST", "/v1/credits/checkout", body={"pack_id": "trio"},
+            headers={"Authorization": "Bearer npc_sess_ghost"})
+        self.assertEqual(status, 401, data)
+        self.assertEqual(self.payments.sessions, [])
 
 
 class CreditsUnitTest(unittest.TestCase):

@@ -36,6 +36,8 @@ Mapping (pk / sk):
   idempotency keys    IDEM                   / route + TAB + key
   verification reqs   VREQ                   / subject record_id
   verification tries  VREQATT                / created_at + # + hex
+  account checks      ACCOUNT_CHECK#<acct>   / created_at + # + check_id
+  agent runs          AGENT_RUN              / run_id
   anchor batches      ANCHOR_BATCH           / batch_id
   record anchors      RECORD_ANCHOR          / record_id
   anchor rotations    ANCHOR_ROTATION        / notice_id
@@ -442,6 +444,34 @@ class DynamoDBStore:
             row = self._get_row("REG", record_id)
         return json.loads(row["record_json"]) if row else None
 
+    def registrations_by_email(self, email, kind="agent"):
+        """Registration records submitted under one owner email, of
+        one kind, newest first. Mirrors the SQLite store: records
+        are the parsed signed dicts, exactly as get_registration
+        returns them. The REG partition is read whole and filtered
+        client-side by email HASH, the same approach
+        count_registrations_since uses (rows written before hashes
+        existed fall back to hashing their stored email), so no new
+        partition or migration exists."""
+        with self._lock:
+            rows = self._query_rows("REG")
+        wanted = registration_email_hash(email)
+        rows = [r for r in rows
+                if r.get("kind") == kind
+                and (r.get("email_hash")
+                     or registration_email_hash(r.get("email", "")))
+                == wanted]
+        rows.sort(key=lambda r: r["created_at"], reverse=True)
+        out = []
+        for row in rows:
+            try:
+                record = json.loads(row["record_json"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(record, dict):
+                out.append(record)
+        return out
+
     def registration_for_agent(self, agent_id):
         """The agent registration that names this agent_id, or
         None. Mirrors the SQLite store: the recorded agent_id on a
@@ -695,6 +725,33 @@ class DynamoDBStore:
         records = [json.loads(r["record_json"]) for r in rows
                    if r["subject_record_id"] == subject_record_id]
         records.sort(key=lambda r: r.get("linked_at", ""))
+        return records
+
+    def add_wallet_claim(self, record) -> bool:
+        """Store a signed wallet-claim record, put-if-absent, under
+        the "WCLAIM" partition (sk = claim id)."""
+        row = {"claim_id": record["record_id"],
+               "subject_record_id": record["subject_record_id"],
+               "wallet": record["wallet_claimed_by"],
+               "claimed_at": record["claimed_at"],
+               "record_json": json.dumps(record)}
+        with self._lock:
+            return self._put_row("WCLAIM", record["record_id"], row,
+                                 if_absent=True)
+
+    def get_wallet_claim(self, claim_id):
+        with self._lock:
+            row = self._get_row("WCLAIM", claim_id)
+        return json.loads(row["record_json"]) if row else None
+
+    def list_wallet_claims(self, subject_record_id):
+        """Every claim record for one record, oldest first,
+        mirroring the SQLite store."""
+        with self._lock:
+            rows = self._query_rows("WCLAIM")
+        records = [json.loads(r["record_json"]) for r in rows
+                   if r["subject_record_id"] == subject_record_id]
+        records.sort(key=lambda r: r.get("claimed_at", ""))
         return records
 
     def add_identity_observation(self, row) -> None:
@@ -1120,15 +1177,66 @@ class DynamoDBStore:
     # charged, and composite sequences run under the store lock.
 
     def create_credit_purchase(self, session_id, pack_id, buyer_email,
-                               now, referral_hash=None):
+                               now, referral_hash=None, account_id=None):
         row = {"session_id": session_id, "pack_id": pack_id,
                "code_hash": None, "code_plaintext": None,
                "status": "pending", "buyer_email": buyer_email,
                "code_delivered": 0, "created_at": now,
-               "completed_at": None, "referral_hash": referral_hash}
+               "completed_at": None, "referral_hash": referral_hash,
+               "account_id": account_id}
         with self._lock:
             self._put_row("CREDIT_PURCHASE", session_id, row,
                           if_absent=True)
+
+    # -- account balances (desktop, 2026-11-22) -------------------------
+    # Same contract as the SQLite store: the account's checks live
+    # in a CREDIT_CODE row keyed by
+    # credits.account_ledger_hash(account_id), created empty on
+    # first use; signed-in purchases credit it instead of minting
+    # a code.
+
+    def _account_ledger_row(self, account_hash, buyer_email, now):
+        row = {"code_hash": account_hash, "pack_id": "account",
+               "credits_total": 0, "credits_used": 0,
+               "status": "active", "stripe_session_id": None,
+               "buyer_email": buyer_email, "created_at": now,
+               "redeemed_at": None, "last_used_at": None}
+        self._put_row("CREDIT_CODE", account_hash, row, if_absent=True)
+        return self._get_row("CREDIT_CODE", account_hash)
+
+    def ensure_account_ledger(self, account_id, buyer_email, now):
+        """Return the account's ledger row (augmented), creating it
+        empty on first use."""
+        account_hash = credits_module.account_ledger_hash(account_id)
+        with self._lock:
+            row = self._account_ledger_row(
+                account_hash, buyer_email, now)
+            return self._augment_credit_row(row, now)
+
+    def complete_account_purchase(self, session_id, account_hash,
+                                  pack, buyer_email, now):
+        """Mark a signed-in purchase paid and add its checks to the
+        account's ledger row, exactly once; a replayed completion
+        returns the row unchanged. No code is minted."""
+        with self._lock:
+            purchase = self._get_row("CREDIT_PURCHASE", session_id)
+            if purchase is None:
+                return None
+            if purchase["status"] == "paid" \
+                    and purchase.get("code_hash") == account_hash:
+                return self._augment_credit_row(
+                    self._get_row("CREDIT_CODE", account_hash), now)
+            row = self._account_ledger_row(
+                account_hash, buyer_email, now)
+            row["credits_total"] = row.get("credits_total", 0) \
+                + pack["checks"]
+            self._put_row("CREDIT_CODE", account_hash, row)
+            purchase.update({
+                "status": "paid", "code_hash": account_hash,
+                "code_plaintext": None, "buyer_email": buyer_email,
+                "completed_at": now})
+            self._put_row("CREDIT_PURCHASE", session_id, purchase)
+            return self._augment_credit_row(row, now)
 
     def get_credit_purchase(self, session_id):
         with self._lock:
@@ -1158,6 +1266,34 @@ class DynamoDBStore:
                 "buyer_email": buyer_email, "completed_at": now})
             self._put_row("CREDIT_PURCHASE", session_id, purchase)
             return code_row
+
+    def grant_account_comp(self, account_id, buyer_email, amount,
+                           grant_id, now, expires_at):
+        """Land an operator test comp on an account's ledger row.
+        Same contract as the SQLite store: a grant under the source
+        "operator_comp", keyed by grant_id so a replay lands
+        nothing twice. Outcomes: "granted", "duplicate",
+        "not_found"."""
+        with self._lock:
+            if self._get_row("ACCT", account_id) is None:
+                return {"outcome": "not_found", "code": None}
+            account_hash = credits_module.account_ledger_hash(
+                account_id)
+            existing = self._get_row(
+                "CREDIT_GRANT#" + account_hash, grant_id)
+            if existing is not None:
+                return {"outcome": "duplicate",
+                        "code": self.get_credit_code(account_hash,
+                                                     now)}
+            self._account_ledger_row(account_hash, buyer_email, now)
+            grant = {"grant_id": grant_id, "code_hash": account_hash,
+                     "amount": int(amount), "used": 0, "ai_cap": 0,
+                     "ai_used": 0, "source": "operator_comp",
+                     "granted_at": now, "expires_at": expires_at}
+            self._put_row("CREDIT_GRANT#" + account_hash, grant_id,
+                          grant)
+            return {"outcome": "granted",
+                    "code": self.get_credit_code(account_hash, now)}
 
     def expire_credit_purchase(self, session_id, now):
         with self._lock:
@@ -1277,6 +1413,46 @@ class DynamoDBStore:
                 "buyer_email": buyer_email, "completed_at": now})
             self._put_row("CREDIT_PURCHASE", session_id, purchase)
             return self._augment_credit_row(code_row, now)
+
+    def activate_account_pass(self, session_id, account_hash, pack,
+                              buyer_email, subscription_id, customer_id,
+                              grant_id, now, expires_at):
+        """The signed-in form of activate_pass_subscription: open
+        the subscription against the account's ledger row and land
+        the first monthly grant, exactly once, minting no code; a
+        replayed activation returns the row unchanged."""
+        with self._lock:
+            purchase = self._get_row("CREDIT_PURCHASE", session_id)
+            if purchase is None:
+                return None
+            if purchase["status"] == "paid" \
+                    and purchase.get("code_hash") == account_hash:
+                return self._augment_credit_row(
+                    self._get_row("CREDIT_CODE", account_hash), now)
+            row = self._account_ledger_row(
+                account_hash, buyer_email, now)
+            sub = {"subscription_id": subscription_id,
+                   "code_hash": account_hash, "pack_id": pack["id"],
+                   "customer_id": customer_id,
+                   "buyer_email": buyer_email,
+                   "monthly_checks": pack["checks"],
+                   "ai_checks": pack.get("ai_checks", 0),
+                   "status": "active", "created_at": now,
+                   "updated_at": now}
+            self._put_row("CREDIT_SUBSCRIPTION", subscription_id, sub)
+            grant = {"grant_id": grant_id, "code_hash": account_hash,
+                     "amount": pack["checks"], "used": 0,
+                     "ai_cap": pack.get("ai_checks", 0), "ai_used": 0,
+                     "source": "pass",
+                     "granted_at": now, "expires_at": expires_at}
+            self._put_row("CREDIT_GRANT#" + account_hash, grant_id,
+                          grant)
+            purchase.update({
+                "status": "paid", "code_hash": account_hash,
+                "code_plaintext": None, "buyer_email": buyer_email,
+                "completed_at": now})
+            self._put_row("CREDIT_PURCHASE", session_id, purchase)
+            return self._augment_credit_row(row, now)
 
     def get_subscription(self, subscription_id):
         with self._lock:
@@ -1531,6 +1707,143 @@ class DynamoDBStore:
                     "referrer_bonus": amount,
                     "referrer_link_bonus": link_amount}
 
+    # -- account check history (Biblo tab) -----------------------------
+
+    def record_account_check(self, check_id, account_id, code_hash,
+                             check, media_ref, media_sha256, result,
+                             charged, duplicate, created_at):
+        """Record one session-run AI check in the account's history.
+        Same row shape as the SQLite store: flags as 0/1 ints and
+        the result body as JSON text in result_json. The partition
+        is the account; the sort key is created_at + check_id, so a
+        reversed partition Query reads newest first."""
+        row = {
+            "check_id": check_id, "account_id": account_id,
+            "code_hash": code_hash, "check": check,
+            "media_ref": media_ref, "media_sha256": media_sha256,
+            "result_json": json.dumps(result),
+            "charged": 1 if charged else 0,
+            "duplicate": 1 if duplicate else 0,
+            "created_at": created_at,
+        }
+        with self._lock:
+            self._put_row("ACCOUNT_CHECK#" + account_id,
+                          created_at + "#" + check_id, row)
+        return row
+
+    def list_account_checks(self, account_id, limit=50):
+        """The account's recorded session checks, newest first."""
+        limit = int(limit)
+        with self._lock:
+            rows = self._query_rows("ACCOUNT_CHECK#" + account_id,
+                                    reverse=True, limit=limit)
+        rows.sort(key=lambda r: (r["created_at"], r["check_id"]),
+                  reverse=True)
+        return rows[:limit]
+
+    # -- server-side agent runs (npc_verify.runs) ----------------------
+    # Same row shape and semantics as the SQLite store. One
+    # partition (AGENT_RUN / run_id), read whole and filtered
+    # client-side for the per-account list, the REG partition's
+    # approach at this service's scale.
+
+    _AGENT_RUN_FIELDS = (
+        "record_id", "account_id", "status", "input_text",
+        "input_hash", "output_text", "output_hash", "model",
+        "tokens_in", "tokens_out", "band", "price_npc",
+        "ledger_units", "charged", "charge_id", "run_record_id",
+        "error", "created_at", "started_at", "finished_at")
+    _AGENT_RUN_INT_FIELDS = frozenset(
+        ("tokens_in", "tokens_out", "price_npc", "ledger_units",
+         "charged"))
+
+    def add_agent_run(self, row) -> bool:
+        """Insert one run row in its created state. False when the
+        run id already exists."""
+        out = {"run_id": row["run_id"]}
+        for f in self._AGENT_RUN_FIELDS:
+            default = 0 if f in self._AGENT_RUN_INT_FIELDS else ""
+            out[f] = row.get(f, default)
+        with self._lock:
+            return self._put_row("AGENT_RUN", row["run_id"], out,
+                                 if_absent=True)
+
+    def update_agent_run(self, run_id, **fields) -> bool:
+        """Move a run row through its lifecycle. Only the known run
+        columns may be written. Returns True when a row moved."""
+        cols = {f: v for f, v in fields.items()
+                if f in self._AGENT_RUN_FIELDS}
+        if not cols:
+            return False
+        with self._lock:
+            row = self._get_row("AGENT_RUN", run_id)
+            if row is None:
+                return False
+            row.update(cols)
+            self._put_row("AGENT_RUN", run_id, row)
+            return True
+
+    def get_agent_run(self, run_id):
+        with self._lock:
+            return self._get_row("AGENT_RUN", run_id)
+
+    def list_agent_runs(self, account_id, limit=50):
+        """The account's runs, newest first."""
+        with self._lock:
+            rows = self._query_rows("AGENT_RUN")
+        rows = [r for r in rows
+                if r.get("account_id") == account_id]
+        rows.sort(key=lambda r: (r["created_at"], r["run_id"]),
+                  reverse=True)
+        return rows[:int(limit)]
+
+    # -- staged media uploads (v6.11) --------------------------------
+    # Same row shape and semantics as the SQLite store. The
+    # partition is the account and the sort key is the upload id, so
+    # resolution is namespaced by construction. Claim and release
+    # are read-modify-write under the store lock, the same
+    # discipline consume_credit uses in this backend.
+
+    def create_account_upload(self, upload_id, account_id, media_type,
+                              size_bytes, content_type, object_key,
+                              created_at):
+        row = {
+            "upload_id": upload_id, "account_id": account_id,
+            "media_type": media_type, "size_bytes": int(size_bytes),
+            "content_type": content_type, "object_key": object_key,
+            "state": "pending", "created_at": created_at,
+        }
+        with self._lock:
+            self._put_row("ACCOUNT_UPLOAD#" + account_id, upload_id,
+                          row)
+        return row
+
+    def get_account_upload(self, account_id, upload_id):
+        with self._lock:
+            return self._get_row("ACCOUNT_UPLOAD#" + account_id,
+                                 upload_id)
+
+    def claim_account_upload(self, account_id, upload_id):
+        with self._lock:
+            row = self._get_row("ACCOUNT_UPLOAD#" + account_id,
+                                upload_id)
+            if row is None or row.get("state") != "pending":
+                return False
+            row["state"] = "consumed"
+            self._put_row("ACCOUNT_UPLOAD#" + account_id, upload_id,
+                          row)
+            return True
+
+    def release_account_upload(self, account_id, upload_id):
+        with self._lock:
+            row = self._get_row("ACCOUNT_UPLOAD#" + account_id,
+                                upload_id)
+            if row is None or row.get("state") != "consumed":
+                return
+            row["state"] = "pending"
+            self._put_row("ACCOUNT_UPLOAD#" + account_id, upload_id,
+                          row)
+
     def get_credit_code(self, code_hash, now=None):
         with self._lock:
             return self._augment_credit_row(
@@ -1548,14 +1861,19 @@ class DynamoDBStore:
 
     def consume_credit(self, code_hash, image_identity, claim_hash,
                        charge_id, now, kind="standard",
-                       hourly_limit=None):
+                       hourly_limit=None, amount=1):
         """Charge one credit for one new image, atomically. Same
         outcomes as the SQLite store: charged / duplicate /
         no_credits / no_ai_credits / rate_limited / revoked /
         not_found. While the code's Pass subscription is active a
         standard charge is covered by the Pass (the charge row
         lands with funded_by "pass" and no pool moves); the
-        hourly backstop counts charged consumes per code."""
+        hourly backstop counts charged consumes per code.
+
+        `amount` mirrors the SQLite store: that many ledger units
+        under the same single charge row and the same
+        (code_hash, image_identity) idempotency key, all-or-nothing
+        (the agent-run band charge; see npc_verify.runs)."""
         with self._lock:
             row = self._get_row("CREDIT_CODE", code_hash)
             if row is None:
@@ -1578,7 +1896,7 @@ class DynamoDBStore:
                 if recent >= hourly_limit:
                     return {"outcome": "rate_limited",
                             "code": self._augment_credit_row(row, now)}
-            if kind == "standard":
+            if kind == "standard" and amount == 1:
                 sub = self._subscription_for_code(code_hash)
                 if sub is not None and sub["status"] == "active":
                     charge = {"id": charge_id,
@@ -1601,8 +1919,8 @@ class DynamoDBStore:
             if grants:
                 return self._consume_with_grants(
                     row, grants, image_identity, claim_hash, charge_id,
-                    now, kind)
-            if row["credits_used"] >= row["credits_total"]:
+                    now, kind, amount)
+            if row["credits_used"] + amount > row["credits_total"]:
                 return {"outcome": "no_credits",
                         "code": self._augment_credit_row(row, now)}
             # The code's own pack counters fund this charge; an AI
@@ -1616,7 +1934,7 @@ class DynamoDBStore:
                                  if_absent=True):
                 return {"outcome": "duplicate",
                         "code": self._augment_credit_row(row, now)}
-            row["credits_used"] = row["credits_used"] + 1
+            row["credits_used"] = row["credits_used"] + amount
             if row["credits_used"] >= row["credits_total"]:
                 row["status"] = "exhausted"
             row["last_used_at"] = now
@@ -1625,7 +1943,8 @@ class DynamoDBStore:
                     "code": self._augment_credit_row(row, now)}
 
     def _consume_with_grants(self, row, grants, image_identity,
-                             claim_hash, charge_id, now, kind):
+                             claim_hash, charge_id, now, kind,
+                             amount=1):
         """The grant path of consume_credit, under the store lock
         with the duplicate check already done. Same draw rules as
         the SQLite store: standard draws take the oldest live
@@ -1633,52 +1952,58 @@ class DynamoDBStore:
         first, then bonus grants oldest first, each bonus draw
         spending the grant's shared pool and landing marked
         funded_by "bonus", then the code's pack counters, landing
-        marked funded_by "pack"."""
+        marked funded_by "pack". A multi-unit charge plans its
+        whole draw first and moves nothing when the fundable pools
+        cannot cover it in full (see the SQLite store)."""
         code_hash = row["code_hash"]
-        live = [g for g in grants if g["expires_at"] > now]
+        live = [dict(g) for g in grants if g["expires_at"] > now]
         grant_remaining = sum(g["amount"] - g["used"] for g in live)
         legacy_remaining = row["credits_total"] - row["credits_used"]
-        target = None
+
+        def _room(grant):
+            if kind == "ai":
+                return credits_module.grant_ai_room(grant)
+            return grant["amount"] - grant["used"]
+
         if kind == "ai":
-            for g in live:
-                if g["source"] not in \
-                        credits_module.BONUS_GRANT_SOURCES \
-                        and credits_module.grant_ai_room(g) > 0:
-                    target = g
-                    break
-            if target is None:
-                for g in live:
-                    if g["source"] in \
-                            credits_module.BONUS_GRANT_SOURCES \
-                            and credits_module.grant_ai_room(g) > 0:
-                        target = g
-                        break
-            if target is None and credits_module.grant_ai_room(
-                    credits_module.pack_grant_view(row)) <= 0:
+            ordered = (
+                [g for g in live
+                 if g["source"] not in
+                 credits_module.BONUS_GRANT_SOURCES]
+                + [g for g in live
+                   if g["source"] in
+                   credits_module.BONUS_GRANT_SOURCES])
+            fundable = sum(_room(g) for g in ordered) \
+                + credits_module.grant_ai_room(
+                    credits_module.pack_grant_view(row))
+            if fundable < amount:
                 outcome = "no_credits" \
                     if grant_remaining + legacy_remaining <= 0 \
                     else "no_ai_credits"
                 return {"outcome": outcome,
                         "code": self._augment_credit_row(row, now)}
         else:
-            if grant_remaining + legacy_remaining <= 0:
+            ordered = live
+            if grant_remaining + legacy_remaining < amount:
                 return {"outcome": "no_credits",
                         "code": self._augment_credit_row(row, now)}
-            for g in live:
-                if g["amount"] - g["used"] > 0:
-                    target = g
-                    break
+        plan = []
+        remaining = amount
+        for g in ordered:
+            if remaining <= 0:
+                break
+            draw = min(_room(g), remaining)
+            if draw > 0:
+                plan.append((g, draw))
+                remaining -= draw
+        counter_draw = remaining
         funded_by = ""
-        if kind == "ai" and target is not None \
-                and target["source"] in \
-                credits_module.BONUS_GRANT_SOURCES:
-            funded_by = "bonus"
-        elif kind == "ai" and target is None:
-            # No grant could fund this AI charge, so it falls to
-            # the code's pack counters (their room was checked
-            # above); the spend itself happens in the counters
-            # branch below.
-            funded_by = "pack"
+        if kind == "ai":
+            if any(g["source"] in credits_module.BONUS_GRANT_SOURCES
+                   for g, _d in plan):
+                funded_by = "bonus"
+            elif counter_draw > 0:
+                funded_by = "pack"
         charge = {"id": charge_id, "code_hash": code_hash,
                   "image_identity": image_identity,
                   "claim_hash": claim_hash, "kind": kind,
@@ -1688,16 +2013,17 @@ class DynamoDBStore:
                              image_identity, charge, if_absent=True):
             return {"outcome": "duplicate",
                     "code": self._augment_credit_row(row, now)}
-        if target is not None:
-            target["used"] = target["used"] + 1
+        for g, draw in plan:
+            g["used"] = g["used"] + draw
             if kind == "ai":
-                target["ai_used"] = target["ai_used"] + 1
+                g["ai_used"] = g["ai_used"] + draw
             self._put_row("CREDIT_GRANT#" + code_hash,
-                          target["grant_id"], target)
+                          g["grant_id"], g)
+        if plan:
             row["last_used_at"] = now
             self._put_row("CREDIT_CODE", code_hash, row)
-        else:
-            row["credits_used"] = row["credits_used"] + 1
+        if counter_draw > 0:
+            row["credits_used"] = row["credits_used"] + counter_draw
             sub = self._subscription_for_code(code_hash)
             if row["credits_used"] >= row["credits_total"] and not (
                     sub and sub["status"] == "active"):

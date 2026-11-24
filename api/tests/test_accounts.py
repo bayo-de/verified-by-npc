@@ -433,6 +433,88 @@ class TestHandoff(AccountHttpTestCase):
         self.assertEqual(status, 400, poll)
 
 
+class TestHandoffCompletionGaps(AccountHttpTestCase):
+    """The two sign-in page handoff gaps, closed: a browser that
+    already holds a web session completes a pending handoff
+    without a fresh sign-in, and a recovery-code sign-in carries
+    the handoff id so it completes the handoff too. Each test
+    proves the desktop exchange then succeeds."""
+
+    def _create_handoff(self):
+        status, _h, data = self.post(
+            "/v1/auth/handoff", {"device_label": "Bayo's Mac"})
+        self.assertEqual(status, 200, data)
+        return data
+
+    def _poll(self, handoff):
+        status, _h, poll = self.post(
+            "/v1/auth/handoff/poll",
+            {"handoff_id": handoff["handoff_id"],
+             "secret": handoff["secret"]})
+        self.assertEqual(status, 200, poll)
+        return poll
+
+    def _exchange(self, handoff):
+        status, _h, exchanged = self.post(
+            "/v1/auth/handoff/exchange",
+            {"handoff_id": handoff["handoff_id"],
+             "secret": handoff["secret"]})
+        self.assertEqual(status, 200, exchanged)
+        self.assertEqual(exchanged["session"]["surface"], "desktop")
+        return exchanged
+
+    def test_already_signed_in_branch_completes_handoff(self):
+        # The browser already holds a web session for the account.
+        data = self.redeem_link("already@example.com")
+        handoff = self._create_handoff()
+        self.assertEqual(self._poll(handoff)["status"], "pending")
+        # The page's already-signed-in branch: with the session it
+        # already holds, it completes the pending handoff directly.
+        status, _h, done = self.post(
+            "/v1/auth/handoff/complete",
+            {"handoff_id": handoff["handoff_id"]},
+            token=data["session_token"])
+        self.assertEqual(status, 200, done)
+        self.assertEqual(self._poll(handoff)["status"], "ready")
+        exchanged = self._exchange(handoff)
+        self.assertEqual(exchanged["account"]["email"],
+                         "already@example.com")
+
+    def test_handoff_complete_requires_a_session(self):
+        handoff = self._create_handoff()
+        status, _h, data = self.post(
+            "/v1/auth/handoff/complete",
+            {"handoff_id": handoff["handoff_id"]})
+        self.assertEqual(status, 401, data)
+        self.assertEqual(self._poll(handoff)["status"], "pending")
+
+    def test_recovery_code_sign_in_completes_handoff(self):
+        data = self.redeem_link("recoverdesk@example.com")
+        _auth, done = self.enroll_passkey(data["session_token"])
+        code = done["recovery_codes"][0]
+        handoff = self._create_handoff()
+        status, _h, back = self.post(
+            "/v1/auth/recovery/redeem",
+            {"email": "recoverdesk@example.com", "code": code,
+             "surface": "web", "device_label": "New browser",
+             "handoff_id": handoff["handoff_id"]})
+        self.assertEqual(status, 200, back)
+        self.assertEqual(self._poll(handoff)["status"], "ready")
+        exchanged = self._exchange(handoff)
+        self.assertEqual(exchanged["account"]["email"],
+                         "recoverdesk@example.com")
+
+    def test_signin_page_threads_the_handoff_through_both_paths(self):
+        # The page itself: the already-signed-in branch calls the
+        # completion endpoint, and the recovery-code call carries
+        # the handoff id, like the passkey call already did.
+        from npc_verify.signin_page import PAGE
+        self.assertIn("/v1/auth/handoff/complete", PAGE)
+        self.assertIn("completePendingHandoff", PAGE)
+        self.assertGreaterEqual(
+            PAGE.count("handoff_id: handoffId || undefined"), 2)
+
+
 class TestSignInPage(AccountHttpTestCase):
     def test_page_is_served(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port,

@@ -306,6 +306,60 @@ class _FakeTime:
         self.sleeps.append(seconds)
 
 
+    def test_library_suggestion_is_grounded_not_deflected(self):
+        # The live failure of 2026-11-23: "Can you suggest some
+        # agents I should add to my fleet?" drew the canned scope
+        # decline because the corpus held no library facts and the
+        # scope rule did not name agents. The provider here answers
+        # the way the fixed prompt directs, from the materials; the
+        # pins are that the library materials reached the model,
+        # the answer is served (not the decline), and the sources
+        # name the library chunks it came from.
+        def fn(sys_ins, hist, msg):
+            return ("For a fleet, the library lists the Clip Factory "
+                    "Producer, which turns one approved recording "
+                    "into platform-ready clips, and the Market Ear, "
+                    "which watches what people say about your "
+                    "market.", 300, 40)
+        provider = FakeProvider(fn)
+        svc, _store = _service(provider)
+        status, body = svc.post_chat(
+            {"message": "Can you suggest some agents I should add "
+                        "to my fleet?"}, "203.0.113.7")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"], "ok")
+        self.assertNotEqual(body["reply"], chat_mod.SCOPE_DECLINE)
+        self.assertIn("Clip Factory Producer", body["reply"])
+        self.assertIn("The Agent Library", provider.last_system)
+        self.assertIn("Clip Factory Producer", provider.last_system)
+        self.assertTrue(any(s["path"] == "Agent Library"
+                            for s in body["sources"]))
+
+    def test_a_model_verdict_is_replaced_never_shown(self):
+        # Grounding discipline: a verdict on a specific item comes
+        # only from its signed record via Search. If the model
+        # offers one anyway, the post-check replaces the whole
+        # reply with the plain no-answer.
+        def fn(sys_ins, hist, msg):
+            return ("Yes, that agent is verified.", 60, 8)
+        svc, _store = _service(FakeProvider(fn))
+        status, body = svc.post_chat(
+            {"message": "Is the agent with record reg_abc123 "
+                        "verified?"}, "203.0.113.7")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["reply"], chat_mod.NO_ANSWER)
+
+    def test_out_of_scope_still_declines_politely(self):
+        def fn(sys_ins, hist, msg):
+            return (chat_mod.SCOPE_DECLINE, 40, 6)
+        svc, _store = _service(FakeProvider(fn))
+        status, body = svc.post_chat(
+            {"message": "Tell me a joke about pirates."},
+            "203.0.113.7")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["reply"], chat_mod.SCOPE_DECLINE)
+
+
 class TestGeminiProvider(unittest.TestCase):
     """The Oct 21 retry hardening and generation budget (fixes
     b and c from the Oct 18 off-state diagnosis). No network: the
@@ -430,15 +484,31 @@ class TestCorpus(unittest.TestCase):
     def test_corpus_shape(self):
         chunks = chat_mod.load_corpus()
         self.assertGreaterEqual(len(chunks), 40)
-        self.assertLessEqual(len(chunks), 70)
+        self.assertLessEqual(len(chunks), 100)
         hosts = set()
         for c in chunks:
             self.assertTrue(c["title"])
             self.assertTrue(c["text"])
             self.assertNotIn("—", c["text"])
-            hosts.add(c["source"].split("/")[2])
+            if "://" in c["source"]:
+                hosts.add(c["source"].split("/")[2])
+            else:
+                # The one non-URL source: the Agent Library's own
+                # listing, added 2026-11-23 so questions about
+                # agents are grounded instead of deflected.
+                self.assertEqual(c["source"], "Agent Library")
         self.assertEqual(hosts, {"verify.npclabs.xyz", "npclabs.xyz",
                                  "paragraph.com"})
+
+    def test_retrieval_finds_the_library(self):
+        top = chat_mod.retrieve(
+            "Can you suggest some agents I should add to my fleet?")
+        self.assertTrue(top)
+        self.assertTrue(any(c["source"] == "Agent Library"
+                            for c in top))
+        top = chat_mod.retrieve("What does the Clip Factory Producer do?")
+        self.assertTrue(any(c["title"] == "Clip Factory Producer"
+                            for c in top))
 
     def test_retrieval_finds_the_right_pages(self):
         top = chat_mod.retrieve("Where can I use the plugins?")

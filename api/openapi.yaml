@@ -173,6 +173,86 @@ paths:
         '503':
           $ref: '#/components/responses/DetectorUnavailable'
 
+  /videos/ai-check:
+    post:
+      operationId: aiCheckVideo
+      summary: AI-generation check for one short video (Sightengine-backed)
+      description: |
+        The client sends the video's URL; the API fetches the media
+        itself under an SSRF guard and a 50 MB cap and forwards the
+        bytes to Sightengine's genai video model (sync path, clips
+        under a minute). Frame scores are aggregated to a mean
+        percent, with the peak frame percent alongside, inside the
+        signed response. When detection is not configured or the
+        service fails, the answer is an honest 503; no score is
+        faked. A media URL that cannot be fetched answers 422.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AiVideoCheckRequest'
+      responses:
+        '200':
+          description: Detector result, signed like every response
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AiVideoCheckResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '503':
+          $ref: '#/components/responses/DetectorUnavailable'
+
+  /audio/ai-check:
+    post:
+      operationId: aiCheckAudio
+      summary: AI-generation check for one audio file (Sightengine-backed)
+      description: |
+        The client sends the audio file's URL; the API fetches the
+        media itself under an SSRF guard and a 25 MB cap and
+        forwards the bytes to Sightengine's ai_music model. The
+        vendor states the model works best on audio with no vocals.
+        The probability returns as an integer percent inside the
+        signed response. When detection is not configured or the
+        service fails, the answer is an honest 503; no score is
+        faked. A media URL that cannot be fetched answers 422.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AiAudioCheckRequest'
+      responses:
+        '200':
+          description: Detector result, signed like every response
+          headers:
+            X-NPC-Signature:
+              $ref: '#/components/headers/XNPCSignature'
+            X-NPC-Key-ID:
+              $ref: '#/components/headers/XNPCKeyID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AiAudioCheckResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '503':
+          $ref: '#/components/responses/DetectorUnavailable'
+
   /credits/packs:
     get:
       operationId: creditPacks
@@ -1312,6 +1392,121 @@ paths:
         '429': { description: Link attempt cap reached. }
         '503': { description: Identity linking not enabled. }
 
+  /records/{id}/wallet-claim/challenge:
+    post:
+      operationId: startWalletClaimChallenge
+      summary: Issue a wallet-claim challenge for a record
+      description: |
+        The optional per-record wallet claim. Gated by the same
+        NPC_IDENTITY_SIGNALS flag as identity linking: with the
+        flag off this answers 503, and nothing is signed.
+        Ownership is proven by the registration email (compared by
+        hash; attempts counted before the match under the same
+        caps), so claims cover the records that gate can prove
+        ownership of: agent registrations and content
+        registrations. A wrong email and an unknown ID return the
+        same signed "unknown" answer as everywhere else. The
+        response carries the exact message for the owner to sign:
+        the SIWE layout with a claim statement that binds the
+        record ID, the record fingerprint (SHA-256 of the record
+        without its signature envelope), the wallet, a nonce, and
+        an expiry. Signing is a message signature only: no
+        transaction, no token approval, no gas.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, wallet_address]
+              properties:
+                email: { type: string, format: email }
+                wallet_address:
+                  type: string
+                  description: The claiming wallet, as a valid
+                    Ethereum address (checksummed when mixed case).
+      responses:
+        '201': { description: Challenge issued (signed JSON). }
+        '404': { description: Unknown record or email mismatch (signed verdict unknown). }
+        '422': { description: Validation error. }
+        '429': { description: Link attempt cap reached. }
+        '503': { description: Identity linking not enabled. }
+
+  /records/{id}/wallet-claim/verify:
+    post:
+      operationId: verifyWalletClaim
+      summary: Verify a signed claim statement and mint the claim
+      description: |
+        The signature must recover to the challenged wallet, and
+        the message's domain, URI, chain ID, nonce, expiry, and
+        claim statement (record ID and fingerprint) must match the
+        challenge the server issued. Any mismatch fails closed
+        with 422 and nothing is recorded. On success the challenge
+        is consumed (single use) and an npc.wallet.record_claim
+        record is minted naming the wallet as claimant; the same
+        signature also stands behind the record's SIWE
+        wallet-control link when the record has none yet, so one
+        wallet-control proof per record supports its claim. A
+        repeat claim by the same wallet returns the claim already
+        on record (200, created false). The subject record is
+        never edited, and claiming does not change its
+        verification status: a claim shows who claimed the record,
+        and verification stays NPC's own signed decision.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, challenge_id, message, signature]
+              properties:
+                email: { type: string, format: email }
+                challenge_id: { type: string }
+                message: { type: string }
+                signature: { type: string }
+      responses:
+        '201': { description: Claim minted; the signed claim record (signed JSON). }
+        '200': { description: The wallet already claimed this record; the existing claim record. }
+        '404': { description: Unknown record or email mismatch (signed verdict unknown). }
+        '422': { description: Verification failed; nothing recorded. }
+        '429': { description: Link attempt cap reached. }
+        '503': { description: Identity linking not enabled. }
+
+  /records/{id}/wallet-claim:
+    get:
+      operationId: getWalletClaimState
+      summary: Read a record's wallet-claim state
+      description: |
+        Public. Whether a wallet has claimed the record, the
+        claiming wallet (from the latest claim), every claim
+        record on file, and the boundary line: a claim shows who
+        claimed the record, verification is separate, and a claim
+        does not change a record's status. Unknown IDs fail
+        closed. Gated by NPC_IDENTITY_SIGNALS like the rest of
+        the claim surface.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200': { description: Claim state (signed JSON). }
+        '404': { description: Unknown record (signed verdict unknown). }
+        '503': { description: Identity linking not enabled. }
+
   /records/{id}/identity-links/{provider}/start:
     post:
       operationId: startOAuthLink
@@ -2392,6 +2587,84 @@ components:
           type: ['string', 'null']
           description: SHA-256 hex of the image bytes (bytes mode only)
         source: { type: string, enum: [bytes, url] }
+        checked_at: { type: string, format: date-time }
+
+    AiVideoCheckRequest:
+      type: object
+      required: [video_url]
+      additionalProperties: false
+      properties:
+        video_url:
+          type: string
+          maxLength: 2048
+          description: http(s) URL of the video; the API fetches it (50 MB cap)
+        interval_seconds:
+          type: number
+          enum: [0.5, 1, 2, 3, 4, 5]
+          default: 2
+          description: Frame sampling interval for the video model
+
+    AiVideoCheckResult:
+      type: object
+      required: [check, provider, model, ai_generated_percent,
+                 ai_generated_percent_peak, frames_analyzed,
+                 frames_flagged, interval_ms, video_sha256, source,
+                 vendor_operations, checked_at]
+      properties:
+        check: { type: string, const: ai_generation_video }
+        provider: { type: string, const: sightengine }
+        model: { type: string, const: genai }
+        ai_generated_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Mean of the per-frame ai_generated probabilities, as a percent
+        ai_generated_percent_peak:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Highest single-frame ai_generated probability, as a percent
+        frames_analyzed: { type: integer }
+        frames_flagged:
+          type: integer
+          description: Frames scoring at least 0.5 ai_generated
+        interval_ms: { type: integer }
+        video_sha256:
+          type: string
+          description: SHA-256 hex of the exact video bytes analyzed
+        source: { type: string, const: url }
+        vendor_operations:
+          type: ['integer', 'null']
+          description: Sightengine operations consumed, when reported
+        checked_at: { type: string, format: date-time }
+
+    AiAudioCheckRequest:
+      type: object
+      required: [audio_url]
+      additionalProperties: false
+      properties:
+        audio_url:
+          type: string
+          maxLength: 2048
+          description: http(s) URL of the audio file; the API fetches it (25 MB cap)
+
+    AiAudioCheckResult:
+      type: object
+      required: [check, provider, model, ai_generated_percent,
+                 audio_sha256, source, checked_at]
+      properties:
+        check: { type: string, const: ai_generation_music }
+        provider: { type: string, const: sightengine }
+        model: { type: string, const: ai_music }
+        ai_generated_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Sightengine ai_music probability as a percent
+        audio_sha256:
+          type: string
+          description: SHA-256 hex of the exact audio bytes analyzed
+        source: { type: string, const: url }
         checked_at: { type: string, format: date-time }
 
     OnchainAnchor:

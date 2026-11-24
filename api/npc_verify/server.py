@@ -24,6 +24,14 @@ Endpoints:
   POST /v1/attestations                   (issuer only)
   POST /v1/images/ai-check                (verifier+; Sightengine-backed,
                                            signed like every response)
+  POST /v1/videos/ai-check                (verifier+; Sightengine-backed
+                                           sync short-video check; the API
+                                           fetches the media URL itself
+                                           under an SSRF guard and a size
+                                           cap; signed like every response)
+  POST /v1/audio/ai-check                 (verifier+; Sightengine-backed
+                                           music check; same fetch model,
+                                           signed like every response)
   POST /v1/pact/grants                    (issuer only; mints the signed
                                            consent record at issuance)
   POST /v1/pact/grants/{id}/receipts      (issuer only; appends a receipt
@@ -67,6 +75,12 @@ Endpoints:
                                            while NPC_SOCIAL_PROFILES=1)
   POST /v1/records/{id}/identity-links/siwe/challenge
   POST /v1/records/{id}/identity-links/siwe/verify
+  POST /v1/records/{id}/wallet-claim/challenge
+  POST /v1/records/{id}/wallet-claim/verify
+  GET  /v1/records/{id}/wallet-claim       (PUBLIC; the record's
+                                           wallet-claim state. The
+                                           three claim routes share
+                                           the linking flag)
   POST /v1/records/{id}/identity-links/{github|google}/start
   GET  /v1/link/{github|google}/callback
   POST /v1/records/{id}/identity-links/coinbase/refresh
@@ -99,6 +113,41 @@ Endpoints:
   POST /v1/chat/feedback                  (PUBLIC; thumbs feedback on a
                                            chat turn; UNSIGNED,
                                            best-effort, never an error)
+  POST /v1/account/checks/image           (account session; AI image
+                                           check charged to the
+                                           account's own balance and
+                                           recorded in the account's
+                                           history; a body code is
+                                           still honored for older
+                                           clients)
+  POST /v1/account/checks/video           (account session; AI video
+                                           check, same charging and
+                                           recording)
+  GET  /v1/account/checks                 (account session; the
+                                           account's recorded checks,
+                                           newest first)
+  GET  /v1/account/balance                (account session; the
+                                           account's own check
+                                           balance on the credit
+                                           ledger)
+  GET  /v1/account/fleet                  (account session; the
+                                           account's own agent
+                                           registrations, newest
+                                           first, with counts and
+                                           attestation summaries)
+  POST /v1/agents/{record_id}/runs        (account session; run the
+                                           stored pack of an agent
+                                           registration the account
+                                           owns: signed run record,
+                                           charged exactly once on
+                                           completion only, at the
+                                           NPC_RUN_RATES draft bands)
+  POST /v1/auth/handoff/complete          (account session; complete
+                                           a pending desktop handoff
+                                           from an existing web
+                                           session, the sign-in
+                                           page's already-signed-in
+                                           branch)
 
 Fail-closed: unknown subjects -> 404 {"verdict": "unknown"}.
 """
@@ -121,6 +170,9 @@ from .canonical import (canonicalize, claim_hash_for_text,
                         normalize_claim_text)
 from .detector import (DetectorError, DetectorNotConfigured,
                        detector_from_env)
+from .av_detector import (DEFAULT_INTERVAL_SECONDS, VIDEO_INTERVALS,
+                          av_detectors_from_env)
+from .media_fetch import FetchError, fetch_media_bytes
 from .keys import KeyRegistry
 from .models import Attestation, utcnow_iso
 from . import chat as chat_module
@@ -129,7 +181,9 @@ from . import anchor as anchor_module
 from . import linking as linking_module
 from . import mailer as mailer_module
 from . import accounts as accounts_module
+from . import uploads as uploads_module
 from . import signin_page as signin_page_module
+from . import runs as runs_module
 from . import social as social_module
 from . import kya as kya_module
 from . import pact
@@ -165,6 +219,25 @@ MAX_BODY = 1024 * 1024  # 1 MiB
 # 750 KB of image keeps the JSON body under MAX_BODY.
 MAX_IMAGE_BYTES = 750 * 1000
 MAX_IMAGE_URL = 2048
+# AV check caps. Media arrives by URL only (the JSON body cap and
+# the vendor's upload endpoints rule out inline media at these
+# sizes); the API fetches the bytes itself under these caps. The
+# video cap matches the vendor Starter plan's 50 MB file limit;
+# audio has no published vendor cap, so a conservative 25 MB stands.
+MAX_MEDIA_URL = 2048
+MAX_VIDEO_BYTES = 50 * 1000 * 1000
+MAX_AUDIO_BYTES = 25 * 1000 * 1000
+# Staged-upload caps (v6.11, npc_verify.uploads). Video and audio
+# reuse the URL lane's caps above; the staged image cap is new:
+# the 750 KB inline cap is a transport cap (MAX_BODY), not a
+# detector cap, and 10 MB covers ordinary phone photos while
+# staying small enough to hold in memory and hand to the vendor
+# in one request. uploads.MEDIA_CAPS carries the same numbers for
+# the presign route; the two must agree.
+MAX_STAGED_IMAGE_BYTES = 10 * 1000 * 1000
+assert uploads_module.MEDIA_CAPS == {
+    "video": MAX_VIDEO_BYTES, "audio": MAX_AUDIO_BYTES,
+    "image": MAX_STAGED_IMAGE_BYTES}
 CHAIN_STATUS = {"network": "base", "anchoring": "live",
                 "mode": "local-first",
                 "note": "Records anchor to Base in signed Merkle "
@@ -537,7 +610,9 @@ class App:
     def __init__(self, db_path: str, keys_dir: str, detector=None,
                  fetcher=None, chat_provider=None, chat_config=None,
                  mailer=None, link_http=None, coinbase_reader=None,
-                 payments=None, anchor_chain=None):
+                 payments=None, anchor_chain=None, video_detector=None,
+                 audio_detector=None, media_fetcher=None,
+                 staging_store=None):
         self.store = make_store(db_path)
         self.keys = KeyRegistry(self.store, keys_dir)
         self.auth = Auth(self.store)
@@ -546,6 +621,25 @@ class App:
         # server environment only. Tests inject a fake detector here.
         self.detector = detector if detector is not None \
             else detector_from_env()
+        # AI video/audio detection (Sightengine, the same server
+        # credentials as the image detector). Tests inject fake
+        # detectors here.
+        env_video, env_audio = av_detectors_from_env()
+        self.video_detector = video_detector \
+            if video_detector is not None else env_video
+        self.audio_detector = audio_detector \
+            if audio_detector is not None else env_audio
+        # SSRF-guarded fetcher for the AV routes' media URLs
+        # (npc_verify.media_fetch). Tests inject a fake here.
+        self.media_fetcher = media_fetcher if media_fetcher is not None \
+            else fetch_media_bytes
+        # Staged media uploads (v6.11, npc_verify.uploads). The
+        # store comes from the environment (NPC_STAGING_BUCKET)
+        # when not injected; with no bucket the uploads route
+        # answers honestly (503) and staged checks cannot resolve.
+        # Tests inject a MemoryStagingStore here.
+        self.staging = staging_store if staging_store is not None \
+            else uploads_module.staging_from_env()
         # Biblo site chat (biblo-chat spec). The provider comes from
         # the environment (NPC_CHAT_LLM_API_KEY) when not injected;
         # with no key the service rests instead of failing. Tests and
@@ -604,6 +698,12 @@ class App:
         self.accounts = accounts_module.AccountService(
             self.store, self.mailer,
             accounts_module.config_from_env())
+        # Server-side agent runs (npc_verify.runs). The service
+        # executes through the chat service's provider (the API's
+        # existing LLM chat path), read live per run, so tests that
+        # inject a chat provider drive runs with the same fake.
+        self.runs = runs_module.RunService(
+            self.store, self.keys, chat_service=self.chat)
         self.keys.ensure_bootstrap()
         # Trust-layer memory shares the API store's connection and
         # lock on the SQLite backend. The DynamoDB backend has no
@@ -726,6 +826,116 @@ class App:
                 },
             }
 
+        def _image_check_core(body, staged_bytes=None):
+            """The shared image AI-check core: validate + detect.
+
+            Returns (status, body, info). On any failure status/body
+            are the error tuple to answer with and info is None; on
+            success body is the flat check body and info carries
+            {"image_bytes": ..., "image_url": ...} for the caller's
+            bookkeeping. The verifier route answers with the body
+            alone; the account session route adds credit charging
+            and history recording on top of the same core, so both
+            lanes run the identical validation and detection.
+
+            staged_bytes (v6.11) is the account lane's staged-upload
+            path: the bytes were read from the staging bucket by
+            the account route, so no URL or base64 rides the body,
+            and the cap is the staged image cap, not the inline
+            transport cap. The verifier route never passes it.
+            """
+            if not isinstance(body, dict):
+                status, err = errors.bad_request(
+                    "JSON object body required")
+                return status, err, None
+            if staged_bytes is not None:
+                if not staged_bytes:
+                    status, err = errors.bad_request(
+                        "the staged upload holds no image bytes")
+                    return status, err, None
+                if len(staged_bytes) > MAX_STAGED_IMAGE_BYTES:
+                    status, err = errors.bad_request(
+                        "image is too large for this check")
+                    return status, err, None
+                return _detect_image(staged_bytes, None,
+                                     source="upload")
+            image_url = body.get("image_url")
+            image_b64 = body.get("image_base64")
+            if (image_url is None) == (image_b64 is None):
+                status, err = errors.bad_request(
+                    "provide exactly one of image_url or image_base64")
+                return status, err, None
+            image_bytes = None
+            if image_b64 is not None:
+                if not isinstance(image_b64, str):
+                    status, err = errors.bad_request(
+                        "image_base64 must be a string")
+                    return status, err, None
+                try:
+                    image_bytes = base64.b64decode(image_b64,
+                                                   validate=True)
+                except Exception:
+                    status, err = errors.bad_request(
+                        "image_base64 must be valid base64")
+                    return status, err, None
+                if not image_bytes:
+                    status, err = errors.bad_request(
+                        "image_base64 decodes to no image bytes")
+                    return status, err, None
+                if len(image_bytes) > MAX_IMAGE_BYTES:
+                    status, err = errors.bad_request(
+                        "image is too large for this check")
+                    return status, err, None
+            else:
+                if not isinstance(image_url, str) \
+                        or len(image_url) > MAX_IMAGE_URL \
+                        or not (image_url.startswith("https://")
+                                or image_url.startswith("http://")):
+                    status, err = errors.bad_request(
+                        "image_url must be an http(s) URL")
+                    return status, err, None
+            return _detect_image(
+                image_bytes, image_url,
+                source="bytes" if image_bytes is not None else "url")
+
+        def _detect_image(image_bytes, image_url, source):
+            """Run the image detector over bytes or a URL and shape
+            the flat check body. Exactly one of image_bytes /
+            image_url is given; source is the word the signed body
+            carries for how the media arrived ("bytes", "url", or
+            "upload" for a staged file)."""
+            detector = app.detector
+            if detector is None or not detector.configured:
+                status, err = errors.detector_unavailable(
+                    "AI generation detection is not configured on "
+                    "this API")
+                return status, err, None
+            try:
+                prob = detector.check_ai(image_bytes=image_bytes,
+                                         image_url=image_url)
+            except DetectorNotConfigured:
+                status, err = errors.detector_unavailable(
+                    "AI generation detection is not configured on "
+                    "this API")
+                return status, err, None
+            except DetectorError:
+                status, err = errors.detector_unavailable(
+                    "the detection service could not complete the "
+                    "check")
+                return status, err, None
+            percent = int(prob * 100 + 0.5)
+            percent = max(0, min(100, percent))
+            return 200, {
+                "check": "ai_generation",
+                "provider": detector.provider,
+                "model": detector.model,
+                "ai_generated_percent": percent,
+                "image_sha256": (hashlib.sha256(image_bytes).hexdigest()
+                                 if image_bytes is not None else None),
+                "source": source,
+                "checked_at": utcnow_iso(),
+            }, {"image_bytes": image_bytes, "image_url": image_url}
+
         @app.route("POST", r"^/v1/images/ai-check$")
         @app.require_role("verifier")
         def ai_check_image(req):
@@ -740,65 +950,211 @@ class App:
             When detection is off or the service fails, the answer is
             an honest 503. A score is never fabricated.
             """
-            if not isinstance(req.body, dict):
-                return errors.bad_request("JSON object body required")
-            image_url = req.body.get("image_url")
-            image_b64 = req.body.get("image_base64")
-            if (image_url is None) == (image_b64 is None):
-                return errors.bad_request(
-                    "provide exactly one of image_url or image_base64")
-            image_bytes = None
-            if image_b64 is not None:
-                if not isinstance(image_b64, str):
-                    return errors.bad_request(
-                        "image_base64 must be a string")
-                try:
-                    image_bytes = base64.b64decode(image_b64,
-                                                   validate=True)
-                except Exception:
-                    return errors.bad_request(
-                        "image_base64 must be valid base64")
-                if not image_bytes:
-                    return errors.bad_request(
-                        "image_base64 decodes to no image bytes")
-                if len(image_bytes) > MAX_IMAGE_BYTES:
-                    return errors.bad_request(
-                        "image is too large for this check")
+            status, body, _info = _image_check_core(req.body)
+            return status, body
+
+        # -- AI video / audio checks (npc_verify.av_detector) --------
+        # Media arrives by URL: the JSON body cap and the
+        # vendor's upload endpoints rule out inline media at these
+        # sizes, so the API fetches the bytes itself through the
+        # SSRF-guarded fetcher (npc_verify.media_fetch) under a hard
+        # cap and forwards them to the vendor. Since v6.11 the
+        # account lane can also hand a core staged_bytes read from
+        # the private staging bucket (npc_verify.uploads): the same
+        # caps, the same hashing, the same detector call, with no
+        # fetch and no public URL. Responses are flat
+        # signed bodies in the image check's shape: percents are
+        # integers because the signed envelope (NPC-JCS-v1) is
+        # defined over strings, booleans, integers and nulls. When
+        # detection is off or the service fails, the answer is an
+        # honest 503. A score is never fabricated.
+
+        def _av_percent(prob):
+            pct = int(prob * 100 + 0.5)
+            return max(0, min(100, pct))
+
+        def _av_media_url(body, field):
+            if not isinstance(body, dict):
+                return None, errors.bad_request(
+                    "JSON object body required")
+            url = body.get(field)
+            if url is None:
+                return None, errors.bad_request(f"{field} is required")
+            if not isinstance(url, str) or len(url) > MAX_MEDIA_URL \
+                    or not (url.startswith("https://")
+                            or url.startswith("http://")):
+                return None, errors.bad_request(
+                    f"{field} must be an http(s) URL")
+            extra = set(body) - {field, "interval_seconds"}
+            if extra:
+                return None, errors.bad_request(
+                    "unexpected fields: " + ", ".join(sorted(extra)))
+            return url, None
+
+        def _video_check_core(body, staged_bytes=None):
+            """The shared video AI-check core: validate + fetch +
+            detect. Returns (status, body, info) in the image core's
+            shape; on success info carries {"video_url": url} for
+            the URL path or {"video_url": None} for a staged upload.
+            The verifier route answers with the body alone; the
+            account session route adds credit charging and history
+            recording on top of the same core. staged_bytes (v6.11)
+            skips the URL validation and the fetch: the account
+            route read the bytes from the staging bucket, and the
+            same byte cap applies."""
+            if staged_bytes is not None:
+                if not isinstance(body, dict):
+                    status, err_body = errors.bad_request(
+                        "JSON object body required")
+                    return status, err_body, None
+                extra = set(body) - {"interval_seconds"}
+                if extra:
+                    status, err_body = errors.bad_request(
+                        "unexpected fields: "
+                        + ", ".join(sorted(extra)))
+                    return status, err_body, None
+                url = None
             else:
-                if not isinstance(image_url, str) \
-                        or len(image_url) > MAX_IMAGE_URL \
-                        or not (image_url.startswith("https://")
-                                or image_url.startswith("http://")):
-                    return errors.bad_request(
-                        "image_url must be an http(s) URL")
-            detector = app.detector
+                url, err = _av_media_url(body, "video_url")
+                if err is not None:
+                    status, err_body = err
+                    return status, err_body, None
+            interval = body.get("interval_seconds",
+                                DEFAULT_INTERVAL_SECONDS)
+            if isinstance(interval, bool) \
+                    or interval not in VIDEO_INTERVALS:
+                status, err_body = errors.bad_request(
+                    "interval_seconds must be one of "
+                    "0.5, 1, 2, 3, 4, 5")
+                return status, err_body, None
+            detector = app.video_detector
             if detector is None or not detector.configured:
-                return errors.detector_unavailable(
-                    "AI generation detection is not configured on "
-                    "this API")
+                status, err_body = errors.detector_unavailable(
+                    "AI video detection is not configured on this API")
+                return status, err_body, None
+            if staged_bytes is not None:
+                if not staged_bytes:
+                    status, err_body = errors.bad_request(
+                        "the staged upload holds no video bytes")
+                    return status, err_body, None
+                if len(staged_bytes) > MAX_VIDEO_BYTES:
+                    status, err_body = errors.bad_request(
+                        "video is too large for this check")
+                    return status, err_body, None
+                video_bytes = staged_bytes
+            else:
+                try:
+                    video_bytes = app.media_fetcher(url, MAX_VIDEO_BYTES)
+                except FetchError as exc:
+                    status, err_body = errors.unprocessable(str(exc))
+                    return status, err_body, None
             try:
-                prob = detector.check_ai(image_bytes=image_bytes,
-                                         image_url=image_url)
+                result = detector.check_ai_video(
+                    video_bytes=video_bytes, interval_seconds=interval)
             except DetectorNotConfigured:
-                return errors.detector_unavailable(
-                    "AI generation detection is not configured on "
-                    "this API")
+                status, err_body = errors.detector_unavailable(
+                    "AI video detection is not configured on this API")
+                return status, err_body, None
             except DetectorError:
-                return errors.detector_unavailable(
+                status, err_body = errors.detector_unavailable(
                     "the detection service could not complete the "
                     "check")
-            percent = int(prob * 100 + 0.5)
-            percent = max(0, min(100, percent))
+                return status, err_body, None
             return 200, {
-                "check": "ai_generation",
+                "check": "ai_generation_video",
                 "provider": detector.provider,
                 "model": detector.model,
-                "ai_generated_percent": percent,
-                "image_sha256": (hashlib.sha256(image_bytes).hexdigest()
-                                 if image_bytes is not None else None),
-                "source": "bytes" if image_bytes is not None else "url",
+                "ai_generated_percent": _av_percent(result.mean),
+                "ai_generated_percent_peak": _av_percent(result.peak),
+                "frames_analyzed": len(result.frames),
+                "frames_flagged": result.flagged,
+                "interval_ms": int(interval * 1000),
+                "video_sha256": hashlib.sha256(video_bytes).hexdigest(),
+                "source": "upload" if staged_bytes is not None else "url",
+                "vendor_operations": result.operations,
                 "checked_at": utcnow_iso(),
-            }
+            }, {"video_url": url}
+
+        @app.route("POST", r"^/v1/videos/ai-check$")
+        @app.require_role("verifier")
+        def ai_check_video(req):
+            """AI-generation check for one short video, via
+            Sightengine. Sync vendor path: clips under a minute."""
+            status, body, _info = _video_check_core(req.body)
+            return status, body
+
+        def _audio_check_core(body, staged_bytes=None):
+            """The shared audio AI-check core: validate + fetch +
+            detect, in the video core's shape. On success info
+            carries {"audio_url": url} for the URL path or
+            {"audio_url": None} for a staged upload (v6.11: the
+            account route read the bytes from the staging bucket,
+            and the same byte cap applies)."""
+            if staged_bytes is not None:
+                if not isinstance(body, dict):
+                    status, err_body = errors.bad_request(
+                        "JSON object body required")
+                    return status, err_body, None
+                if set(body) - {"upload_id"}:
+                    status, err_body = errors.bad_request(
+                        "unexpected fields: "
+                        + ", ".join(sorted(set(body) - {"upload_id"})))
+                    return status, err_body, None
+                url = None
+            else:
+                url, err = _av_media_url(body, "audio_url")
+                if err is not None:
+                    status, err_body = err
+                    return status, err_body, None
+            detector = app.audio_detector
+            if detector is None or not detector.configured:
+                status, err_body = errors.detector_unavailable(
+                    "AI music detection is not configured on this API")
+                return status, err_body, None
+            if staged_bytes is not None:
+                if not staged_bytes:
+                    status, err_body = errors.bad_request(
+                        "the staged upload holds no audio bytes")
+                    return status, err_body, None
+                if len(staged_bytes) > MAX_AUDIO_BYTES:
+                    status, err_body = errors.bad_request(
+                        "audio is too large for this check")
+                    return status, err_body, None
+                audio_bytes = staged_bytes
+            else:
+                try:
+                    audio_bytes = app.media_fetcher(url, MAX_AUDIO_BYTES)
+                except FetchError as exc:
+                    status, err_body = errors.unprocessable(str(exc))
+                    return status, err_body, None
+            try:
+                prob = detector.check_ai_music(audio_bytes=audio_bytes)
+            except DetectorNotConfigured:
+                status, err_body = errors.detector_unavailable(
+                    "AI music detection is not configured on this API")
+                return status, err_body, None
+            except DetectorError:
+                status, err_body = errors.detector_unavailable(
+                    "the detection service could not complete the "
+                    "check")
+                return status, err_body, None
+            return 200, {
+                "check": "ai_generation_music",
+                "provider": detector.provider,
+                "model": detector.model,
+                "ai_generated_percent": _av_percent(prob),
+                "audio_sha256": hashlib.sha256(audio_bytes).hexdigest(),
+                "source": "upload" if staged_bytes is not None else "url",
+                "checked_at": utcnow_iso(),
+            }, {"audio_url": url}
+
+        @app.route("POST", r"^/v1/audio/ai-check$")
+        @app.require_role("verifier")
+        def ai_check_audio(req):
+            """AI-generation check for one audio file, via the
+            Sightengine ai_music model."""
+            status, body, _info = _audio_check_core(req.body)
+            return status, body
 
         # -- paid check credits (npc_verify.credits) --------------------
         # Public by design: the redeem code is the credential, the
@@ -898,6 +1254,24 @@ class App:
                         "referral_code must be a valid NPC code")
                 referral_hash = credits_module.code_hash(
                     referral_code)
+            # A signed-in buyer's purchase belongs to their account
+            # (Bayo's ruling, 2026-11-22): when the request carries
+            # an account session, the purchase records the account,
+            # completion credits the account's own balance instead
+            # of minting a code, and the buyer's email defaults to
+            # the account's. A presented session that does not
+            # authenticate refuses the checkout outright, rather
+            # than quietly selling a code to someone who believes
+            # they are buying into their account.
+            account_id = None
+            if req.headers.get("authorization"):
+                ctx = _account_ctx(req)
+                if ctx is None:
+                    return errors.unauthorized()
+                account, _session = ctx
+                account_id = account["account_id"]
+                if email is None:
+                    email = account.get("email")
             if not getattr(app.payments, "configured", False):
                 return errors.unavailable(
                     "payments_not_configured",
@@ -919,7 +1293,7 @@ class App:
                     "the payment provider could not start checkout")
             app.store.create_credit_purchase(
                 session["id"], pack["id"], email, utcnow_iso(),
-                referral_hash=referral_hash)
+                referral_hash=referral_hash, account_id=account_id)
             return 201, {"session_id": session["id"],
                          "checkout_url": session["url"],
                          "pack_id": pack["id"]}
@@ -989,9 +1363,43 @@ class App:
                         elif isinstance(obj.get("customer_email"),
                                         str) and obj["customer_email"]:
                             email = obj["customer_email"]
-                        code = credits_module.generate_code()
                         now = utcnow_iso()
-                        if pack.get("kind") == "access" and isinstance(
+                        # A purchase made while signed in credits
+                        # the buyer's account balance and mints no
+                        # code (2026-11-22): no code email is sent
+                        # (there is no code to send; Stripe's own
+                        # receipt covers the payment, and the balance
+                        # is read in the account), and the code-to-
+                        # code referral block below does not apply.
+                        account_hash = None
+                        if purchase.get("account_id"):
+                            account_hash = credits_module \
+                                .account_ledger_hash(
+                                    purchase["account_id"])
+                        if account_hash is not None and pack.get(
+                                "kind") == "access" and isinstance(
+                                obj.get("subscription"), str):
+                            subscription_id = obj.get("subscription")
+                            invoice_id = obj.get("invoice")
+                            grant_id = invoice_id \
+                                if isinstance(invoice_id, str) \
+                                and invoice_id else \
+                                "first:" + session_id
+                            row = app.store.activate_account_pass(
+                                session_id, account_hash, pack, email,
+                                subscription_id
+                                if isinstance(subscription_id, str)
+                                else None,
+                                obj.get("customer")
+                                if isinstance(obj.get("customer"), str)
+                                else None,
+                                grant_id, now,
+                                credits_module.grant_expiry(now))
+                        elif account_hash is not None:
+                            row = app.store.complete_account_purchase(
+                                session_id, account_hash, pack, email,
+                                now)
+                        elif pack.get("kind") == "access" and isinstance(
                                 obj.get("subscription"), str):
                             # The Verifier Pass: open the
                             # subscription and land the first
@@ -1000,6 +1408,7 @@ class App:
                             # names one, so a replay can never
                             # double-grant (activation itself is
                             # also idempotent in the store).
+                            code = credits_module.generate_code()
                             subscription_id = obj.get("subscription")
                             invoice_id = obj.get("invoice")
                             grant_id = invoice_id \
@@ -1022,6 +1431,7 @@ class App:
                                 mailer_module.send_verifier_pass(
                                     app.mailer, email, code, pack)
                         else:
+                            code = credits_module.generate_code()
                             row = app.store.complete_credit_purchase(
                                 session_id,
                                 credits_module.code_hash(code), code,
@@ -1029,7 +1439,7 @@ class App:
                             if row is not None:
                                 mailer_module.send_credit_code(
                                     app.mailer, email, code, pack)
-                        if row is not None:
+                        if row is not None and account_hash is None:
                             # Every minted code, pack or Pass,
                             # carries a personal referral code
                             # (hash-only; its plaintext rests until
@@ -1120,6 +1530,12 @@ class App:
                 return 404, {"error": "session_not_found"}
             body = {"status": purchase["status"],
                     "pack_id": purchase["pack_id"]}
+            if purchase.get("account_id"):
+                # A signed-in purchase credits the account balance;
+                # there is no code to deliver for it, on this call
+                # or any other.
+                body["account_credited"] = \
+                    purchase["status"] == "paid"
             if purchase["status"] == "paid":
                 pack = credits_module.find_pack(
                     app.credit_packs, purchase["pack_id"])
@@ -1851,6 +2267,87 @@ class App:
             if problems:
                 return _link_not_configured(provider)
             return 201, dict({"record_id": id}, **out)
+
+        # -- Per-record wallet claims --------------------------------
+        # The optional claim layer over wallet control: the owner
+        # signs one readable statement naming the exact record and
+        # its fingerprint, and the claim is minted as its own signed
+        # record. Ownership is proven through the same gate as every
+        # link (the registration email, attempts counted first), so
+        # claims cover the records that gate can prove ownership of:
+        # agent registrations and content registrations. A claim
+        # never edits the record and never changes its status.
+
+        def _wallet_claim_challenge_impl(req, id):
+            err, subject, email = _identity_gate(req, id)
+            if err is not None:
+                return err
+            wallet = req.body.get("wallet_address")
+            if not linking_module.valid_wallet(wallet):
+                return errors.unprocessable(
+                    "wallet_address must be a valid Ethereum "
+                    "address")
+            out = linking_module.start_wallet_claim_challenge(
+                app.store, subject, email, wallet, utcnow_iso())
+            return 201, {"record_id": id, "challenge": out}
+
+        @app.route("POST",
+                   r"^/v1/records/(?P<id>[^/]{1,128})"
+                   r"/wallet-claim/challenge$")
+        def wallet_claim_challenge(req, id):
+            return app._idempotent(
+                req, "POST /v1/records/%s/wallet-claim/challenge"
+                % id,
+                lambda: _wallet_claim_challenge_impl(req, id))
+
+        def _wallet_claim_verify_impl(req, id):
+            err, subject, _email = _identity_gate(req, id)
+            if err is not None:
+                return err
+            challenge_id = req.body.get("challenge_id")
+            message = req.body.get("message")
+            signature = req.body.get("signature")
+            if not isinstance(challenge_id, str) \
+                    or not isinstance(message, str) \
+                    or not isinstance(signature, str):
+                return errors.bad_request(
+                    "challenge_id, message, and signature are "
+                    "required strings")
+            rec, created, problems = \
+                linking_module.complete_wallet_claim(
+                    app.store, app.keys, subject, challenge_id,
+                    message, signature, utcnow_iso())
+            if problems:
+                return errors.unprocessable("; ".join(problems))
+            return (201 if created else 200), {
+                "record_id": id, "claim": rec, "created": created,
+                "wallet_claimed_by": rec["wallet_claimed_by"]}
+
+        @app.route("POST",
+                   r"^/v1/records/(?P<id>[^/]{1,128})"
+                   r"/wallet-claim/verify$")
+        def wallet_claim_verify(req, id):
+            return app._idempotent(
+                req, "POST /v1/records/%s/wallet-claim/verify" % id,
+                lambda: _wallet_claim_verify_impl(req, id))
+
+        @app.route("GET",
+                   r"^/v1/records/(?P<id>[^/]{1,128})"
+                   r"/wallet-claim$")
+        def wallet_claim_state(req, id):
+            """The record's wallet-claim state (PUBLIC): whether a
+            wallet has claimed it, and the claim records. Unknown
+            IDs fail closed, same answer as everywhere."""
+            if not linking_module.linking_enabled():
+                return errors.unavailable(
+                    "identity_linking_not_enabled",
+                    "wallet claiming is not enabled on this "
+                    "deployment")
+            subject = app.store.get_registration(id)
+            if subject is None:
+                return errors.unknown()
+            return 200, linking_module.build_wallet_claim_state(
+                app.store, subject)
 
         @app.route("POST",
                    r"^/v1/records/(?P<id>[^/]{1,128})"
@@ -2930,7 +3427,8 @@ class App:
                 lambda: app.accounts.redeem_recovery_code(
                     body.get("email"), body.get("code"),
                     surface=body.get("surface") or "web",
-                    device_label=body.get("device_label") or ""))
+                    device_label=body.get("device_label") or "",
+                    handoff_id=body.get("handoff_id")))
 
         @app.route("GET", r"^/v1/auth/me$")
         def auth_me(req):
@@ -2995,6 +3493,510 @@ class App:
             body = req.body or {}
             return _account_call(lambda: app.accounts.exchange_handoff(
                 body.get("handoff_id"), body.get("secret")))
+
+        @app.route("POST", r"^/v1/auth/handoff/complete$")
+        def auth_handoff_complete(req):
+            """Complete a pending desktop handoff from an existing
+            web session (the sign-in page's already-signed-in
+            branch): the browser that already holds a session asks,
+            with that session, for the pending handoff named in the
+            page's query string to be readied for the desktop app,
+            exactly as a fresh sign-in would ready it."""
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, _session = ctx
+            body = req.body or {}
+            return _account_call(
+                lambda: app.accounts.complete_handoff_for_session(
+                    account, body.get("handoff_id")))
+
+        # -- account check history + session checks (Biblo tab) --------
+        # A signed-in account runs AI checks under its session alone:
+        # no client ever holds a verifier key, and the server runs
+        # the same check cores the verifier routes run. The check
+        # pays from the account's own balance on the credit ledger
+        # (Bayo's ruling, 2026-11-22: account balance, no codes in
+        # the desktop app): the ledger row keyed by the account id
+        # (credits.account_ledger_hash), created empty on first use.
+        # A body that still presents a check code is honored (older
+        # clients), and that code pays exactly as before. The
+        # balance is peeked before the detector runs, so a balance
+        # with no AI checks is answered 402 without spending a
+        # detection call; a failed or unreachable check never
+        # consumes and is never recorded; a repeat check of the same
+        # media is the ledger's duplicate and is never charged
+        # twice. Every completed check lands in the account's
+        # history with the exact result body it was answered with,
+        # so any surface signed into the account can pull the same
+        # past checks up. History holds session checks only: checks
+        # run under verifier API keys were recorded against codes in
+        # the credit ledger, not against accounts, and carry no
+        # stored result body.
+
+        def _run_account_check(req, core_body, core, media_of,
+                               staged=None):
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, _session = ctx
+            if isinstance(req.body, dict) and req.body.get("code"):
+                code_hash, err = _code_from_body(req)
+                if err:
+                    return err
+            else:
+                code_hash = credits_module.account_ledger_hash(
+                    account["account_id"])
+                app.store.ensure_account_ledger(
+                    account["account_id"], account.get("email"),
+                    utcnow_iso())
+            row = app.store.get_credit_code(code_hash, utcnow_iso())
+            if row is None:
+                return 404, {"error": "code_not_found"}
+            if row["status"] == "revoked":
+                return 403, {"error": "code_revoked"}
+            if row.get("ai_balance", 0) < 1:
+                body = _credit_body(row)
+                body["error"] = "no_ai_credits"
+                return 402, body
+            # Staged uploads (v6.11): the balance peek above runs
+            # first on purpose, so a balance that cannot fund the
+            # check leaves the upload staged and usable. From the
+            # claim on, the attempt owns the upload: it is consumed
+            # exactly once, and the staged object is deleted when
+            # the attempt completes, on success and on failure
+            # alike (the finally below). Every return before the
+            # claim leaves the upload untouched.
+            claimed = False
+            staged_bytes = None
+            if staged is not None:
+                if not app.store.claim_account_upload(
+                        account["account_id"], staged["upload_id"]):
+                    return errors.conflict(
+                        "that upload was already used")
+                claimed = True
+            try:
+                if staged is not None:
+                    try:
+                        staged_bytes = app.staging.get_bytes(
+                            staged["object_key"])
+                    except uploads_module.StagingError:
+                        return errors.unprocessable(
+                            "the staged upload could not be read")
+                    cap = uploads_module.MEDIA_CAPS[
+                        staged["media_type"]]
+                    if len(staged_bytes) > cap:
+                        return errors.bad_request(
+                            "the uploaded file is larger than the"
+                            " size allowed for this check")
+                    if len(staged_bytes) != staged["size_bytes"]:
+                        return errors.bad_request(
+                            "the uploaded file does not match the"
+                            " size declared for it")
+                status, result, info = core(
+                    core_body, staged_bytes=staged_bytes)
+                if info is None:
+                    return status, result
+                return _finish_account_check(
+                    account, code_hash, result, info, media_of)
+            finally:
+                if claimed:
+                    app.staging.delete(staged["object_key"])
+
+        def _finish_account_check(account, code_hash, result, info,
+                                  media_of):
+            """Charge (exactly once), record, and answer a completed
+            account check. Split from _run_account_check so the
+            staged-upload claim/delete wrapper above stays thin."""
+            media_ref, media_sha256, identity = media_of(result, info)
+            outcome = app.store.consume_credit(
+                code_hash, identity, None,
+                "chg_" + uuid.uuid4().hex, utcnow_iso(), kind="ai",
+                hourly_limit=credits_module.CONSUME_HOURLY_LIMIT)
+            oc = outcome["outcome"]
+            if oc == "not_found":
+                return 404, {"error": "code_not_found"}
+            if oc == "revoked":
+                return 403, {"error": "code_revoked"}
+            if oc in ("no_ai_credits", "no_credits"):
+                body = _credit_body(outcome["code"])
+                body["error"] = "no_ai_credits"
+                return 402, body
+            if oc == "rate_limited":
+                body = _credit_body(outcome["code"])
+                body["error"] = "rate_limited"
+                return 429, body
+            charged = oc == "charged"
+            duplicate = oc == "duplicate"
+            check_id = "chk_" + uuid.uuid4().hex
+            app.store.record_account_check(
+                check_id, account["account_id"], code_hash,
+                result["check"], media_ref, media_sha256, result,
+                charged, duplicate, utcnow_iso())
+            balances = _credit_body(outcome["code"])
+            body = dict(result)
+            body["check_id"] = check_id
+            body["charged"] = charged
+            body["duplicate"] = duplicate
+            body["balance"] = balances["balance"]
+            body["ai_balance"] = balances["ai_balance"]
+            return 200, body
+
+        def _image_media(result, info):
+            if info["image_bytes"] is not None:
+                digest = hashlib.sha256(
+                    info["image_bytes"]).hexdigest()
+                return "sha256:" + digest, digest, "acct:" + digest
+            url = info["image_url"]
+            return url, result["image_sha256"], "acct:" + hashlib.sha256(
+                url.encode("utf-8")).hexdigest()
+
+        def _video_media(result, info):
+            url = info["video_url"]
+            if url is None:
+                # Staged upload: the media identity is the bytes
+                # themselves (the same choice the image bytes path
+                # makes), so the same file staged and checked again
+                # is the ledger duplicate.
+                digest = result["video_sha256"]
+                return "sha256:" + digest, digest, "acct:" + digest
+            return url, result["video_sha256"], "acct:" + hashlib.sha256(
+                url.encode("utf-8")).hexdigest()
+
+        def _audio_media(result, info):
+            url = info["audio_url"]
+            if url is None:
+                digest = result["audio_sha256"]
+                return "sha256:" + digest, digest, "acct:" + digest
+            return url, result["audio_sha256"], "acct:" + hashlib.sha256(
+                url.encode("utf-8")).hexdigest()
+
+        # -- staged media uploads (v6.11) ------------------------------
+        # One staging path for every oversized file: a signed-in
+        # account asks for an upload slot, PUTs the file to the
+        # private staging bucket through the presigned address, and
+        # runs the check with the upload id. The upload record lives
+        # in the API store under the account; resolution below is
+        # namespaced by that account, so another account's upload id
+        # reads as absent. The staged object is claimed exactly once
+        # and deleted when the check attempt completes (see
+        # _run_account_check); the bucket lifecycle rule (1 day) is
+        # the backstop for files that are staged and never checked.
+
+        def _resolve_upload(account, body, media_type):
+            """(upload row, None) or (None, error tuple) for the
+            body's upload_id under this account and media kind."""
+            if app.staging is None:
+                return None, errors.unavailable(
+                    "uploads_unavailable",
+                    "uploads are not configured on this API")
+            upload_id = body.get("upload_id")
+            if not isinstance(upload_id, str) or not upload_id:
+                return None, errors.bad_request(
+                    "upload_id is required")
+            row = app.store.get_account_upload(
+                account["account_id"], upload_id)
+            if row is None:
+                return None, errors.bad_request(
+                    "that upload is not available")
+            if row["media_type"] != media_type:
+                return None, errors.bad_request(
+                    "that upload holds a different kind of media")
+            if row["state"] == "consumed":
+                return None, errors.conflict(
+                    "that upload was already used")
+            from datetime import datetime, timedelta, timezone
+            try:
+                created = datetime.fromisoformat(row["created_at"])
+                expired = datetime.now(timezone.utc) - created > \
+                    timedelta(hours=uploads_module.UPLOAD_TTL_HOURS)
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                return None, errors.bad_request(
+                    "that upload has expired; upload the file again")
+            return row, None
+
+        @app.route("POST", r"^/v1/account/uploads$")
+        def account_upload_create(req):
+            """Ask for one staged-upload slot under the session.
+
+            Body: {media_type, size_bytes, filename}. The answer is
+            the upload id and a presigned PUT address bound to the
+            declared size and the content type the filename's
+            extension allows, good for 15 minutes. Nothing is
+            charged here: charging happens at the check, exactly
+            once, under the account balance rules."""
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, _session = ctx
+            if app.staging is None:
+                return errors.unavailable(
+                    "uploads_unavailable",
+                    "uploads are not configured on this API")
+            body = req.body
+            if not isinstance(body, dict):
+                return errors.bad_request("JSON object body required")
+            extra = set(body) - {"media_type", "size_bytes", "filename"}
+            if extra:
+                return errors.bad_request(
+                    "unexpected fields: " + ", ".join(sorted(extra)))
+            media_type = body.get("media_type")
+            if media_type not in uploads_module.MEDIA_CAPS:
+                return errors.bad_request(
+                    "media_type must be one of video, audio, image")
+            cap = uploads_module.MEDIA_CAPS[media_type]
+            size = body.get("size_bytes")
+            if isinstance(size, bool) or not isinstance(size, int) \
+                    or size < 1:
+                return errors.bad_request(
+                    "size_bytes must be a positive whole number")
+            if size > cap:
+                return errors.bad_request(
+                    "that %s is too large to upload for a check; "
+                    "the limit is %d bytes" % (media_type, cap))
+            content_type = uploads_module.content_type_for(
+                media_type, body.get("filename"))
+            if content_type is None:
+                return errors.bad_request(
+                    "that file type cannot be uploaded for a %s check"
+                    % media_type)
+            upload_id = "upl_" + uuid.uuid4().hex
+            key = uploads_module.object_key(account["account_id"],
+                                            upload_id)
+            try:
+                url = app.staging.presign_put(key, content_type, size)
+            except uploads_module.StagingError:
+                return errors.unavailable(
+                    "uploads_unavailable",
+                    "the upload could not be prepared just now")
+            app.store.create_account_upload(
+                upload_id, account["account_id"], media_type, size,
+                content_type, key, utcnow_iso())
+            return 200, {
+                "upload_id": upload_id,
+                "upload_url": url,
+                "expires_in_seconds":
+                    uploads_module.PRESIGN_EXPIRES_SECONDS,
+                "max_bytes": cap,
+                "media_type": media_type,
+            }
+
+        @app.route("POST", r"^/v1/account/checks/image$")
+        def account_check_image(req):
+            """AI-generation image check under the account session.
+
+            Body: {image_url} or {image_base64}, or {upload_id}
+            for an image staged through POST /v1/account/uploads
+            (the path for images above the inline size limit),
+            charged to the account's own balance; a {code} may
+            still ride along for older clients and then pays
+            instead. Validation is the verifier image route's.
+            Answers the verifier route's body plus check_id,
+            charged, duplicate, balance and ai_balance."""
+            if isinstance(req.body, dict) \
+                    and req.body.get("upload_id") is not None:
+                if req.body.get("image_url") is not None \
+                        or req.body.get("image_base64") is not None:
+                    return errors.bad_request(
+                        "provide upload_id or an image source, "
+                        "not both")
+                ctx = _account_ctx(req)
+                if ctx is None:
+                    return errors.unauthorized()
+                account, _session = ctx
+                row, err = _resolve_upload(account, req.body, "image")
+                if err is not None:
+                    return err
+                return _run_account_check(
+                    req, {}, _image_check_core, _image_media,
+                    staged=row)
+            return _run_account_check(
+                req, req.body, _image_check_core, _image_media)
+
+        @app.route("POST", r"^/v1/account/checks/video$")
+        def account_check_video(req):
+            """AI-generation video check under the account session.
+
+            Body: {video_url, interval_seconds?}, or {upload_id,
+            interval_seconds?} for a video staged through POST
+            /v1/account/uploads, charged to the account's own
+            balance (a {code} may still ride along for older
+            clients), with the verifier video route's validation
+            and answer shape."""
+            core_body = None
+            if isinstance(req.body, dict):
+                core_body = {k: req.body[k] for k in
+                             ("video_url", "interval_seconds")
+                             if k in req.body}
+                if req.body.get("upload_id") is not None:
+                    if req.body.get("video_url") is not None:
+                        return errors.bad_request(
+                            "provide upload_id or video_url, not both")
+                    ctx = _account_ctx(req)
+                    if ctx is None:
+                        return errors.unauthorized()
+                    account, _session = ctx
+                    row, err = _resolve_upload(
+                        account, req.body, "video")
+                    if err is not None:
+                        return err
+                    staged_body = {k: req.body[k] for k in
+                                   ("interval_seconds",)
+                                   if k in req.body}
+                    return _run_account_check(
+                        req, staged_body, _video_check_core,
+                        _video_media, staged=row)
+            return _run_account_check(
+                req, core_body, _video_check_core, _video_media)
+
+        @app.route("POST", r"^/v1/account/checks/audio$")
+        def account_check_audio(req):
+            """AI-generation audio check under the account session.
+
+            Body: {audio_url}, or {upload_id} for an audio file
+            staged through POST /v1/account/uploads, charged to the
+            account's own balance, with the verifier audio route's
+            validation and answer shape. The audio detector's
+            configured state is whatever the API carries: while it
+            is not configured the answer is the honest signed 503
+            and nothing is charged, exactly as on the verifier
+            route."""
+            core_body = None
+            if isinstance(req.body, dict):
+                core_body = {k: req.body[k] for k in ("audio_url",)
+                             if k in req.body}
+                if req.body.get("upload_id") is not None:
+                    if req.body.get("audio_url") is not None:
+                        return errors.bad_request(
+                            "provide upload_id or audio_url, not both")
+                    ctx = _account_ctx(req)
+                    if ctx is None:
+                        return errors.unauthorized()
+                    account, _session = ctx
+                    row, err = _resolve_upload(
+                        account, req.body, "audio")
+                    if err is not None:
+                        return err
+                    return _run_account_check(
+                        req, {}, _audio_check_core, _audio_media,
+                        staged=row)
+            return _run_account_check(
+                req, core_body, _audio_check_core, _audio_media)
+
+        @app.route("GET", r"^/v1/account/checks$")
+        def account_checks_list(req):
+            """The session account's recorded checks, newest first.
+
+            Only checks run through the session check routes are
+            recorded (see the section note above); the list is the
+            account's own rows and no one else's."""
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, _session = ctx
+            rows = app.store.list_account_checks(
+                account["account_id"])
+            return 200, {"checks": [{
+                "check_id": r["check_id"],
+                "check": r["check"],
+                "media_ref": r["media_ref"],
+                "media_sha256": r["media_sha256"],
+                "result": json.loads(r["result_json"]),
+                "charged": bool(r["charged"]),
+                "duplicate": bool(r["duplicate"]),
+                "created_at": r["created_at"],
+            } for r in rows]}
+
+        @app.route("GET", r"^/v1/account/balance$")
+        def account_balance(req):
+            """The session account's own check balance.
+
+            The balance is the account's ledger row read the same
+            way a code's balance is read (the shared _credit_body
+            shape): checks left, AI checks left, live Pass grants,
+            and the subscription state. The row is created empty on
+            first read, so a new account simply reads zero."""
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, _session = ctx
+            row = app.store.ensure_account_ledger(
+                account["account_id"], account.get("email"),
+                utcnow_iso())
+            return 200, _credit_body(row)
+
+        @app.route("GET", r"^/v1/account/fleet$")
+        def account_fleet(req):
+            """The session account's fleet: its own agent
+            registrations, newest first.
+
+            The fleet is the account's own agent registrations
+            keyed by the account email: registration is public and
+            email-keyed, and the account is rooted at the same
+            email, so the list is exactly the registrations whose
+            owner email is the session account's email, and no one
+            else's. Each entry carries the full signed registration
+            record and, when the record declared an agent_id that
+            has an attestation row, that row's summary; registration
+            is never dressed as verification, so no verified count
+            is served. The counts are computed from the same list
+            the response carries."""
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, _session = ctx
+            records = app.store.registrations_by_email(
+                account["email"], kind="agent")
+            agents = []
+            with_declared_identity = 0
+            with_attestations = 0
+            for record in records:
+                attestation = None
+                agent_id = record.get("agent_id")
+                if agent_id:
+                    with_declared_identity += 1
+                    row = app.store.get_agent(agent_id)
+                    if row is not None:
+                        with_attestations += 1
+                        attestation = {
+                            "agent_id": row["agent_id"],
+                            "verdict": row["verdict"],
+                            "valid_from": row["valid_from"],
+                            "valid_until": row["valid_until"],
+                            "revoked": bool(row.get("revoked")),
+                        }
+                agents.append({"record": record,
+                               "attestation": attestation})
+            return 200, {
+                "counts": {
+                    "total": len(agents),
+                    "with_declared_identity": with_declared_identity,
+                    "with_attestations": with_attestations,
+                },
+                "agents": agents,
+            }
+
+        # -- server-side agent runs (npc_verify.runs) ------------------
+        # Run a registered agent the signed-in account owns. The
+        # pack executes from the stored registration record only
+        # (a run body can never supply steps), the run is metered
+        # through the credit ledger exactly once on completion,
+        # and its terminal state mints a signed run record. An
+        # unknown record id and a record owned by another account
+        # answer identically (404 unknown), the ownership pattern
+        # the fleet list above implies: the account's agents are
+        # exactly its own registrations, and no one else's
+        # existence is leaked.
+        @app.route("POST",
+                   r"^/v1/agents/(?P<record_id>[^/]{1,128})/runs$")
+        def agent_run_create(req, record_id):
+            ctx = _account_ctx(req)
+            if ctx is None:
+                return errors.unauthorized()
+            account, _session = ctx
+            return app.runs.create_run(account, record_id, req.body)
 
     # -- idempotency (audit D4) ---------------------------------------------
     def _idempotent(self, req, route, produce):
@@ -3193,12 +4195,16 @@ def create_app(db_path: str, keys_dir: str, detector=None,
                fetcher=None, chat_provider=None, chat_config=None,
                mailer=None, link_http=None,
                coinbase_reader=None, payments=None,
-               anchor_chain=None) -> App:
+               anchor_chain=None, video_detector=None,
+               audio_detector=None, media_fetcher=None,
+               staging_store=None) -> App:
     return App(db_path, keys_dir, detector=detector, fetcher=fetcher,
                chat_provider=chat_provider, chat_config=chat_config,
                mailer=mailer, link_http=link_http,
                coinbase_reader=coinbase_reader, payments=payments,
-               anchor_chain=anchor_chain)
+               anchor_chain=anchor_chain, video_detector=video_detector,
+               audio_detector=audio_detector, media_fetcher=media_fetcher,
+               staging_store=staging_store)
 
 
 def run(db_path: str, keys_dir: str, host="127.0.0.1", port=8787):

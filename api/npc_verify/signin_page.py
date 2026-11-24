@@ -9,7 +9,12 @@ shows the account's signed-in devices with revoke controls.
 It is also the page the desktop app's browser handoff opens. The
 handoff id rides in the query string and is passed through the
 sign-in calls, so a completed sign-in readies the handoff for the
-app to exchange. The page itself holds the web surface's session
+app to exchange. Every sign-in path carries it: the email link
+(bound at request time), the passkey finish, and the recovery-code
+redeem; and when the browser already holds a session, so no
+sign-in runs at all, the page completes the pending handoff
+directly with that session (POST /v1/auth/handoff/complete). The
+page itself holds the web surface's session
 token in sessionStorage, which is that surface's own credential,
 the same standing a browser session cookie would have.
 
@@ -163,6 +168,18 @@ function credentialPayload(cred, extra) {
   }
   return Object.assign(payload, extra || {});
 }
+async function completePendingHandoff() {
+  // The already-signed-in branch: this browser already holds a
+  // session, so no sign-in below will run to complete a pending
+  // desktop handoff. Complete it explicitly, with the session,
+  // the same completion a fresh sign-in performs server-side.
+  if (!handoffId || !sessionToken) return;
+  try {
+    await call("POST", "/v1/auth/handoff/complete",
+      { handoff_id: handoffId }, true);
+  } catch (e) { /* the account view still loads; the desktop app
+                   keeps polling until the handoff expires */ }
+}
 async function signedIn(data) {
   if (data.session_token) {
     sessionToken = data.session_token;
@@ -253,6 +270,7 @@ $("btn-recovery").addEventListener("click", async function () {
       code: $("recovery-code").value,
       surface: "web",
       device_label: deviceLabel(),
+      handoff_id: handoffId || undefined,
     });
     await signedIn(data);
     say("You are signed in with a recovery code. Add a fresh passkey below so the next sign-in is one touch.");
@@ -304,7 +322,11 @@ $("btn-signout").addEventListener("click", async function () {
       return;
     }
   }
-  if (sessionToken) { await refreshAccount(); return; }
+  if (sessionToken) {
+    await completePendingHandoff();
+    await refreshAccount();
+    return;
+  }
   show("view-signin");
 })();
 </script>

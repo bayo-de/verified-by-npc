@@ -866,8 +866,95 @@ def validate_agent_input(fields):
                 "digits, and . _ : - +, max 128 chars)")
     problems.extend(
         validate_declared_scope(fields.get("declared_scope")))
+    problems.extend(validate_agent_pack(fields.get("pack")))
     problems.extend(_identity_signals_gate_problems(fields))
     return problems
+
+
+# -- agent pack (optional agent-registration intake) ----------------------
+# An agent registration may carry the agent's `pack`: the stored
+# definition the server-side run service (npc_verify.runs) executes
+# — purpose, when to use it, the steps, and the checks — in the
+# shape the desktop Skill Builder authors (purpose / when to use /
+# steps / checks). The pack is stored server-side as part of the
+# signed registration record, exactly like declared_scope, and a
+# run reads the pack ONLY from that stored record: a run request
+# can never supply or override steps, so nothing unregistered can
+# be run under a registered agent's name. Records without a pack
+# are exactly the records this API has always minted: the field is
+# omitted, never null, and such an agent simply cannot be run
+# server-side until it is re-registered with a pack.
+AGENT_PACK_MAX_STEPS = 32
+AGENT_PACK_MAX_CHECKS = 32
+
+
+def validate_agent_pack(pack):
+    """Validate the optional `pack` on an agent registration.
+
+    Shape only, like validate_declared_scope: the pack is the
+    owner's own definition, recorded as supplied; NPC does not
+    review what the steps say at intake."""
+    problems = []
+    if pack is None:
+        return problems
+    if not isinstance(pack, dict):
+        return ["pack must be an object"]
+    _check_str(problems, pack, "purpose", 500)
+    _check_str(problems, pack, "when_to_use", 500, required=False)
+    steps = pack.get("steps")
+    if not isinstance(steps, list) or not steps \
+            or len(steps) > AGENT_PACK_MAX_STEPS or any(
+                not isinstance(s, str) or not s.strip()
+                or len(s) > 1000 for s in steps):
+        problems.append(
+            "pack.steps is required (a list of 1 to %d step "
+            "strings, each max 1000 chars)" % AGENT_PACK_MAX_STEPS)
+    checks = pack.get("checks")
+    if checks is not None:
+        if not isinstance(checks, list) \
+                or len(checks) > AGENT_PACK_MAX_CHECKS or any(
+                    not isinstance(c, str) or not c.strip()
+                    or len(c) > 500 for c in checks):
+            problems.append(
+                "pack.checks must be a list of at most %d strings "
+                "(each max 500 chars)" % AGENT_PACK_MAX_CHECKS)
+    return problems
+
+
+def normalize_agent_pack(pack):
+    """Return the cleaned `pack` dict for the signed record core,
+    or None when there is nothing usable. Only known fields
+    survive, in a fixed key order, strings trimmed: the signed
+    record shape stays under this module's control even though the
+    owner supplied the values. Callers validate first
+    (validate_agent_input); this stays defensive about types rather
+    than re-reporting problems."""
+    if not isinstance(pack, dict):
+        return None
+    purpose = pack.get("purpose")
+    steps = pack.get("steps")
+    if not isinstance(purpose, str) or not purpose.strip() \
+            or not isinstance(steps, list):
+        return None
+    clean_steps = [s.strip() for s in steps
+                   if isinstance(s, str) and s.strip()
+                   and len(s.strip()) <= 1000]
+    if not clean_steps:
+        return None
+    out = {"purpose": purpose.strip()}
+    when = pack.get("when_to_use")
+    if isinstance(when, str) and when.strip() \
+            and len(when.strip()) <= 500:
+        out["when_to_use"] = when.strip()
+    out["steps"] = clean_steps[:AGENT_PACK_MAX_STEPS]
+    checks = pack.get("checks")
+    if isinstance(checks, list):
+        clean_checks = [c.strip() for c in checks
+                        if isinstance(c, str) and c.strip()
+                        and len(c.strip()) <= 500]
+        if clean_checks:
+            out["checks"] = clean_checks[:AGENT_PACK_MAX_CHECKS]
+    return out
 
 
 # -- declared scope (optional agent-registration intake) ------------------
@@ -1479,6 +1566,19 @@ def mint_agent_registration(store, keys, fields, email, client_ip):
     }
     if isinstance(agent_id, str) and _AGENT_ID_RE.match(agent_id):
         core["agent_id"] = agent_id
+    pack = normalize_agent_pack(fields.get("pack"))
+    if pack is not None:
+        core["pack"] = pack
+        core["checks_run"].append({
+            "check": "agent_pack",
+            "status": "recorded",
+            "detail": "The registration carries the agent's pack "
+                      "(purpose, when to use it, steps, and "
+                      "checks) exactly as the owner supplied it. "
+                      "The pack is the stored definition the "
+                      "server-side run service executes; it is "
+                      "recorded, not reviewed.",
+        })
     if declared_scope is not None:
         core["declared_scope"] = declared_scope
         core["checks_run"].append({

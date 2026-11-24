@@ -340,6 +340,15 @@ CREATE TABLE IF NOT EXISTS identity_links (
 );
 CREATE INDEX IF NOT EXISTS idx_ilink_subject
   ON identity_links (subject_record_id, linked_at);
+CREATE TABLE IF NOT EXISTS wallet_claims (
+  claim_id          TEXT PRIMARY KEY,
+  subject_record_id TEXT NOT NULL,
+  wallet            TEXT NOT NULL,
+  claimed_at        TEXT NOT NULL,
+  record_json       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wclaim_subject
+  ON wallet_claims (subject_record_id, claimed_at);
 CREATE TABLE IF NOT EXISTS identity_observations (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   subject_record_id TEXT NOT NULL,
@@ -486,6 +495,7 @@ CREATE TABLE IF NOT EXISTS credit_purchases (
   buyer_email    TEXT,
   code_delivered INTEGER NOT NULL DEFAULT 0,
   referral_hash  TEXT,
+  account_id     TEXT,
   created_at     TEXT NOT NULL,
   completed_at   TEXT
 );
@@ -678,6 +688,85 @@ CREATE TABLE IF NOT EXISTS account_events (
 );
 CREATE INDEX IF NOT EXISTS idx_acct_events_account
   ON account_events (account_id, created_at);
+-- Account check history (Biblo tab, 2026-11-21). One row per AI
+-- check a signed-in account ran through the session check routes:
+-- the media reference, the exact signed result body it was
+-- answered with (JSON text), and whether the credit ledger
+-- charged for it or answered it as a duplicate. Append-only:
+-- rows are inserted once and never updated. Checks run under
+-- verifier API keys (the extension lane) are NOT recorded here:
+-- they carry no account and no stored result body, only the
+-- credit_charges ledger rows keyed by code.
+CREATE TABLE IF NOT EXISTS account_checks (
+  check_id     TEXT PRIMARY KEY,
+  account_id   TEXT NOT NULL,
+  code_hash    TEXT NOT NULL,
+  "check"      TEXT NOT NULL,
+  media_ref    TEXT NOT NULL,
+  media_sha256 TEXT,
+  result_json  TEXT NOT NULL,
+  charged      INTEGER NOT NULL DEFAULT 0,
+  duplicate    INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_acct_checks_account
+  ON account_checks (account_id, created_at);
+-- Staged media uploads (v6.11). One row per upload slot an
+-- account asked for: the declared media kind and size, the object
+-- key in the private staging bucket, and the claim state. The
+-- bytes themselves never live here, only in the bucket; the row
+-- is what lets a check resolve an upload id under its account,
+-- claim it exactly once, and refuse a replay. Rows are created
+-- pending, claimed once (consumed), and never deleted: they are
+-- the audit trail of what was staged.
+CREATE TABLE IF NOT EXISTS account_uploads (
+  upload_id    TEXT PRIMARY KEY,
+  account_id   TEXT NOT NULL,
+  media_type   TEXT NOT NULL,
+  size_bytes   INTEGER NOT NULL,
+  content_type TEXT NOT NULL,
+  object_key   TEXT NOT NULL,
+  state        TEXT NOT NULL DEFAULT 'pending',
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_acct_uploads_account
+  ON account_uploads (account_id, created_at);
+-- Server-side agent runs (npc_verify.runs). One row per run of a
+-- registered agent's stored pack, with its full lifecycle
+-- (created -> running -> completed / failed) persisted: the input
+-- and output are kept beside their hashes so the run stays
+-- inspectable, while the SIGNED run record (stored in
+-- registrations, kind "agent_run") carries the hashes only. The
+-- charge columns record the credit-ledger outcome: charged is 1
+-- only when the run's single ledger charge landed, and charge_id
+-- is that charge row's id (the ledger keys the charge itself by
+-- (code_hash, run_id), so a replayed completion cannot charge
+-- twice).
+CREATE TABLE IF NOT EXISTS agent_runs (
+  run_id        TEXT PRIMARY KEY,
+  record_id     TEXT NOT NULL,
+  account_id    TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'created',
+  input_text    TEXT NOT NULL DEFAULT '',
+  input_hash    TEXT NOT NULL DEFAULT '',
+  output_text   TEXT NOT NULL DEFAULT '',
+  output_hash   TEXT NOT NULL DEFAULT '',
+  model         TEXT NOT NULL DEFAULT '',
+  tokens_in     INTEGER NOT NULL DEFAULT 0,
+  tokens_out    INTEGER NOT NULL DEFAULT 0,
+  band          TEXT NOT NULL DEFAULT '',
+  price_npc     INTEGER NOT NULL DEFAULT 0,
+  ledger_units  INTEGER NOT NULL DEFAULT 0,
+  charged       INTEGER NOT NULL DEFAULT 0,
+  charge_id     TEXT NOT NULL DEFAULT '',
+  run_record_id TEXT NOT NULL DEFAULT '',
+  error         TEXT NOT NULL DEFAULT '',
+  created_at    TEXT NOT NULL,
+  started_at    TEXT NOT NULL DEFAULT '',
+  finished_at   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_account
+  ON agent_runs (account_id, created_at);
 """
 
 
@@ -788,6 +877,14 @@ class Store:
             self.db.execute(
                 "ALTER TABLE credit_purchases"
                 " ADD COLUMN referral_hash TEXT")
+        if "account_id" not in cols:
+            # Added 2026-11-22 with account-balance purchases: a
+            # purchase made while signed in records the account it
+            # belongs to, and completion credits that account's own
+            # ledger row instead of minting a code.
+            self.db.execute(
+                "ALTER TABLE credit_purchases"
+                " ADD COLUMN account_id TEXT")
         cols = {r["name"]
                 for r in self.db.execute(
                     "PRAGMA table_info(credit_referrals)")}
@@ -1134,6 +1231,21 @@ class Store:
             (record_id,))
         return json.loads(row["record_json"]) if row else None
 
+    def registrations_by_email(self, email, kind="agent"):
+        """Registration records submitted under one owner email, of
+        one kind, newest first. Records are the parsed signed dicts,
+        exactly as get_registration returns them. The email column
+        is the server-side submitter address (never part of the
+        signed record itself); callers pass the address exactly as
+        registration stored it (the register routes store it
+        stripped and lowercased)."""
+        rows = self._fetchall(
+            "SELECT record_json FROM registrations"
+            " WHERE email=? AND kind=?"
+            " ORDER BY created_at DESC, rowid DESC",
+            (email, kind))
+        return [json.loads(r["record_json"]) for r in rows]
+
     def registration_for_agent(self, agent_id):
         """The agent registration that names this agent_id, or None.
 
@@ -1390,6 +1502,34 @@ class Store:
         rows = self._fetchall(
             "SELECT record_json FROM identity_links"
             " WHERE subject_record_id=? ORDER BY linked_at ASC",
+            (subject_record_id,))
+        return [json.loads(r["record_json"]) for r in rows]
+
+    def add_wallet_claim(self, record) -> bool:
+        """Store a signed wallet-claim record. Put-if-absent on the
+        claim id."""
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO wallet_claims (claim_id,"
+                " subject_record_id, wallet, claimed_at, record_json)"
+                " VALUES (?,?,?,?,?)",
+                (record["record_id"], record["subject_record_id"],
+                 record["wallet_claimed_by"], record["claimed_at"],
+                 json.dumps(record)))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def get_wallet_claim(self, claim_id):
+        row = self._fetchone(
+            "SELECT record_json FROM wallet_claims WHERE claim_id=?",
+            (claim_id,))
+        return json.loads(row["record_json"]) if row else None
+
+    def list_wallet_claims(self, subject_record_id):
+        """Every claim record for one record, oldest first."""
+        rows = self._fetchall(
+            "SELECT record_json FROM wallet_claims"
+            " WHERE subject_record_id=? ORDER BY claimed_at ASC",
             (subject_record_id,))
         return [json.loads(r["record_json"]) for r in rows]
 
@@ -1850,12 +1990,74 @@ class Store:
     # the counter move together or not at all.
 
     def create_credit_purchase(self, session_id, pack_id, buyer_email,
-                               now, referral_hash=None):
+                               now, referral_hash=None, account_id=None):
         self._write(
             "INSERT OR IGNORE INTO credit_purchases (session_id,"
-            " pack_id, status, buyer_email, created_at, referral_hash)"
-            " VALUES (?,?, 'pending', ?, ?, ?)",
-            (session_id, pack_id, buyer_email, now, referral_hash))
+            " pack_id, status, buyer_email, created_at, referral_hash,"
+            " account_id) VALUES (?,?, 'pending', ?, ?, ?, ?)",
+            (session_id, pack_id, buyer_email, now, referral_hash,
+             account_id))
+
+    # -- account balances (desktop, 2026-11-22) -------------------------
+    # A signed-in account's checks live on this same ledger, in a
+    # code row keyed by credits.account_ledger_hash(account_id) that
+    # no one ever sees or presents. The row is created on first use
+    # with zero counters; purchases made while signed in add to it
+    # (packs raise credits_total; a Verifier Pass opens a
+    # subscription and lands its grants against it, through the
+    # same tables a code's Pass uses).
+
+    def ensure_account_ledger(self, account_id, buyer_email, now):
+        """Return the account's ledger row (augmented), creating it
+        empty on first use."""
+        code_hash = credits_module.account_ledger_hash(account_id)
+        with self._lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO credit_codes (code_hash,"
+                " pack_id, credits_total, credits_used, status,"
+                " stripe_session_id, buyer_email, created_at)"
+                " VALUES (?,'account',0,0,'active',NULL,?,?)",
+                (code_hash, buyer_email, now))
+            self.db.commit()
+        return self.get_credit_code(code_hash, now)
+
+    def complete_account_purchase(self, session_id, account_hash,
+                                  pack, buyer_email, now):
+        """Mark a signed-in purchase paid and add its checks to the
+        account's ledger row, exactly once. Returns the (augmented)
+        account ledger row. A replayed completion returns the row
+        unchanged: one paid session can never credit twice. No code
+        is minted and no plaintext exists for this purchase."""
+        with self._lock:
+            purchase = _one(self.db.execute(
+                "SELECT * FROM credit_purchases WHERE session_id=?",
+                (session_id,)))
+            if purchase is None:
+                return None
+            if purchase["status"] == "paid" \
+                    and purchase["code_hash"] == account_hash:
+                return self._augment_credit_row(_one(self.db.execute(
+                    "SELECT * FROM credit_codes WHERE code_hash=?",
+                    (account_hash,))), now)
+            self.db.execute(
+                "INSERT OR IGNORE INTO credit_codes (code_hash,"
+                " pack_id, credits_total, credits_used, status,"
+                " stripe_session_id, buyer_email, created_at)"
+                " VALUES (?,'account',0,0,'active',NULL,?,?)",
+                (account_hash, buyer_email, now))
+            self.db.execute(
+                "UPDATE credit_codes SET credits_total="
+                " credits_total + ? WHERE code_hash=?",
+                (pack["checks"], account_hash))
+            self.db.execute(
+                "UPDATE credit_purchases SET status='paid',"
+                " code_hash=?, code_plaintext=NULL, buyer_email=?,"
+                " completed_at=? WHERE session_id=?",
+                (account_hash, buyer_email, now, session_id))
+            self.db.commit()
+            return self._augment_credit_row(_one(self.db.execute(
+                "SELECT * FROM credit_codes WHERE code_hash=?",
+                (account_hash,))), now)
 
     def get_credit_purchase(self, session_id):
         return self._fetchone(
@@ -1898,6 +2100,52 @@ class Store:
             return _one(self.db.execute(
                 "SELECT * FROM credit_codes WHERE code_hash=?",
                 (code_hash,)))
+
+    def grant_account_comp(self, account_id, buyer_email, amount,
+                           grant_id, now, expires_at):
+        """Land an operator test comp on an account's ledger row.
+
+        The comp is a grant under the source "operator_comp"
+        (credits.BONUS_GRANT_SOURCES): it spends like a bonus grant
+        (the whole remainder can fund an AI check) and is always
+        distinguishable in the ledger from a purchase, which lands
+        as pack counters or a Pass grant instead. Keyed by
+        grant_id, so a replayed grant lands nothing twice.
+        Outcomes: "granted", "duplicate" (this grant id already
+        landed), "not_found" (no such account). The returned row is
+        the account's augmented ledger row.
+        """
+        with self._lock:
+            account = _one(self.db.execute(
+                "SELECT * FROM accounts WHERE account_id=?",
+                (account_id,)))
+            if account is None:
+                return {"outcome": "not_found", "code": None}
+            existing = _one(self.db.execute(
+                "SELECT * FROM credit_grants WHERE grant_id=?",
+                (grant_id,)))
+            account_hash = credits_module.account_ledger_hash(
+                account_id)
+            if existing is not None:
+                return {"outcome": "duplicate",
+                        "code": self.get_credit_code(account_hash,
+                                                     now)}
+            self.db.execute(
+                "INSERT OR IGNORE INTO credit_codes (code_hash,"
+                " pack_id, credits_total, credits_used, status,"
+                " stripe_session_id, buyer_email, created_at)"
+                " VALUES (?,'account',0,0,'active',NULL,?,?)",
+                (account_hash, buyer_email, now))
+            self.db.execute(
+                "INSERT INTO credit_grants (grant_id, code_hash,"
+                " amount, used, ai_cap, ai_used, source, granted_at,"
+                " expires_at) VALUES (?,?,?,0,0,0,'operator_comp',"
+                "?,?)",
+                (grant_id, account_hash, int(amount), now,
+                 expires_at))
+            self.db.commit()
+            return {"outcome": "granted",
+                    "code": self.get_credit_code(account_hash, now)}
 
     def expire_credit_purchase(self, session_id, now):
         self._write(
@@ -2033,6 +2281,55 @@ class Store:
             return self._augment_credit_row(_one(self.db.execute(
                 "SELECT * FROM credit_codes WHERE code_hash=?",
                 (code_hash,))), now)
+
+    def activate_account_pass(self, session_id, account_hash, pack,
+                              buyer_email, subscription_id, customer_id,
+                              grant_id, now, expires_at):
+        """The signed-in form of activate_pass_subscription: open
+        the subscription against the account's ledger row and land
+        the first monthly grant, exactly once, minting no code.
+        Returns the (augmented) account ledger row. A replayed
+        activation returns the row and grants nothing twice."""
+        with self._lock:
+            purchase = _one(self.db.execute(
+                "SELECT * FROM credit_purchases WHERE session_id=?",
+                (session_id,)))
+            if purchase is None:
+                return None
+            if purchase["status"] == "paid" \
+                    and purchase["code_hash"] == account_hash:
+                return self._augment_credit_row(_one(self.db.execute(
+                    "SELECT * FROM credit_codes WHERE code_hash=?",
+                    (account_hash,))), now)
+            self.db.execute(
+                "INSERT OR IGNORE INTO credit_codes (code_hash,"
+                " pack_id, credits_total, credits_used, status,"
+                " stripe_session_id, buyer_email, created_at)"
+                " VALUES (?,'account',0,0,'active',NULL,?,?)",
+                (account_hash, buyer_email, now))
+            self.db.execute(
+                "INSERT INTO credit_subscriptions (subscription_id,"
+                " code_hash, pack_id, customer_id, buyer_email,"
+                " monthly_checks, ai_checks, status, created_at,"
+                " updated_at) VALUES (?,?,?,?,?,?,?,'active',?,?)",
+                (subscription_id, account_hash, pack["id"],
+                 customer_id, buyer_email, pack["checks"],
+                 pack.get("ai_checks", 0), now, now))
+            self.db.execute(
+                "INSERT INTO credit_grants (grant_id, code_hash,"
+                " amount, used, ai_cap, ai_used, granted_at,"
+                " expires_at) VALUES (?,?,?,0,?,0,?,?)",
+                (grant_id, account_hash, pack["checks"],
+                 pack.get("ai_checks", 0), now, expires_at))
+            self.db.execute(
+                "UPDATE credit_purchases SET status='paid',"
+                " code_hash=?, code_plaintext=NULL, buyer_email=?,"
+                " completed_at=? WHERE session_id=?",
+                (account_hash, buyer_email, now, session_id))
+            self.db.commit()
+            return self._augment_credit_row(_one(self.db.execute(
+                "SELECT * FROM credit_codes WHERE code_hash=?",
+                (account_hash,))), now)
 
     def get_subscription(self, subscription_id):
         return self._fetchone(
@@ -2326,6 +2623,167 @@ class Store:
                     "referrer_bonus": amount,
                     "referrer_link_bonus": link_amount}
 
+    # -- account check history (Biblo tab) -----------------------------
+
+    def record_account_check(self, check_id, account_id, code_hash,
+                             check, media_ref, media_sha256, result,
+                             charged, duplicate, created_at):
+        """Record one session-run AI check in the account's history.
+
+        The row is inserted once and never updated. `result` is the
+        exact check result body the caller was answered with; it is
+        stored as JSON text in result_json so the history endpoint
+        can hand back the recorded body itself. charged/duplicate
+        are the credit ledger's outcome flags for the check.
+        Returns the stored row (flags as 0/1 ints, result_json as
+        the JSON string), in the shape list_account_checks returns.
+        """
+        row = {
+            "check_id": check_id, "account_id": account_id,
+            "code_hash": code_hash, "check": check,
+            "media_ref": media_ref, "media_sha256": media_sha256,
+            "result_json": json.dumps(result),
+            "charged": 1 if charged else 0,
+            "duplicate": 1 if duplicate else 0,
+            "created_at": created_at,
+        }
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO account_checks (check_id, account_id,"
+                " code_hash, \"check\", media_ref, media_sha256,"
+                " result_json, charged, duplicate, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (row["check_id"], row["account_id"], row["code_hash"],
+                 row["check"], row["media_ref"], row["media_sha256"],
+                 row["result_json"], row["charged"], row["duplicate"],
+                 row["created_at"]))
+            self.db.commit()
+        return row
+
+    def list_account_checks(self, account_id, limit=50):
+        """The account's recorded session checks, newest first."""
+        with self._lock:
+            return _rows(self.db.execute(
+                "SELECT * FROM account_checks WHERE account_id=?"
+                " ORDER BY created_at DESC, check_id DESC LIMIT ?",
+                (account_id, int(limit))))
+
+    # -- server-side agent runs (npc_verify.runs) ----------------------
+
+    _AGENT_RUN_FIELDS = (
+        "record_id", "account_id", "status", "input_text",
+        "input_hash", "output_text", "output_hash", "model",
+        "tokens_in", "tokens_out", "band", "price_npc",
+        "ledger_units", "charged", "charge_id", "run_record_id",
+        "error", "created_at", "started_at", "finished_at")
+
+    _AGENT_RUN_INT_FIELDS = frozenset(
+        ("tokens_in", "tokens_out", "price_npc", "ledger_units",
+         "charged"))
+
+    def add_agent_run(self, row) -> bool:
+        """Insert one run row in its created state. False when the
+        run id already exists (a run is created exactly once)."""
+        values = [row["run_id"]]
+        for f in self._AGENT_RUN_FIELDS:
+            default = 0 if f in self._AGENT_RUN_INT_FIELDS else ""
+            values.append(row.get(f, default))
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO agent_runs (run_id, %s)"
+                " VALUES (?,%s)" % (
+                    ", ".join(self._AGENT_RUN_FIELDS),
+                    ",".join("?" * len(self._AGENT_RUN_FIELDS))),
+                tuple(values))
+            self.db.commit()
+            return cur.rowcount == 1
+
+    def update_agent_run(self, run_id, **fields) -> bool:
+        """Move a run row through its lifecycle. Only the known run
+        columns may be written; anything else is refused. Returns
+        True when a row moved."""
+        cols = [f for f in fields if f in self._AGENT_RUN_FIELDS]
+        if not cols:
+            return False
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE agent_runs SET %s WHERE run_id=?" % ", ".join(
+                    "%s=?" % c for c in cols),
+                tuple(fields[c] for c in cols) + (run_id,))
+            self.db.commit()
+            return cur.rowcount == 1
+
+    def get_agent_run(self, run_id):
+        return self._fetchone(
+            "SELECT * FROM agent_runs WHERE run_id=?", (run_id,))
+
+    def list_agent_runs(self, account_id, limit=50):
+        """The account's runs, newest first."""
+        with self._lock:
+            return _rows(self.db.execute(
+                "SELECT * FROM agent_runs WHERE account_id=?"
+                " ORDER BY created_at DESC, run_id DESC LIMIT ?",
+                (account_id, int(limit))))
+
+    # -- staged media uploads (v6.11) --------------------------------
+
+    def create_account_upload(self, upload_id, account_id, media_type,
+                              size_bytes, content_type, object_key,
+                              created_at):
+        """Record one upload slot in the pending state. Returns the
+        stored row. The bytes live only in the staging bucket; this
+        row is the account-namespaced handle a check resolves."""
+        row = {
+            "upload_id": upload_id, "account_id": account_id,
+            "media_type": media_type, "size_bytes": int(size_bytes),
+            "content_type": content_type, "object_key": object_key,
+            "state": "pending", "created_at": created_at,
+        }
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO account_uploads (upload_id, account_id,"
+                " media_type, size_bytes, content_type, object_key,"
+                " state, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (row["upload_id"], row["account_id"],
+                 row["media_type"], row["size_bytes"],
+                 row["content_type"], row["object_key"], row["state"],
+                 row["created_at"]))
+            self.db.commit()
+        return row
+
+    def get_account_upload(self, account_id, upload_id):
+        """One upload row under its owning account, or None. An
+        upload id that belongs to another account reads as absent:
+        resolution is namespaced by construction."""
+        with self._lock:
+            return _one(self.db.execute(
+                "SELECT * FROM account_uploads WHERE account_id=?"
+                " AND upload_id=?", (account_id, upload_id)))
+
+    def claim_account_upload(self, account_id, upload_id):
+        """Atomically move one pending upload to consumed. Returns
+        True only for the caller that won the claim; a replayed or
+        already-consumed upload claims False."""
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE account_uploads SET state='consumed'"
+                " WHERE account_id=? AND upload_id=?"
+                " AND state='pending'", (account_id, upload_id))
+            self.db.commit()
+            return cur.rowcount == 1
+
+    def release_account_upload(self, account_id, upload_id):
+        """Move a consumed upload back to pending. Used only when a
+        check stopped before it began (for example a balance that
+        could not fund it), so the customer can retry the same
+        upload once the blocker clears."""
+        with self._lock:
+            self.db.execute(
+                "UPDATE account_uploads SET state='pending'"
+                " WHERE account_id=? AND upload_id=?"
+                " AND state='consumed'", (account_id, upload_id))
+            self.db.commit()
+
     def get_credit_code(self, code_hash, now=None):
         row = self._fetchone(
             "SELECT * FROM credit_codes WHERE code_hash=?", (code_hash,))
@@ -2352,8 +2810,17 @@ class Store:
 
     def consume_credit(self, code_hash, image_identity, claim_hash,
                        charge_id, now, kind="standard",
-                       hourly_limit=None):
+                       hourly_limit=None, amount=1):
         """Charge one credit for one new image, atomically.
+
+        `amount` (default 1, the only value the check routes use)
+        charges that many ledger units under the SAME single charge
+        row and the SAME (code_hash, image_identity) idempotency
+        key: the server-side run service charges a completed run's
+        band this way, keyed by the run id, so a run's charge is
+        still exactly one ledger row that can never land twice. A
+        multi-unit charge is all-or-nothing: when the balance
+        cannot cover it in full, nothing moves.
 
         Outcomes: "charged" (a new charge row, counter moved),
         "duplicate" (this image was already charged to this code;
@@ -2418,7 +2885,10 @@ class Store:
                         and recent["n"] >= hourly_limit:
                     return {"outcome": "rate_limited",
                             "code": self._augment_credit_row(row, now)}
-            if kind == "standard":
+            if kind == "standard" and amount == 1:
+                # The Pass covers single standard checks only: a
+                # multi-unit charge (an agent run) always draws a
+                # finite pool, never the unlimited Pass side.
                 sub = self._fetchone(
                     "SELECT * FROM credit_subscriptions"
                     " WHERE code_hash=?", (code_hash,))
@@ -2430,8 +2900,8 @@ class Store:
             if grants:
                 return self._consume_with_grants(
                     row, grants, image_identity, claim_hash, charge_id,
-                    now, kind)
-            if row["credits_used"] >= row["credits_total"]:
+                    now, kind, amount)
+            if row["credits_used"] + amount > row["credits_total"]:
                 return {"outcome": "no_credits",
                         "code": self._augment_credit_row(row, now)}
             # The code's own pack counters fund this charge; an AI
@@ -2448,7 +2918,7 @@ class Store:
                 self.db.rollback()
                 return {"outcome": "duplicate",
                         "code": self._augment_credit_row(row, now)}
-            used = row["credits_used"] + 1
+            used = row["credits_used"] + amount
             status = "exhausted" if used >= row["credits_total"] \
                 else row["status"]
             self.db.execute(
@@ -2493,7 +2963,8 @@ class Store:
                 "code": self._augment_credit_row(row, now)}
 
     def _consume_with_grants(self, row, grants, image_identity,
-                             claim_hash, charge_id, now, kind):
+                             claim_hash, charge_id, now, kind,
+                             amount=1):
         """The grant path of consume_credit, called under the store
         lock with the duplicate check already done. Draws the oldest
         live grant first; grants past expiry are invisible. AI
@@ -2501,52 +2972,67 @@ class Store:
         sub-allowances first (oldest first), then bonus grants
         (oldest first), each bonus draw spending the grant's shared
         pool and landing marked funded_by "bonus", then the code's
-        pack counters, landing marked funded_by "pack"."""
+        pack counters, landing marked funded_by "pack".
+
+        A multi-unit charge (amount > 1, the agent-run path) plans
+        its whole draw before anything moves: when the pools that
+        can fund this kind cannot cover the amount in full, the
+        outcome is no_credits / no_ai_credits and nothing is drawn.
+        The plan then applies in the same draw order, grant by
+        grant, with any remainder on the pack counters."""
         code_hash = row["code_hash"]
-        live = [g for g in grants if g["expires_at"] > now]
+        live = [dict(g) for g in grants if g["expires_at"] > now]
         grant_remaining = sum(g["amount"] - g["used"] for g in live)
         legacy_remaining = row["credits_total"] - row["credits_used"]
-        target = None
+
+        def _room(grant):
+            if kind == "ai":
+                return credits_module.grant_ai_room(grant)
+            return grant["amount"] - grant["used"]
+
         if kind == "ai":
-            for g in live:
-                if g["source"] not in \
-                        credits_module.BONUS_GRANT_SOURCES \
-                        and credits_module.grant_ai_room(g) > 0:
-                    target = g
-                    break
-            if target is None:
-                for g in live:
-                    if g["source"] in \
-                            credits_module.BONUS_GRANT_SOURCES \
-                            and credits_module.grant_ai_room(g) > 0:
-                        target = g
-                        break
-            if target is None and credits_module.grant_ai_room(
-                    credits_module.pack_grant_view(row)) <= 0:
+            ordered = (
+                [g for g in live
+                 if g["source"] not in
+                 credits_module.BONUS_GRANT_SOURCES]
+                + [g for g in live
+                   if g["source"] in
+                   credits_module.BONUS_GRANT_SOURCES])
+            fundable = sum(_room(g) for g in ordered) \
+                + credits_module.grant_ai_room(
+                    credits_module.pack_grant_view(row))
+            if fundable < amount:
                 outcome = "no_credits" \
                     if grant_remaining + legacy_remaining <= 0 \
                     else "no_ai_credits"
                 return {"outcome": outcome,
                         "code": self._augment_credit_row(row, now)}
         else:
-            if grant_remaining + legacy_remaining <= 0:
+            ordered = live
+            if grant_remaining + legacy_remaining < amount:
                 return {"outcome": "no_credits",
                         "code": self._augment_credit_row(row, now)}
-            for g in live:
-                if g["amount"] - g["used"] > 0:
-                    target = g
-                    break
+        # Plan the draw in order: (grant, units) pairs, then any
+        # remainder on the code row's own pack counters.
+        plan = []
+        remaining = amount
+        for g in ordered:
+            if remaining <= 0:
+                break
+            draw = min(_room(g), remaining)
+            if draw > 0:
+                plan.append((g, draw))
+                remaining -= draw
+        counter_draw = remaining
         funded_by = ""
-        if kind == "ai" and target is not None \
-                and target["source"] in \
-                credits_module.BONUS_GRANT_SOURCES:
-            funded_by = "bonus"
-        elif kind == "ai" and target is None:
-            # No grant could fund this AI charge, so it falls to
-            # the code's pack counters (their room was checked
-            # above); the spend itself happens in the counters
-            # branch below.
-            funded_by = "pack"
+        if kind == "ai":
+            if any(g["source"] in credits_module.BONUS_GRANT_SOURCES
+                   for g, _d in plan):
+                funded_by = "bonus"
+            elif counter_draw > 0:
+                # No grant could fund (part of) this AI charge, so
+                # it falls to the code's pack counters.
+                funded_by = "pack"
         try:
             self.db.execute(
                 "INSERT INTO credit_charges (id, code_hash,"
@@ -2558,21 +3044,23 @@ class Store:
             self.db.rollback()
             return {"outcome": "duplicate",
                     "code": self._augment_credit_row(row, now)}
-        if target is not None:
+        for g, draw in plan:
             self.db.execute(
                 "UPDATE credit_grants SET used=?, ai_used=?"
                 " WHERE grant_id=?",
-                (target["used"] + 1,
-                 target["ai_used"] + (1 if kind == "ai" else 0),
-                 target["grant_id"]))
+                (g["used"] + draw,
+                 g["ai_used"] + (draw if kind == "ai" else 0),
+                 g["grant_id"]))
+        if plan:
             self.db.execute(
                 "UPDATE credit_codes SET last_used_at=?"
                 " WHERE code_hash=?", (now, code_hash))
-        else:
-            # No live grant can fund this charge, but the code row
-            # still holds counters (a hand-minted hybrid): spend
-            # from them, without flipping a Pass code to exhausted.
-            used = row["credits_used"] + 1
+        if counter_draw > 0:
+            # No live grant can fund this part of the charge, but
+            # the code row still holds counters (a hand-minted
+            # hybrid): spend from them, without flipping a Pass
+            # code to exhausted.
+            used = row["credits_used"] + counter_draw
             sub = self._fetchone(
                 "SELECT * FROM credit_subscriptions"
                 " WHERE code_hash=?", (code_hash,))

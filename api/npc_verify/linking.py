@@ -43,6 +43,7 @@ Everything here is gated by NPC_IDENTITY_SIGNALS=1, the same flag
 as the registry block: a deployment without the linking service
 refuses to sign claims it cannot stand behind.
 """
+import hashlib
 import json
 import os
 import re
@@ -56,6 +57,7 @@ from .models import is_iso8601, utcnow_iso
 from .store import registration_email_hash
 
 LINK_RECORD_TYPE = "npc.identity.signal_link"
+CLAIM_RECORD_TYPE = "npc.wallet.record_claim"
 CHALLENGE_TTL = timedelta(minutes=10)
 OAUTH_PROVIDERS = ("github", "google")
 
@@ -331,13 +333,13 @@ def valid_wallet(address):
 
 
 def build_siwe_message(domain, address, uri, chain_id, nonce,
-                       issued_at, expires_at):
+                       issued_at, expires_at, statement=None):
     lines = [
         "%s wants you to sign in with your Ethereum account:"
         % domain,
         ethkeys.to_checksum_address(address),
         "",
-        SIWE_STATEMENT,
+        statement if statement is not None else SIWE_STATEMENT,
         "",
         "URI: %s" % uri,
         "Version: 1",
@@ -493,6 +495,183 @@ def start_siwe_challenge(store, subject, email, wallet, now_iso):
             "nonce": nonce, "domain": domain,
             "chain_id": siwe_chain_id(), "expires_at": expires,
             "wallet": ethkeys.to_checksum_address(wallet)}
+
+
+
+# -- per-record wallet claims ------------------------------------------------
+# A claim is the design's second layer over wallet control: the
+# wallet signs one readable statement that names the exact record
+# and its fingerprint, and NPC mints the claim as its own signed
+# record (npc.wallet.record_claim). One signature does both jobs:
+# completing a claim also stands behind the record's SIWE
+# wallet-control link when the record does not have one yet, so an
+# owner never signs twice for the same wallet on the same record.
+# A claim changes no status: the subject record is never edited,
+# and its verification state is carried onto the claim record only
+# as the value it held at claim time.
+
+
+def record_fingerprint(subject):
+    """A deterministic fingerprint of one signed record: the
+    SHA-256 of the canonical form of the record without its
+    signature envelope (signature, key id, and read-time anchor
+    metadata are not part of what is being fingerprinted)."""
+    from .canonical import canonicalize
+    body = {k: v for k, v in subject.items()
+            if k not in ("signature", "key_id", "anchor")}
+    digest = hashlib.sha256(canonicalize(body)).hexdigest()
+    return "sha256:" + digest
+
+
+def claim_statement(record_id, fingerprint):
+    """The one line the wallet signs for a claim. It binds the
+    record id and the record fingerprint, and it states the
+    boundary in the message itself: a claim is not verification."""
+    return ("Claim Verified by NPC record %s. Record fingerprint: "
+            "%s. Signing proves you control this wallet and claim "
+            "this exact record. It does not move funds, approve a "
+            "transaction, or verify the record."
+            % (record_id, fingerprint))
+
+
+CLAIM_BOUNDARY = ("A wallet claim shows who claimed this record. "
+                  "Verification is separate: NPC signs every "
+                  "verification decision, and a claim does not "
+                  "change a record's status.")
+
+
+def start_wallet_claim_challenge(store, subject, email, wallet,
+                                 now_iso):
+    """Issue a claim challenge for one wallet on one record. The
+    message is the SIWE layout with the claim statement, so the
+    existing signature verification checks every field."""
+    now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+    expires = (now + CHALLENGE_TTL).isoformat(timespec="seconds")
+    nonce = secrets.token_hex(8)
+    challenge_id = "lchg_" + secrets.token_hex(12)
+    domain = link_domain()
+    fingerprint = record_fingerprint(subject)
+    statement = claim_statement(subject["record_id"], fingerprint)
+    message = build_siwe_message(
+        domain, wallet, public_base_url(), siwe_chain_id(), nonce,
+        now.isoformat(timespec="seconds"), expires,
+        statement=statement)
+    store.add_identity_link_challenge({
+        "challenge_id": challenge_id, "kind": "wallet_claim",
+        "provider": "wallet_claim",
+        "subject_record_id": subject["record_id"],
+        "email_hash": registration_email_hash(email),
+        "secret": nonce, "wallet": wallet,
+        "created_at": now_iso, "expires_at": expires,
+        "consumed_at": "",
+    })
+    return {"challenge_id": challenge_id, "message": message,
+            "nonce": nonce, "domain": domain,
+            "chain_id": siwe_chain_id(), "expires_at": expires,
+            "wallet": ethkeys.to_checksum_address(wallet),
+            "record_id": subject["record_id"],
+            "record_fingerprint": fingerprint,
+            "statement": statement}
+
+
+def find_wallet_claim(store, subject_record_id, wallet):
+    """The existing claim for one wallet on one record, or None.
+    Wallet comparison is case-insensitive."""
+    for rec in store.list_wallet_claims(subject_record_id):
+        if (rec.get("wallet_claimed_by") or "").lower() \
+                == wallet.lower():
+            return rec
+    return None
+
+
+def complete_wallet_claim(store, keys, subject, challenge_id,
+                          message, signature, now_iso):
+    """Finish a claim challenge. Returns (claim, created, problems):
+    on success claim is the signed claim record and created says
+    whether this call minted it (a repeat claim by the same wallet
+    on the same record returns the claim already on record)."""
+    row = store.get_identity_link_challenge(challenge_id)
+    if row is None or row["kind"] != "wallet_claim" \
+            or row["subject_record_id"] != subject["record_id"]:
+        return None, False, ["this claim challenge is not open"]
+    if row.get("consumed_at"):
+        return None, False, ["this claim challenge was already used"]
+    if not _iso_after(row["expires_at"], now_iso):
+        return None, False, ["this claim challenge has expired"]
+    problems, _recovered = verify_siwe(message, signature, {
+        "domain": link_domain(), "nonce": row["secret"],
+        "wallet": row["wallet"], "chain_id": siwe_chain_id(),
+        "uri": public_base_url(),
+    }, now_iso)
+    parsed = parse_siwe_message(message)
+    expected_statement = claim_statement(
+        subject["record_id"], record_fingerprint(subject))
+    if parsed is not None \
+            and parsed.get("statement") != expected_statement:
+        problems.append("the signed message does not carry the "
+                        "claim statement for this record")
+    if problems:
+        return None, False, problems
+    if not store.consume_identity_link_challenge(challenge_id,
+                                                 now_iso):
+        return None, False, ["this claim challenge was already used"]
+    wallet = ethkeys.to_checksum_address(row["wallet"])
+    # One wallet-control proof per record supports its claim: the
+    # same signature stands behind the SIWE wallet-control link.
+    if find_link(store, subject["record_id"], "siwe",
+                 "wallet_control", wallet) is None:
+        mint_link_record(store, keys, subject, "siwe",
+                         "wallet_control", wallet, now_iso,
+                         observed_at=now_iso)
+    existing = find_wallet_claim(store, subject["record_id"], wallet)
+    if existing is not None:
+        return existing, False, []
+    sig = signature if signature.startswith("0x") \
+        else "0x" + signature
+    core = {
+        "record_type": CLAIM_RECORD_TYPE,
+        "record_id": "wclaim_" + secrets.token_hex(12),
+        "subject_record_id": subject["record_id"],
+        "subject_kind": subject.get("kind"),
+        "status": "claimed",
+        "status_label": "Claimed with a wallet",
+        "claimed_at": now_iso,
+        "wallet_claimed_by": wallet,
+        "record_fingerprint": record_fingerprint(subject),
+        "verification_status": subject.get("status"),
+        "signed_statement": message,
+        "wallet_signature": sig,
+        "detail": ("The wallet named signed a statement claiming "
+                   "this exact record, and NPC confirmed the "
+                   "signature. Claiming shows who claims the "
+                   "record. It is not a verification decision, and "
+                   "it does not change the record's status."),
+    }
+    rec = pact.sign_record(keys, core)
+    if not store.add_wallet_claim(rec):
+        again = find_wallet_claim(store, subject["record_id"],
+                                  wallet)
+        if again is not None:
+            return again, False, []
+        return None, False, ["the claim could not be recorded"]
+    return rec, True, []
+
+
+def build_wallet_claim_state(store, subject):
+    """The public claim state for one record: the latest claim
+    names the claimant, and every claim on record is listed."""
+    claims = list(store.list_wallet_claims(subject["record_id"]))
+    claims.sort(key=lambda r: r.get("claimed_at", ""), reverse=True)
+    latest = claims[0] if claims else None
+    return {
+        "record_id": subject["record_id"],
+        "claimed": latest is not None,
+        "wallet_claimed_by": latest["wallet_claimed_by"]
+        if latest else None,
+        "claim_count": len(claims),
+        "claims": claims,
+        "boundary": CLAIM_BOUNDARY,
+    }
 
 
 def complete_siwe(store, keys, subject, challenge_id, message,

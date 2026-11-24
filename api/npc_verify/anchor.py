@@ -105,11 +105,12 @@ by inspection: it cannot forge the signer's signature on batches
 already anchored, and every rotation it signs is public the
 moment it is recorded.
 
-Approved next layer (design only, NOT built): wallet claiming.
-A registrant will be able to claim a record with their own wallet:
-the wallet signs a claim statement, and the record gains a
-claimed-by attestation naming that wallet. Claiming changes
-nothing about the record's registration status or its anchor.
+Wallet claiming (built 2026-11-22, in npc_verify/linking.py):
+a registrant can claim a record with their own wallet: the wallet
+signs a claim statement binding the record and its fingerprint,
+and the claim is minted as its own signed record naming that
+wallet. Claiming changes nothing about the record's registration
+status or its anchor.
 """
 import hashlib
 import json

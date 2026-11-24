@@ -486,11 +486,13 @@ class AccountService:
     # -- recovery codes ----------------------------------------------------
 
     def redeem_recovery_code(self, email, code, surface="web",
-                             device_label=""):
+                             device_label="", handoff_id=None):
         """Trade one recovery code for a session. The failure shape
         is identical for an unknown email and a wrong code, so the
         endpoint cannot be used to learn which emails hold
-        accounts."""
+        accounts. A handoff_id rides through exactly as it does on
+        the passkey path, so a recovery-code sign-in completes a
+        pending desktop handoff too."""
         failure = _bad(
             "that email and recovery code do not match our records")
         try:
@@ -514,6 +516,8 @@ class AccountService:
             account["account_id"], surface, device_label)
         self._event(account["account_id"], "recovery_code_used",
                     {"session_id": session["session_id"]})
+        if handoff_id:
+            self._complete_handoff(handoff_id, account["account_id"])
         _total, unused = self.store.count_recovery_codes(
             account["account_id"])
         return {
@@ -575,6 +579,19 @@ class AccountService:
                 "revoked_current": session_id == current_session_id}
 
     # -- desktop handoff -----------------------------------------------------
+
+    def complete_handoff_for_session(self, account, handoff_id):
+        """Ready a pending handoff for the account that already
+        holds a session. This is the completion the sign-in page's
+        already-signed-in branch performs: the browser arrived
+        signed in, so no new sign-in happens, but a pending desktop
+        handoff named by the page must still be completed for the
+        signed-in account, exactly as a fresh sign-in completes it.
+        Like _complete_handoff itself, an unknown, expired, or
+        settled handoff is a quiet no-op: the answer is the same
+        either way, so the call cannot probe handoff state."""
+        self._complete_handoff(handoff_id, account["account_id"])
+        return {"ok": True}
 
     def create_handoff(self, device_label=""):
         handoff_id = _new_id("hoff_")

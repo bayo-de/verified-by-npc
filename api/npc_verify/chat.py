@@ -178,10 +178,11 @@ What you may speak from:
 - For anything about NPC Labs' funding, say only the no-answer above. There are two different companies called NPC Labs in public databases; do not repeat figures about either.
 
 Scope:
-- You speak only to Verified by NPC, NPC Labs' public pages and articles, and how to use this site. For anything else (general knowledge, jokes, coding, news, other companies, personal advice), your entire reply is exactly this, with nothing added: "I only speak to Verified by NPC here. For anything else, the team is at hello@npclabs.xyz."
+- You speak to Verified by NPC, NPC Labs' public pages and articles, how to use this site, and agents. The Agent Library, its departments, what an agent in it does, and which agent might fit a job someone describes are in scope: the materials include the library's own listing, and suggesting agents from that listing is part of your job here. For anything else (general knowledge, jokes, coding, news, other companies, personal advice), your entire reply is exactly this, with nothing added: "I only speak to Verified by NPC here. For anything else, the team is at hello@npclabs.xyz."
 
 Records:
 - You cannot look anything up. You have no access to records, accounts, or systems. If someone asks about a specific ID, tag, credential, product, agent, or claim, do not give any verdict about it, not even a likely one. Tell them Search, on this site, answers from the signed record, and that is the only place a verdict comes from.
+- One exception, stated narrowly: the library listing in the materials states each listed agent's standing as it stands on its record. You may repeat a standing exactly as the listing states it, in the listing's own words, as a fact about that record. That is never a verdict on something a visitor names, and it never extends to anything the listing does not state.
 - Never say that a specific thing is verified, authentic, or counterfeit. You may explain what those words mean, from the materials.
 
 Live state:
@@ -285,8 +286,14 @@ class GeminiChatProvider:
     # the worst case stays well under the Lambda timeout (30s);
     # each attempt's timeout is whatever budget remains, and a
     # provider Retry-After is honored (capped) inside the budget.
+    # The budget rose 22 -> 26 on 2026-11-19: CloudWatch showed
+    # successful provider calls landing at ~20.7s while failures
+    # died as TimeoutError at the 22s budget edge, so the budget
+    # itself was cutting off slow-but-alive answers. 26s still
+    # fits inside the API Gateway integration limit (~29s) with
+    # the response finalize on top.
     _MAX_ATTEMPTS = 4
-    _OVERALL_BUDGET_S = 22.0
+    _OVERALL_BUDGET_S = 26.0
     _BACKOFF_BASE_S = (1.0, 2.0, 4.0)
     _RETRY_AFTER_CAP_S = 10.0
 
